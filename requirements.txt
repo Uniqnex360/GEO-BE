@@ -18,5 +18,10 @@ python-jose[cryptography]==3.5.0
 bcrypt==4.1.2
 passlib[bcrypt]==1.7.4
 
-
+#llm packages
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+langchain-google-genai>=2.0.0
+langchain-xai>=0.1.0
 
