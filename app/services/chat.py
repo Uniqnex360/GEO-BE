@@ -1,5 +1,6 @@
 import json
 import asyncio
+from datetime import datetime
 from typing import TypedDict, Dict, Any, List, Literal, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -12,8 +13,7 @@ from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 # Assuming your actual models exist at these paths
-# from app.models.chat import Chat, ChatSearchQuery
-# from app.models.product import Product
+from app.models import Product, Chat, ChatSearchQuery
 
 
 # 1. State Tracking Matrix
@@ -240,45 +240,68 @@ class ChatService:
         historical_best = None
 
         try:
-            # Dynamic lookup in your products database model using URL strings or names
-            # stmt = select(Product).where((Product.url == data.get('product_url')) | (Product.name == data.get('product_name')))
-            # result = await db.execute(stmt)
-            # product_record = result.scalar_one_or_none()
+            # Search product by URL or product name
+            stmt = select(Product).where(
+                (Product.product_url == data.get("product_url")) |
+                (Product.name == data.get("product_name"))
+            )
 
-            # Simulated matching mock record to illustrate the metrics enhancement pattern
-            product_record = True
+            result = await db.execute(stmt)
+            product_record = result.scalar_one_or_none()
 
-            if product_record:
-                product_id = 42  # Mocking target ID link
-                # Fetching historical high-water marks for active products
+            # Product not found → stop execution immediately
+            if not product_record:
+                yield json.dumps(
+                    {
+                        "type": "error",
+                        "color": "red",
+                        "message": f"Given product '{data.get('product_name')}' not found in database."
+                    }
+                ) + "\n"
+
+                return
+
+            # Use actual DB product id
+            product_id = product_record.id
+
+            # Fetch previous best metrics dynamically
+            stmt = (
+                select(ChatSearchQuery)
+                .join(Chat)
+                .where(Chat.product_id == product_id)
+                .order_by(ChatSearchQuery.share_of_voice.desc())
+            )
+
+            result = await db.execute(stmt)
+            best_record = result.scalars().first()
+
+            historical_best = None
+
+            if best_record:
                 historical_best = {
-                    "best_share_of_voice": 35.0,
-                    "best_citation_rank": 3,
-                    "last_recorded_at": "2026-05-15T12:00:00",
+                    "best_share_of_voice": best_record.share_of_voice,
+                    "best_citation_rank": best_record.citation_rank,
+                    "last_recorded_at": datetime.now().isoformat()
                 }
-                yield json.dumps(
-                    {
-                        "type": "status",
-                        "color": "green",
-                        "message": "Product matched! Historical best benchmark records loaded into execution state.",
-                    }
-                ) + "\n"
-            else:
-                yield json.dumps(
-                    {
-                        "type": "status",
-                        "color": "yellow",
-                        "message": "Product not found in database registry. Skipping variance diagnostics.",
-                    }
-                ) + "\n"
-        except Exception as e:
+
             yield json.dumps(
                 {
                     "type": "status",
-                    "color": "red",
-                    "message": f"Product lookup bypass: {str(e)}",
+                    "color": "green",
+                    "message": "Product matched successfully."
                 }
             ) + "\n"
+
+        except Exception as e:
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "color": "red",
+                    "message": f"Product lookup error: {str(e)}"
+                }
+            ) + "\n"
+
+            return
 
         # 2. Build LangGraph workflow pipeline configurations
         workflow = StateGraph(AgentState)
@@ -336,35 +359,35 @@ class ChatService:
 
         try:
             # Instantiate parent chat record
-            # chat_record = Chat(
-            #     tenant_id=tenant_id,
-            #     product_id=final_output["matched_product_id"],
-            #     product_name=final_output["product_name"],
-            #     product_url=final_output["product_url"],
-            #     extra_context=final_output["extra_context"],
-            #     model_used=data.get("model", "gpt-4o"),
-            #     final_optimization_report=final_output["final_report"]
-            # )
+            chat_record = Chat(
+                tenant_id=tenant_id,
+                product_id=final_output["matched_product_id"],
+                product_name=final_output["product_name"],
+                product_url=final_output["product_url"],
+                extra_context=final_output["extra_context"],
+                model_used=data.get("model", "gpt-4o"),
+                final_optimization_report=final_output["final_report"]
+            )
 
             # Map child entity configurations directly into dynamic JSONB attributes
-            # for q_item in final_output["query_records_db_payload"]:
-            #     child_record = ChatSearchQuery(
-            #         query_text=q_item["query_text"],
-            #         product_found=q_item["product_found"],
-            #         share_of_voice=q_item["share_of_voice"],
-            #         total_websites_found=q_item["total_websites_found"],
-            #         citation_rank=q_item["citation_rank"],
-            #         platform_breakdown=q_item["platform_breakdown"],      # Dynamic maps
-            #         best_metrics_variance=q_item["best_metrics_variance"], # Dynamic maps
-            #         raw_api_response=q_item["raw_api_response"],
-            #         citing_sources=q_item["citing_sources"],
-            #         competitors_mentioned=q_item["competitors_mentioned"],
-            #         query_optimization_tips=q_item["query_optimization_tips"]
-            #     )
-            #     chat_record.search_queries.append(child_record)
+            for q_item in final_output["query_records_db_payload"]:
+                child_record = ChatSearchQuery(
+                    query_text=q_item["query_text"],
+                    product_found=q_item["product_found"],
+                    share_of_voice=q_item["share_of_voice"],
+                    total_websites_found=q_item["total_websites_found"],
+                    citation_rank=q_item["citation_rank"],
+                    platform_breakdown=q_item["platform_breakdown"],      # Dynamic maps
+                    best_metrics_variance=q_item["best_metrics_variance"], # Dynamic maps
+                    raw_api_response=q_item["raw_api_response"],
+                    citing_sources=q_item["citing_sources"],
+                    competitors_mentioned=q_item["competitors_mentioned"],
+                    query_optimization_tips=q_item["query_optimization_tips"]
+                )
+                chat_record.search_queries.append(child_record)
 
-            # db.add(chat_record)
-            # await db.commit()
+            db.add(chat_record)
+            await db.commit()
             pass
         except Exception as write_err:
             yield json.dumps(

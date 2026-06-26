@@ -20,6 +20,7 @@ class Brand(BaseModel):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     industry: Mapped[str] = mapped_column(String(255), nullable=True)
     country: Mapped[str] = mapped_column(String(255), nullable=True)
+    competitor: Mapped[str] = mapped_column(String(255), nullable=True)
 
     # relationships
     tenant: Mapped["Tenant"] = relationship(back_populates="brands")

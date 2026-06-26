@@ -86,6 +86,7 @@ class BrandService:
             domain=data.get("domain"),
             industry=data.get("industry"),
             country=data.get("country"),
+            competitor=data.get("competitor"),
             created_by=int(user.get("sub")),
         )
 

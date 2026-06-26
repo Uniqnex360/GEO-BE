@@ -9,6 +9,7 @@ class BrandBase(BaseModel):
     name: str
     industry: str
     country: str
+    competitor: str
 
 
 class BrandCreate(BrandBase):

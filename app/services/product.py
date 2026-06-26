@@ -1,5 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case, cast, Float, or_, Numeric
 from sqlalchemy.orm import selectinload
 
 from app.models import (
@@ -8,6 +8,8 @@ from app.models import (
     ProductFAQ,
     ProductFeature,
     Brand,
+    Chat,
+    ChatSearchQuery,
 )
 
 
@@ -372,6 +374,66 @@ class ProductService:
 
         return True
 
+    # @staticmethod
+    # async def list_products(
+    #     db: AsyncSession,
+    #     user: dict,
+    #     tenant_id: int,
+    #     page: int = 1,
+    #     limit: int = 20,
+    #     search: str = None,
+    # ):
+    #     """list products"""
+
+    #     is_super_admin = user.get(
+    #         "is_super_admin",
+    #         False,
+    #     )
+
+    #     query = select(Product).options(
+    #         selectinload(Product.features),
+    #         selectinload(Product.faqs),
+    #         selectinload(Product.brand),
+    #     )
+
+    #     count_query = select(func.count(Product.id))
+
+    #     if not is_super_admin:
+
+    #         query = query.where(
+    #             Product.tenant_id == tenant_id,
+    #             Product.is_deleted == False,
+    #         )
+
+    #         count_query = count_query.where(
+    #             Product.tenant_id == tenant_id,
+    #             Product.is_deleted == False,
+    #         )
+
+    #     if search:
+
+    #         search_filter = Product.name.ilike(f"%{search}%")
+
+    #         query = query.where(search_filter)
+
+    #         count_query = count_query.where(search_filter)
+
+    #     query = query.order_by(Product.created_at.desc())
+
+    #     offset = (page - 1) * limit
+
+    #     query = query.offset(offset).limit(limit)
+
+    #     result = await db.execute(query)
+
+    #     products = result.scalars().all()
+
+    #     total_result = await db.execute(count_query)
+
+    #     total = total_result.scalar()
+
+    #     return products, total
+
     @staticmethod
     async def list_products(
         db: AsyncSession,
@@ -381,32 +443,129 @@ class ProductService:
         limit: int = 20,
         search: str = None,
     ):
-        """list products"""
+        """List products with GEO analytics summary"""
 
         is_super_admin = user.get(
             "is_super_admin",
             False,
         )
 
-        query = select(Product).options(
-            selectinload(Product.features),
-            selectinload(Product.faqs),
-            selectinload(Product.brand),
+        query = (
+            select(
+                Product,
+                # Total GEO sessions
+                func.count(func.distinct(Chat.id)).label("total_chats"),
+                # Total search queries
+                func.count(ChatSearchQuery.id).label("total_queries"),
+                # Avg share of voice
+                func.coalesce(
+                    func.round(
+                        cast(
+                            func.avg(ChatSearchQuery.share_of_voice),
+                            Numeric,
+                        ),
+                        2,
+                    ),
+                    0,
+                ).label("avg_share_of_voice"),
+                # Avg citation rank
+                func.coalesce(
+                    func.round(
+                        cast(
+                            func.avg(ChatSearchQuery.citation_rank),
+                            Numeric,
+                        ),
+                        2,
+                    ),
+                    0,
+                ).label("avg_citation_rank"),
+                # Visibility rate %
+                func.coalesce(
+                    func.round(
+                        (
+                            cast(
+                                func.sum(
+                                    case(
+                                        (
+                                            ChatSearchQuery.product_found.is_(True),
+                                            1,
+                                        ),
+                                        else_=0,
+                                    )
+                                ),
+                                Numeric,
+                            )
+                            / func.nullif(
+                                func.count(ChatSearchQuery.id),
+                                0,
+                            )
+                        )
+                        * 100,
+                        2,
+                    ),
+                    0,
+                ).label("visibility_rate"),
+                # Competitor mentions
+                func.coalesce(
+                    func.sum(
+                        func.coalesce(
+                            func.jsonb_array_length(
+                                ChatSearchQuery.competitors_mentioned
+                            ),
+                            0,
+                        )
+                    ),
+                    0,
+                ).label("competitor_mentions"),
+                # Citation sources count
+                func.coalesce(
+                    func.sum(
+                        func.coalesce(
+                            func.jsonb_array_length(ChatSearchQuery.citing_sources),
+                            0,
+                        )
+                    ),
+                    0,
+                ).label("citation_count"),
+                # Last analyzed
+                func.max(Chat.created_at).label("last_analysis"),
+            )
+            # Match by product_id
+            # Fallback: product_name when product_id missing
+            .outerjoin(
+                Chat,
+                or_(
+                    Chat.product_id == Product.id,
+                    (
+                        Chat.product_id.is_(None)
+                        & (func.lower(Chat.product_name) == func.lower(Product.name))
+                    ),
+                ),
+            )
+            .outerjoin(
+                ChatSearchQuery,
+                Chat.id == ChatSearchQuery.chat_id,
+            )
+            .options(
+                selectinload(Product.features),
+                selectinload(Product.faqs),
+                selectinload(Product.brand),
+            )
+            .group_by(Product.id)
         )
 
         count_query = select(func.count(Product.id))
 
         if not is_super_admin:
 
-            query = query.where(
+            filters = [
                 Product.tenant_id == tenant_id,
-                Product.is_deleted == False,
-            )
+                Product.is_deleted.is_(False),
+            ]
 
-            count_query = count_query.where(
-                Product.tenant_id == tenant_id,
-                Product.is_deleted == False,
-            )
+            query = query.where(*filters)
+
+            count_query = count_query.where(*filters)
 
         if search:
 
@@ -424,10 +583,29 @@ class ProductService:
 
         result = await db.execute(query)
 
-        products = result.scalars().all()
+        rows = result.all()
 
         total_result = await db.execute(count_query)
 
         total = total_result.scalar()
+
+        products = []
+
+        for row in rows:
+
+            product = row.Product
+
+            product.analytics = {
+                "total_chats": int(row.total_chats or 0),
+                "total_queries": int(row.total_queries or 0),
+                "avg_share_of_voice": float(row.avg_share_of_voice or 0),
+                "avg_citation_rank": float(row.avg_citation_rank or 0),
+                "visibility_rate": float(row.visibility_rate or 0),
+                "competitor_mentions": int(row.competitor_mentions or 0),
+                "citation_count": int(row.citation_count or 0),
+                "last_analysis": row.last_analysis,
+            }
+
+            products.append(product)
 
         return products, total
