@@ -25,7 +25,7 @@ async def init_llm_analyzes(
     'product_name': 'test', 
     'product_url': 'https://www.chmarine.com/international-cruiser-250-antifoul-3L/', 
     'extra_context': 'test', 
-    'model': 'gpt-4o'}
+    'model': 'gpt-5-nano'}
     """
 
     return StreamingResponse(

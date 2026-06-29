@@ -88,3 +88,4 @@ class Product(BaseModel):
     faqs: Mapped[list["ProductFAQ"]] = relationship(
         back_populates="product", cascade="all, delete-orphan"
     )
+    chats = relationship("Chat", back_populates="product")

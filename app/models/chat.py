@@ -33,6 +33,7 @@ class Chat(BaseModel):
     search_queries: Mapped[List["ChatSearchQuery"]] = relationship(
         "ChatSearchQuery", back_populates="chat", cascade="all, delete-orphan"
     )
+    product = relationship("Product", back_populates="chats")
 
 
 class ChatSearchQuery(BaseModel):

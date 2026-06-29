@@ -128,3 +128,22 @@ async def list_products(
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/detail/{product_id}")
+async def product_detail(
+    product_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(validate_jwt_token),
+):
+    """product detail"""
+
+    try:
+
+        data = await ProductService.detail(db=db, product_id=product_id, tenant_id=user.get("tenant_id"), user=user)
+
+        return data
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+

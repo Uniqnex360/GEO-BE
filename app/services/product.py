@@ -1,6 +1,8 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, case, cast, Float, or_, Numeric
+from sqlalchemy import select, func, case, cast, or_, Numeric
 from sqlalchemy.orm import selectinload
+from statistics import mean
+from fastapi import HTTPException, status
 
 from app.models import (
     User,
@@ -609,3 +611,149 @@ class ProductService:
             products.append(product)
 
         return products, total
+
+    @staticmethod
+    async def detail(
+        db: AsyncSession,
+        product_id: int,
+        tenant_id: int,
+        user: dict,
+    ):
+        is_super_admin = user.get("is_super_admin", False)
+
+        # ------------------------------------------------------------------
+        # 1. Fetch EVERYTHING in ONE single transaction using selectinload
+        # ------------------------------------------------------------------
+        product_query = (
+            select(Product)
+            .where(Product.id == product_id, Product.is_deleted.is_(False))
+            .options(
+                selectinload(Product.features),
+                selectinload(Product.faqs),
+                selectinload(Product.brand),
+                # Deeply load chats and their related search queries together
+                selectinload(Product.chats).selectinload(Chat.search_queries),
+            )
+        )
+
+        product_result = await db.execute(product_query)
+        product = product_result.scalar_one_or_none()
+
+        # Generic Not Found
+        if not product:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
+            )
+
+        # Strict Tenant Verification
+        if not is_super_admin and product.tenant_id != tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: This product does not belong to your tenant.",
+            )
+
+        # ------------------------------------------------------------------
+        # 2. Extract and Process Analytics Directly via Python
+        # ------------------------------------------------------------------
+        all_chats = product.chats or []
+        total_sessions = len(all_chats)
+
+        # Flatten all child queries across all chats for this product
+        all_queries = [q for chat in all_chats for q in (chat.search_queries or [])]
+        total_queries = len(all_queries)
+
+        # Calculate Math Safely
+        avg_sov = (
+            round(mean([q.share_of_voice for q in all_queries]), 2)
+            if all_queries
+            else 0.0
+        )
+        avg_rank = (
+            round(mean([q.citation_rank for q in all_queries]), 2)
+            if all_queries
+            else 0.0
+        )
+
+        # Visibility Rate calculation
+        found_count = sum(1 for q in all_queries if q.product_found is True)
+        visibility_rate = (
+            round((found_count / total_queries) * 100, 2) if total_queries > 0 else 0.0
+        )
+
+        # Last Analysis Timestamp
+        last_analysis = max([c.created_at for c in all_chats]) if all_chats else None
+
+        # ------------------------------------------------------------------
+        # 3. Find Best Performing Query
+        # ------------------------------------------------------------------
+        best_query_obj = max(
+            all_queries, key=lambda q: q.share_of_voice or 0.0, default=None
+        )
+
+        # ------------------------------------------------------------------
+        # 4. Extract Competitors and Sources (De-duplicated)
+        # ------------------------------------------------------------------
+        competitors_set = set()
+        sources_set = set()
+
+        for q in all_queries:
+            if q.competitors_mentioned:
+                competitors_set.update(q.competitors_mentioned)
+            if q.citing_sources:
+                sources_set.update(q.citing_sources)
+
+        # ------------------------------------------------------------------
+        # 5. Format Latest 5 Chat Sessions
+        # ------------------------------------------------------------------
+        sorted_chats = sorted(all_chats, key=lambda c: c.created_at, reverse=True)[:5]
+        latest_sessions = []
+
+        for session in sorted_chats:
+            latest_sessions.append(
+                {
+                    "chat_id": session.id,
+                    "model_used": session.model_used or "",
+                    "extra_context": session.extra_context or "",
+                    "created_at": session.created_at,
+                    "final_report": session.final_optimization_report or "",
+                    "queries": [
+                        {
+                            "id": q.id,
+                            "query": q.query_text or "",
+                            "share_of_voice": q.share_of_voice or 0,
+                            "citation_rank": q.citation_rank or 0,
+                            "product_found": q.product_found,
+                            "platform_breakdown": q.platform_breakdown or {},
+                            "competitors": q.competitors_mentioned or [],
+                            "sources": q.citing_sources or [],
+                            "optimization_tips": q.query_optimization_tips or "",
+                        }
+                        for q in (session.search_queries or [])
+                    ],
+                }
+            )
+
+        # ------------------------------------------------------------------
+        # Final Unified Response
+        # ------------------------------------------------------------------
+        return {
+            "product": product,
+            "analytics": {
+                "total_sessions": total_sessions,
+                "total_queries": total_queries,
+                "avg_share_of_voice": float(avg_sov),
+                "avg_citation_rank": float(avg_rank),
+                "visibility_rate": float(visibility_rate),
+                "last_analysis": last_analysis,
+            },
+            "best_query": {
+                "query": best_query_obj.query_text if best_query_obj else "",
+                "share_of_voice": (
+                    best_query_obj.share_of_voice if best_query_obj else 0.0
+                ),
+                "citation_rank": best_query_obj.citation_rank if best_query_obj else 0,
+            },
+            "competitors": list(competitors_set),
+            "citation_sources": list(sources_set),
+            "latest_sessions": latest_sessions,
+        }
