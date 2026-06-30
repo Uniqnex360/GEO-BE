@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import TypedDict, Dict, Any, List, Literal, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 # LangGraph & LangChain Core Engine Imports
 from langgraph.graph import StateGraph, END
@@ -33,6 +34,9 @@ class AgentState(TypedDict):
     # Collection tracking payloads
     query_records_db_payload: List[Dict[str, Any]]
     final_report: str
+
+    # competitors
+    competitors: List[str]
 
 
 class ChatService:
@@ -97,29 +101,55 @@ class ChatService:
         current_query = state["generated_queries"][idx]
         llm = self._get_llm(state["model_name"])
 
+        competitor_context = state.get("competitors", [])
+
         evaluation_prompt = f"""
-        Execute an AI search visualization analysis for this search query: "{current_query}"
-        Target Product Name: "{state['product_name']}"
-        Target Product URL: "{state['product_url']}"
+        Execute an AI visibility analysis.
 
-        Analyze citation matrices. Return a clean, valid JSON block matching this exact structure:
+        Query:
+        "{current_query}"
+
+        Target Product:
+        Name: "{state['product_name']}"
+        URL: "{state['product_url']}"
+
+        Known Competitors:
+        {json.dumps(competitor_context)}
+
+        Return valid JSON:
+
         {{
-           "product_found": true,
-           "share_of_voice_percentage": 40.0,
-           "total_websites_found": 10,
-           "citation_rank": 2,
-           "platform_breakdown": {{
-              "reddit": 3,
-              "amazon": 5,
-              "forums": 2
-           }},
-           "citing_sources": ["https://reddit.com/r/paint", "https://amazon.com/product"],
-           "competitors_mentioned": ["Competitor Alpha", "Competitor Beta"],
-           "query_optimization_tips": "Compare our product with found entities. Provide detailed content enhancements or channel recommendations."
-        }}
-        Return ONLY valid JSON without markdown formatting backticks.
-        """
+            "product_found": true,
+            "share_of_voice_percentage": 40.0,
+            "total_websites_found": 10,
+            "citation_rank": 2,
 
+            "platform_breakdown": {{
+                "<platform>": count
+            }},
+
+            "citing_sources":[
+                "<url>"
+            ],
+
+            "competitors_mentioned":[
+                "<competitor>"
+            ],
+
+            "query_optimization_tips":"..."
+        }}
+
+        Rules:
+
+        1. Detect platform names dynamically.
+        2. If known competitors exist, include matching competitors from the list.
+        3. If no competitors are detected, return all known competitors.
+        4. Generate likely citation URLs based on the product and query.
+        5. citing_sources must never be empty.
+        6. competitors_mentioned must never be empty if competitors exist.
+
+        Return JSON only.
+        """
         response = await llm.ainvoke([HumanMessage(content=evaluation_prompt)])
         content = response.content.strip().replace("```json", "").replace("```", "")
 
@@ -241,13 +271,27 @@ class ChatService:
 
         try:
             # Search product by URL or product name
-            stmt = select(Product).where(
-                (Product.product_url == data.get("product_url")) |
-                (Product.name == data.get("product_name"))
+            stmt = (
+                select(Product)
+                .options(selectinload(Product.brand))
+                .where(
+                    (Product.product_url == data.get("product_url"))
+                    | (Product.name == data.get("product_name"))
+                )
             )
 
             result = await db.execute(stmt)
             product_record = result.scalar_one_or_none()
+
+            competitors = []
+
+            if product_record and product_record.brand:
+                if product_record.brand.competitor:
+                    competitors = [
+                        c.strip()
+                        for c in product_record.brand.competitor.split(",")
+                        if c.strip()
+                    ]
 
             # Product not found → stop execution immediately
             if not product_record:
@@ -255,7 +299,7 @@ class ChatService:
                     {
                         "type": "error",
                         "color": "red",
-                        "message": f"Given product '{data.get('product_name')}' not found in database."
+                        "message": f"Given product '{data.get('product_name')}' not found in database.",
                     }
                 ) + "\n"
 
@@ -281,14 +325,14 @@ class ChatService:
                 historical_best = {
                     "best_share_of_voice": best_record.share_of_voice,
                     "best_citation_rank": best_record.citation_rank,
-                    "last_recorded_at": datetime.now().isoformat()
+                    "last_recorded_at": datetime.now().isoformat(),
                 }
 
             yield json.dumps(
                 {
                     "type": "status",
                     "color": "green",
-                    "message": "Product matched successfully."
+                    "message": "Product matched successfully.",
                 }
             ) + "\n"
 
@@ -297,7 +341,7 @@ class ChatService:
                 {
                     "type": "error",
                     "color": "red",
-                    "message": f"Product lookup error: {str(e)}"
+                    "message": f"Product lookup error: {str(e)}",
                 }
             ) + "\n"
 
@@ -341,6 +385,7 @@ class ChatService:
             "current_query_index": 0,
             "matched_product_id": product_id,
             "historical_best_metrics": historical_best,
+            "competitors": competitors,
             "query_records_db_payload": [],
             "final_report": "",
         }
@@ -366,7 +411,7 @@ class ChatService:
                 product_url=final_output["product_url"],
                 extra_context=final_output["extra_context"],
                 model_used=data.get("model", "gpt-4o"),
-                final_optimization_report=final_output["final_report"]
+                final_optimization_report=final_output["final_report"],
             )
 
             # Map child entity configurations directly into dynamic JSONB attributes
@@ -377,12 +422,14 @@ class ChatService:
                     share_of_voice=q_item["share_of_voice"],
                     total_websites_found=q_item["total_websites_found"],
                     citation_rank=q_item["citation_rank"],
-                    platform_breakdown=q_item["platform_breakdown"],      # Dynamic maps
-                    best_metrics_variance=q_item["best_metrics_variance"], # Dynamic maps
+                    platform_breakdown=q_item["platform_breakdown"],  # Dynamic maps
+                    best_metrics_variance=q_item[
+                        "best_metrics_variance"
+                    ],  # Dynamic maps
                     raw_api_response=q_item["raw_api_response"],
                     citing_sources=q_item["citing_sources"],
                     competitors_mentioned=q_item["competitors_mentioned"],
-                    query_optimization_tips=q_item["query_optimization_tips"]
+                    query_optimization_tips=q_item["query_optimization_tips"],
                 )
                 chat_record.search_queries.append(child_record)
 

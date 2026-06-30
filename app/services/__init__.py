@@ -4,3 +4,4 @@ from .product import ProductService
 from .chat import ChatService
 from .ai_engine import AIEngineService
 from .citation import CitationService
+from .competitor import CompetitorService
