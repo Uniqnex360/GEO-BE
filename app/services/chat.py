@@ -1,6 +1,6 @@
 import json
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TypedDict, Dict, Any, List, Literal, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -13,14 +13,17 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-# Assuming your actual models exist at these paths
-from app.models import Product, Chat, ChatSearchQuery
+# Schema Core Imports (Assuming these models match your internal structures)
+from app.models import Product, Brand, Chat, ChatSearchQuery
 
 
-# 1. State Tracking Matrix
+# ==========================================
+# 1. STATE TRACKING MATRIX
+# ==========================================
 class AgentState(TypedDict):
     product_name: str
-    product_url: str
+    brand_name: str
+    target_country: str
     extra_context: Optional[str]
     model_name: Optional[str]
     messages: List[BaseMessage]
@@ -35,23 +38,141 @@ class AgentState(TypedDict):
     query_records_db_payload: List[Dict[str, Any]]
     final_report: str
 
-    # competitors
+    # Competitors tracking list
     competitors: List[str]
 
 
+# ==========================================
+# 2. ISOLATED PROMPT FUNCTION ENGINE
+# ==========================================
+class PromptFactory:
+    """Isolated prompts factory for clean testing, validation, and maintenance."""
+
+    @staticmethod
+    def get_query_generation_prompt(
+        product_name: str,
+        brand_name: str,
+        target_country: str,
+        num_queries: int,
+        extra_context: str,
+    ) -> str:
+        return f"""
+        Formulate exactly {num_queries} diverse search queries targeting generative search engines for:
+        Product: {product_name}
+        Brand: {brand_name}
+        Target Market/Country: {target_country}
+        Context: {extra_context}
+        
+        Ensure the queries accurately replicate user intent matching search profiles in {target_country}.
+        Return a clean JSON array of strings.
+        """
+
+    @staticmethod
+    def get_visibility_evaluation_prompt(
+        current_query: str,
+        product_name: str,
+        brand_name: str,
+        target_country: str,
+        competitor_context: List[str],
+    ) -> str:
+        return f"""
+        Execute an AI visibility analysis localized for the target market.
+
+        Query:
+        "{current_query}"
+
+        Target Product:
+        Name: "{product_name}"
+        Brand: "{brand_name}"
+        Market Region: "{target_country}"
+
+        Known Competitors:
+        {json.dumps(competitor_context)}
+
+        Return valid JSON:
+
+        {{
+            "product_found": true,
+            "share_of_voice_percentage": 40.0,
+            "total_websites_found": 10,
+            "citation_rank": 2,
+
+            "platform_breakdown": {{
+                "<platform>": count
+            }},
+
+            "citing_sources":[
+                "<url>"
+            ],
+
+            "competitors_mentioned":[
+                "<competitor>"
+            ],
+
+            "query_optimization_tips":"..."
+        }}
+
+        Rules:
+        1. Detect platform names dynamically.
+        2. If known competitors exist, include matching competitors from the list.
+        3. If no competitors are detected, return all known competitors.
+        4. Generate likely citation URLs based on the product and query.
+        5. citing_sources must never be empty.
+        6. competitors_mentioned must never be empty if competitors exist.
+
+        Return JSON only.
+        """
+
+    @staticmethod
+    def get_geo_report_prompt(matrix_context: str) -> str:
+        return f"""
+        Review this structured visibility datasets and variance metrics:
+        {matrix_context}
+
+        Compile a finalized, comprehensive executive-ready GEO recommendation and strategic roadmap.
+        Emphasize cross-platform performance shifts and clear channel optimization directives.
+        """
+
+    @staticmethod
+    def get_url_extraction_prompt(url: str) -> str:
+        return f"""
+        You are an advanced text extraction and market intelligence agent. 
+        Analyze the following URL asset and extract the core product profile information.
+
+        Target URL: {url}
+
+        CRITICAL DIRECTION: If this URL represents a broad search catalog, market category page, or filter query (rather than a single specific product), infer the underlying product category theme (e.g., "Kitchen & Dining Items") to cleanly fill the fields below.
+
+        Provide a clean JSON object containing exactly these properties:
+        {{
+            "product_name": "Inferred or explicit name of the product or product category",
+            "brand_name": "Inferred or explicit corporate brand owner name. Use 'Generic/Multi-Brand' if parsing a broad search catalog catalog",
+            "extracted_context": "A brief breakdown summarizing what this product or catalog page describes based on the web asset description."
+        }}
+
+        Return raw valid JSON only. Do not enclose it inside Markdown syntax.
+        """
+
+
+# ==========================================
+# 3. CORE SERVICE IMPLEMENTATION
+# ==========================================
 class ChatService:
     NUM_QUERIES_TO_GENERATE = 2
     TARGET_PERSONA = "Generative Engine Optimization (GEO) Expert"
+
+    # Adjustable parameter to skip processing if an evaluation exists within this window
+    RETENTION_DAYS_THRESHOLD = 7
 
     def __init__(self, openai_api_key: str = None, google_api_key: str = None):
         self.openai_api_key = openai_api_key
         self.google_api_key = google_api_key
 
     def _get_llm(self, model_name: str = "gpt-5-nano") -> BaseChatModel:
-        model_lower = model_name.lower()
+        model_lower = model_name.lower() if model_name else "gpt-5-nano"
         if "gpt" in model_lower:
             return ChatOpenAI(
-                model="gpt-5-nano", temperature=0.2, api_key=self.openai_api_key
+                model="gpt-4o", temperature=0.2, api_key=self.openai_api_key
             )
         elif "gemini" in model_lower:
             return ChatGoogleGenerativeAI(
@@ -59,7 +180,7 @@ class ChatService:
             )
         else:
             return ChatOpenAI(
-                model="gpt-5-nano", temperature=0.2, api_key=self.openai_api_key
+                model="gpt-4o", temperature=0.2, api_key=self.openai_api_key
             )
 
     # ==========================================
@@ -93,63 +214,20 @@ class ChatService:
         }
 
     async def evaluate_query_visibility_node(self, state: AgentState) -> Dict[str, Any]:
-        """
-        Node 3: Mentions trace loop. Dynamically aggregates platform citation counts
-        and computes the variance against historical metrics if a product profile is linked.
-        """
+        """Node 3: Mentions trace loop. Aggregates metrics & computes historical variances."""
         idx = state["current_query_index"]
         current_query = state["generated_queries"][idx]
         llm = self._get_llm(state["model_name"])
 
         competitor_context = state.get("competitors", [])
+        evaluation_prompt = PromptFactory.get_visibility_evaluation_prompt(
+            current_query=current_query,
+            product_name=state["product_name"],
+            brand_name=state["brand_name"],
+            target_country=state["target_country"],
+            competitor_context=competitor_context,
+        )
 
-        evaluation_prompt = f"""
-        Execute an AI visibility analysis.
-
-        Query:
-        "{current_query}"
-
-        Target Product:
-        Name: "{state['product_name']}"
-        URL: "{state['product_url']}"
-
-        Known Competitors:
-        {json.dumps(competitor_context)}
-
-        Return valid JSON:
-
-        {{
-            "product_found": true,
-            "share_of_voice_percentage": 40.0,
-            "total_websites_found": 10,
-            "citation_rank": 2,
-
-            "platform_breakdown": {{
-                "<platform>": count
-            }},
-
-            "citing_sources":[
-                "<url>"
-            ],
-
-            "competitors_mentioned":[
-                "<competitor>"
-            ],
-
-            "query_optimization_tips":"..."
-        }}
-
-        Rules:
-
-        1. Detect platform names dynamically.
-        2. If known competitors exist, include matching competitors from the list.
-        3. If no competitors are detected, return all known competitors.
-        4. Generate likely citation URLs based on the product and query.
-        5. citing_sources must never be empty.
-        6. competitors_mentioned must never be empty if competitors exist.
-
-        Return JSON only.
-        """
         response = await llm.ainvoke([HumanMessage(content=evaluation_prompt)])
         content = response.content.strip().replace("```json", "").replace("```", "")
 
@@ -167,12 +245,10 @@ class ChatService:
                 "query_optimization_tips": "JSON parsing error encountered during visibility compilation runs.",
             }
 
-        # --- DYNAMIC HISTORICAL METRICS VARIANCE ENGINE ---
         variance_map = {}
         historical = state.get("historical_best_metrics")
 
         if historical and parsed.get("product_found"):
-            # Compute variances dynamically against system benchmarks
             current_sov = parsed.get("share_of_voice_percentage", 0.0)
             best_sov = historical.get("best_share_of_voice", 0.0)
             current_rank = parsed.get("citation_rank", 0)
@@ -181,8 +257,7 @@ class ChatService:
             variance_map = {
                 "sov_variance": round(current_sov - best_sov, 2),
                 "is_new_sov_record": current_sov > best_sov,
-                "rank_variance": current_rank
-                - best_rank,  # Negative indicates improvements in search rankings
+                "rank_variance": current_rank - best_rank,
                 "benchmark_comparison_log": f"Current SOV ({current_sov}%) vs Best Benchmark ({best_sov}%).",
             }
         elif historical:
@@ -196,17 +271,14 @@ class ChatService:
                 "benchmark_comparison_log": "No historical product tracking records found inside system registry. Benchmark tracking skipped."
             }
 
-        # Flatten records completely, handling platform breakdowns dynamically
         record_map = {
             "query_text": current_query,
             "product_found": parsed.get("product_found", False),
             "share_of_voice": parsed.get("share_of_voice_percentage", 0.0),
             "total_websites_found": parsed.get("total_websites_found", 0),
             "citation_rank": parsed.get("citation_rank", 0),
-            "platform_breakdown": parsed.get(
-                "platform_breakdown", {}
-            ),  # Entirely dynamic JSON block
-            "best_metrics_variance": variance_map,  # Dynamic analytical comparisons
+            "platform_breakdown": parsed.get("platform_breakdown", {}),
+            "best_metrics_variance": variance_map,
             "raw_api_response": content,
             "citing_sources": parsed.get("citing_sources", []),
             "competitors_mentioned": parsed.get("competitors_mentioned", []),
@@ -229,25 +301,25 @@ class ChatService:
         return "compiler"
 
     async def compile_geo_report_node(self, state: AgentState) -> Dict[str, Any]:
-        """Node 4: Processes the full analytical matrix into a finalized strategic report."""
+        """Node 4: Processes full analytical matrix dataset into a finalized strategic roadmap."""
         llm = self._get_llm(state["model_name"])
         matrix_context = json.dumps(state["query_records_db_payload"], indent=2)
 
-        summary_prompt = f"""
-        Review this structured visibility datasets and variance metrics:
-        {matrix_context}
-
-        Compile a finalized, comprehensive executive-ready GEO recommendation and strategic roadmap.
-        Emphasize cross-platform performance shifts and clear channel optimization directives.
-        """
+        summary_prompt = PromptFactory.get_geo_report_prompt(matrix_context)
         response = await llm.ainvoke([HumanMessage(content=summary_prompt)])
         return {"final_report": response.content}
 
     # ==========================================
-    # STREAM FLOW PROCESSING & CORE PERSISTENCE
+    # STREAM FLOW PROCESSING & DYNAMIC PERSISTENCE
     # ==========================================
 
-    async def start_analysis(self, db: AsyncSession, data: dict, tenant_id: int):
+    async def start_analysis(
+        self,
+        db: AsyncSession,
+        data: dict,
+        tenant_id: int,
+        user_id: Optional[int] = None,
+    ):
         yield json.dumps(
             {
                 "type": "status",
@@ -257,7 +329,84 @@ class ChatService:
         ) + "\n"
         await asyncio.sleep(0.1)
 
-        # 1. DYNAMIC SYSTEM RECOGNITION LOOKUP FOR HISTORICAL METRICS
+        product_name = data.get("product_name")
+        product_url = data.get("product_url")
+        extra_context_override = data.get("extra_context", "")
+
+        # --- OPTIONAL URL EXTRACTION STRATEGY ---
+        if not product_name and product_url:
+            yield json.dumps(
+                {
+                    "type": "status",
+                    "color": "orange",
+                    "message": "Missing product identifier. Scraping metadata parameters via url context...",
+                }
+            ) + "\n"
+
+            try:
+                llm = self._get_llm(data.get("model"))
+                extraction_prompt = PromptFactory.get_url_extraction_prompt(product_url)
+                extraction_res = await llm.ainvoke(
+                    [HumanMessage(content=extraction_prompt)]
+                )
+
+                raw_content = extraction_res.content.strip()
+
+                # Use regex to isolate the JSON block from any markdown text clutter
+                import re
+
+                json_match = re.search(r"(\{.*\})", raw_content, re.DOTALL)
+
+                if json_match:
+                    clean_json_res = json_match.group(1)
+                else:
+                    clean_json_res = raw_content
+
+                metadata = json.loads(clean_json_res)
+
+                product_name = metadata.get("product_name")
+                data["brand_name"] = metadata.get("brand_name", data.get("brand_name"))
+                if metadata.get("extracted_context"):
+                    extra_context_override = f"{extra_context_override}\n[Extracted via URL Context]: {metadata['extracted_context']}".strip()
+
+                yield json.dumps(
+                    {
+                        "type": "status",
+                        "color": "green",
+                        "message": f"Successfully parsed URL content. Identified: Product='{product_name}'",
+                    }
+                ) + "\n"
+            except Exception as extract_err:
+                yield json.dumps(
+                    {
+                        "type": "error",
+                        "color": "red",
+                        "message": f"Failed extraction loop mapping across url parameters: {str(extract_err)}",
+                    }
+                ) + "\n"
+                return
+
+        if not product_name:
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "color": "red",
+                    "message": "Termination error: Neither product name nor usable URL targets were provided.",
+                }
+            ) + "\n"
+            return
+
+        brand_name = data.get("brand_name", product_name)
+
+        # Handle incoming target region lists or strings from frontend payload
+        fe_countries = data.get("countries")
+        if isinstance(fe_countries, list) and len(fe_countries) > 0:
+            target_country = ", ".join(fe_countries)
+        elif isinstance(fe_countries, str) and fe_countries.strip():
+            target_country = fe_countries.strip()
+        else:
+            target_country = "United States of America"
+
         yield json.dumps(
             {
                 "type": "status",
@@ -268,58 +417,127 @@ class ChatService:
 
         product_id = None
         historical_best = None
+        competitors = []
 
         try:
-            # Search product by URL or product name
-            stmt = (
+            # Look up product purely by name and tenant alignment
+            product_stmt = (
                 select(Product)
                 .options(selectinload(Product.brand))
                 .where(
-                    (Product.product_url == data.get("product_url"))
-                    | (Product.name == data.get("product_name"))
+                    (Product.name == product_name) & (Product.tenant_id == tenant_id)
                 )
             )
+            product_result = await db.execute(product_stmt)
+            product_record = product_result.scalar_one_or_none()
 
-            result = await db.execute(stmt)
-            product_record = result.scalar_one_or_none()
-
-            competitors = []
-
-            if product_record and product_record.brand:
-                if product_record.brand.competitor:
-                    competitors = [
-                        c.strip()
-                        for c in product_record.brand.competitor.split(",")
-                        if c.strip()
-                    ]
-
-            # Product not found → stop execution immediately
+            # --- DYNAMIC INGESTION STRATEGY ENGINE ---
             if not product_record:
                 yield json.dumps(
                     {
-                        "type": "error",
-                        "color": "red",
-                        "message": f"Given product '{data.get('product_name')}' not found in database.",
+                        "type": "status",
+                        "color": "orange",
+                        "message": f"Product '{product_name}' not found. Resolving brand references...",
                     }
                 ) + "\n"
 
-                return
+                # Look up or build parent brand infrastructure
+                brand_stmt = select(Brand).where(
+                    (Brand.name == brand_name) & (Brand.tenant_id == tenant_id)
+                )
+                brand_result = await db.execute(brand_stmt)
+                brand_record = brand_result.scalar_one_or_none()
 
-            # Use actual DB product id
+                if not brand_record:
+                    brand_record = Brand(
+                        tenant_id=tenant_id,
+                        name=brand_name,  # Correctly saving the brand name inside Brand
+                        country=target_country,
+                        created_by=user_id,
+                    )
+                    db.add(brand_record)
+                    await db.flush()  # Populates brand_record.id safely
+
+                # Create and insert the missing product entity structure
+                product_record = Product(
+                    tenant_id=tenant_id,
+                    brand_id=brand_record.id,
+                    name=product_name,
+                    brand_name=brand_name,
+                    created_by=user_id,
+                )
+                db.add(product_record)
+
+                # FORCE HARD RETENTION COMMIT
+                await db.commit()
+
+                yield json.dumps(
+                    {
+                        "type": "status",
+                        "color": "green",
+                        "message": f"Registered new product profile for '{product_name}' successfully.",
+                    }
+                ) + "\n"
+
             product_id = product_record.id
 
-            # Fetch previous best metrics dynamically
-            stmt = (
+            # Parse competitor context out of relational entities safely
+            if product_record.brand and product_record.brand.competitor:
+                competitors = [
+                    c.strip()
+                    for c in product_record.brand.competitor.split(",")
+                    if c.strip()
+                ]
+
+            # --- FRESHNESS DRIFT RETENTION FILTERING ENGINE ---
+            time_threshold = datetime.now() - timedelta(
+                days=self.RETENTION_DAYS_THRESHOLD
+            )
+            recent_chat_stmt = (
+                select(Chat)
+                .where(
+                    (Chat.product_id == product_id)
+                    & (Chat.created_at >= time_threshold)
+                )
+                .order_by(Chat.created_at.desc())
+                .limit(1)
+            )
+            recent_chat_res = await db.execute(recent_chat_stmt)
+            existing_recent_chat = recent_chat_res.scalar_one_or_none()
+
+            if existing_recent_chat:
+                yield json.dumps(
+                    {
+                        "type": "status",
+                        "color": "green",
+                        "message": f"Found existing analysis record compiled within the last {self.RETENTION_DAYS_THRESHOLD} days. Short-circuiting processing loop to protect credits...",
+                    }
+                ) + "\n"
+
+                yield json.dumps(
+                    {
+                        "type": "result",
+                        "content": f"""
+# Session Metrics Fetched via Warm Retention Cache
+
+This analytical matrix was compiled within your dynamic threshold window ({self.RETENTION_DAYS_THRESHOLD} days) for {target_country}. No additional system units were expended.
+
+## Executive GEO Roadmap Summary
+{existing_recent_chat.final_optimization_report}
+""",
+                    }
+                ) + "\n"
+                return
+
+            # Fetch historical data if no recent chat exists to build the benchmark
+            metrics_stmt = (
                 select(ChatSearchQuery)
                 .join(Chat)
                 .where(Chat.product_id == product_id)
                 .order_by(ChatSearchQuery.share_of_voice.desc())
             )
-
-            result = await db.execute(stmt)
-            best_record = result.scalars().first()
-
-            historical_best = None
+            metrics_result = await db.execute(metrics_stmt)
+            best_record = metrics_result.scalars().first()
 
             if best_record:
                 historical_best = {
@@ -332,7 +550,7 @@ class ChatService:
                 {
                     "type": "status",
                     "color": "green",
-                    "message": "Product matched successfully.",
+                    "message": "Product profile metrics matched successfully.",
                 }
             ) + "\n"
 
@@ -341,13 +559,14 @@ class ChatService:
                 {
                     "type": "error",
                     "color": "red",
-                    "message": f"Product lookup error: {str(e)}",
+                    "message": f"System runtime lookup error: {str(e)}",
                 }
             ) + "\n"
-
             return
 
-        # 2. Build LangGraph workflow pipeline configurations
+        # ==========================================
+        # GRAPH CONTEXT STATE MACHINE BUILDER
+        # ==========================================
         workflow = StateGraph(AgentState)
         workflow.add_node("generator", self.generate_geo_queries_node)
         workflow.add_node("extractor", self.extract_queries_node)
@@ -365,20 +584,22 @@ class ChatService:
         workflow.add_edge("compiler", END)
         agent_graph = workflow.compile()
 
+        # Build execution prompts via the factory pattern engine
         system_prompt = SystemMessage(content=f"You are a {self.TARGET_PERSONA}.")
-        user_prompt = HumanMessage(content=f"""
-        Formulate exactly {self.NUM_QUERIES_TO_GENERATE} diverse search queries targeting search interfaces for:
-        Product: {data.get('product_name')}
-        URL: {data.get('product_url')}
-        Context: {data.get('extra_context', '')}
-        
-        Return a clean JSON array of strings.
-        """)
+        user_prompt_content = PromptFactory.get_query_generation_prompt(
+            product_name=product_name,
+            brand_name=brand_name,
+            target_country=target_country,
+            num_queries=self.NUM_QUERIES_TO_GENERATE,
+            extra_context=extra_context_override,
+        )
+        user_prompt = HumanMessage(content=user_prompt_content)
 
         initial_state = {
-            "product_name": data.get("product_name"),
-            "product_url": data.get("product_url"),
-            "extra_context": data.get("extra_context", ""),
+            "product_name": product_name,
+            "brand_name": brand_name,
+            "target_country": target_country,
+            "extra_context": extra_context_override,
             "model_name": data.get("model", ""),
             "messages": [system_prompt, user_prompt],
             "generated_queries": [],
@@ -390,10 +611,12 @@ class ChatService:
             "final_report": "",
         }
 
-        # 3. Process the LangGraph execution flow
+        # Execute Graph processing sequence
         final_output = await agent_graph.ainvoke(initial_state)
 
-        # 4. Atomic PostgreSQL DB Mapping Insertion Engine
+        # ==========================================
+        # DB ENTITY WRITE / PERSISTENCE LAYER
+        # ==========================================
         yield json.dumps(
             {
                 "type": "status",
@@ -403,18 +626,17 @@ class ChatService:
         ) + "\n"
 
         try:
-            # Instantiate parent chat record
             chat_record = Chat(
                 tenant_id=tenant_id,
                 product_id=final_output["matched_product_id"],
                 product_name=final_output["product_name"],
-                product_url=final_output["product_url"],
+                # Safely fallback to an empty string if product_url evaluates to None
+                product_url=data.get("product_url") or "",
                 extra_context=final_output["extra_context"],
                 model_used=data.get("model", "gpt-4o"),
                 final_optimization_report=final_output["final_report"],
             )
 
-            # Map child entity configurations directly into dynamic JSONB attributes
             for q_item in final_output["query_records_db_payload"]:
                 child_record = ChatSearchQuery(
                     query_text=q_item["query_text"],
@@ -422,10 +644,8 @@ class ChatService:
                     share_of_voice=q_item["share_of_voice"],
                     total_websites_found=q_item["total_websites_found"],
                     citation_rank=q_item["citation_rank"],
-                    platform_breakdown=q_item["platform_breakdown"],  # Dynamic maps
-                    best_metrics_variance=q_item[
-                        "best_metrics_variance"
-                    ],  # Dynamic maps
+                    platform_breakdown=q_item["platform_breakdown"],
+                    best_metrics_variance=q_item["best_metrics_variance"],
                     raw_api_response=q_item["raw_api_response"],
                     citing_sources=q_item["citing_sources"],
                     competitors_mentioned=q_item["competitors_mentioned"],
@@ -435,22 +655,15 @@ class ChatService:
 
             db.add(chat_record)
             await db.commit()
-            pass
+
         except Exception as write_err:
             yield json.dumps(
                 {
                     "type": "status",
                     "color": "red",
-                    "message": f"Persistence Error: {str(write_err)}",
+                    "message": f"Persistence Layer Error: {str(write_err)}",
                 }
             ) + "\n"
-
-        # Output payload validation log display block trace execution dump
-        print("\n" + "=" * 70)
-        print("COMPLETELY DYNAMIC PRODUCTION TRACE:")
-        print("=" * 70)
-        print(json.dumps(final_output["query_records_db_payload"], indent=2))
-        print("=" * 70 + "\n")
 
         yield json.dumps(
             {
@@ -458,7 +671,7 @@ class ChatService:
                 "content": f"""
 # Session Metrics Compiled Successfully
 
-The session architecture processed references using completely dynamic breakdowns without any schema-locked fields.
+The session architecture processed references using completely dynamic breakdowns without any schema-locked fields for {target_country}.
 
 ## Executive GEO Roadmap Summary
 {final_output['final_report']}
