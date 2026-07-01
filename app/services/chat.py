@@ -1,9 +1,11 @@
 import json
 import asyncio
+import re
 from datetime import datetime, timedelta
 from typing import TypedDict, Dict, Any, List, Literal, Optional
+
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
 
 # LangGraph & LangChain Core Engine Imports
@@ -21,7 +23,7 @@ from app.models import Product, Brand, Chat, ChatSearchQuery
 # 1. STATE TRACKING MATRIX
 # ==========================================
 class AgentState(TypedDict):
-    product_name: str
+    product_name: Optional[str]
     brand_name: str
     target_country: str
     extra_context: Optional[str]
@@ -89,38 +91,27 @@ class PromptFactory:
         Known Competitors:
         {json.dumps(competitor_context)}
 
-        Return valid JSON:
+        Return valid JSON containing exactly this structure:
 
         {{
             "product_found": true,
             "share_of_voice_percentage": 40.0,
             "total_websites_found": 10,
             "citation_rank": 2,
-
             "platform_breakdown": {{
-                "<platform>": count
+                "Google Engine": 6,
+                "Perplexity": 4
             }},
-
-            "citing_sources":[
-                "<url>"
-            ],
-
-            "competitors_mentioned":[
-                "<competitor>"
-            ],
-
-            "query_optimization_tips":"..."
+            "citing_sources": ["https://example.com/product"],
+            "competitors_mentioned": ["competitor_a"],
+            "query_optimization_tips": "..."
         }}
 
-        Rules:
-        1. Detect platform names dynamically.
-        2. If known competitors exist, include matching competitors from the list.
-        3. If no competitors are detected, return all known competitors.
-        4. Generate likely citation URLs based on the product and query.
-        5. citing_sources must never be empty.
-        6. competitors_mentioned must never be empty if competitors exist.
-
-        Return JSON only.
+        CRITICAL EXECUTION RULES:
+        1. Detect platform names dynamically based on regional engine popularity in {target_country}.
+        2. If known competitors exist, map mentions against them. If none detected, populate with known entities.
+        3. "citing_sources" and "competitors_mentioned" arrays MUST NEVER be empty. If no real data is inferred, synthesize highly probable localized assets.
+        4. Return raw valid JSON matching this schema completely. No Markdown formatting wrappers.
         """
 
     @staticmethod
@@ -160,16 +151,16 @@ class PromptFactory:
 class ChatService:
     NUM_QUERIES_TO_GENERATE = 2
     TARGET_PERSONA = "Generative Engine Optimization (GEO) Expert"
-
-    # Adjustable parameter to skip processing if an evaluation exists within this window
     RETENTION_DAYS_THRESHOLD = 7
 
-    def __init__(self, openai_api_key: str = None, google_api_key: str = None):
+    def __init__(
+        self, openai_api_key: Optional[str] = None, google_api_key: Optional[str] = None
+    ):
         self.openai_api_key = openai_api_key
         self.google_api_key = google_api_key
 
-    def _get_llm(self, model_name: str = "gpt-5-nano") -> BaseChatModel:
-        model_lower = model_name.lower() if model_name else "gpt-5-nano"
+    def _get_llm(self, model_name: str = "gpt-4o") -> BaseChatModel:
+        model_lower = model_name.lower() if model_name else "gpt-4o"
         if "gpt" in model_lower:
             return ChatOpenAI(
                 model="gpt-4o", temperature=0.2, api_key=self.openai_api_key
@@ -222,7 +213,7 @@ class ChatService:
         competitor_context = state.get("competitors", [])
         evaluation_prompt = PromptFactory.get_visibility_evaluation_prompt(
             current_query=current_query,
-            product_name=state["product_name"],
+            product_name=state["product_name"] or "Unknown Product",
             brand_name=state["brand_name"],
             target_country=state["target_country"],
             competitor_context=competitor_context,
@@ -331,6 +322,10 @@ class ChatService:
 
         product_name = data.get("product_name")
         product_url = data.get("product_url")
+        sku = data.get("sku")
+        ean = data.get("ean")
+        upc = data.get("upc")
+        mpn = data.get("mpn")
         extra_context_override = data.get("extra_context", "")
 
         # --- OPTIONAL URL EXTRACTION STRATEGY ---
@@ -351,19 +346,10 @@ class ChatService:
                 )
 
                 raw_content = extraction_res.content.strip()
-
-                # Use regex to isolate the JSON block from any markdown text clutter
-                import re
-
                 json_match = re.search(r"(\{.*\})", raw_content, re.DOTALL)
-
-                if json_match:
-                    clean_json_res = json_match.group(1)
-                else:
-                    clean_json_res = raw_content
+                clean_json_res = json_match.group(1) if json_match else raw_content
 
                 metadata = json.loads(clean_json_res)
-
                 product_name = metadata.get("product_name")
                 data["brand_name"] = metadata.get("brand_name", data.get("brand_name"))
                 if metadata.get("extracted_context"):
@@ -386,17 +372,30 @@ class ChatService:
                 ) + "\n"
                 return
 
-        if not product_name:
+        # Build query filter requirements across your incoming row keys
+        lookup_filters = []
+        if product_name:
+            lookup_filters.append(Product.name == product_name)
+        if sku:
+            lookup_filters.append(Product.sku == sku)
+        if ean:
+            lookup_filters.append(Product.ean == ean)
+        if upc:
+            lookup_filters.append(Product.upc == upc)
+        if mpn:
+            lookup_filters.append(Product.mpn == mpn)
+
+        if not lookup_filters and not product_url:
             yield json.dumps(
                 {
                     "type": "error",
                     "color": "red",
-                    "message": "Termination error: Neither product name nor usable URL targets were provided.",
+                    "message": "Termination error: Neither structural identifier properties (Name, SKU, EAN, UPC, MPN) nor usable URL targets were provided.",
                 }
             ) + "\n"
             return
 
-        brand_name = data.get("brand_name", product_name)
+        brand_name = data.get("brand_name") or product_name or "Generic/Multi-Brand"
 
         # Handle incoming target region lists or strings from frontend payload
         fe_countries = data.get("countries")
@@ -420,24 +419,27 @@ class ChatService:
         competitors = []
 
         try:
-            # Look up product purely by name and tenant alignment
-            product_stmt = (
-                select(Product)
-                .options(selectinload(Product.brand))
-                .where(
-                    (Product.name == product_name) & (Product.tenant_id == tenant_id)
+            product_record = None
+            if lookup_filters:
+                # Core query to find identity based on ANY matching properties provided
+                product_stmt = (
+                    select(Product)
+                    .options(selectinload(Product.brand))
+                    .where((Product.tenant_id == tenant_id) & or_(*lookup_filters))
                 )
-            )
-            product_result = await db.execute(product_stmt)
-            product_record = product_result.scalar_one_or_none()
+                product_result = await db.execute(product_stmt)
+                product_record = product_result.scalar_one_or_none()
 
             # --- DYNAMIC INGESTION STRATEGY ENGINE ---
             if not product_record:
+                fallback_identifier = (
+                    product_name or sku or ean or upc or mpn or "Unknown Asset"
+                )
                 yield json.dumps(
                     {
                         "type": "status",
                         "color": "orange",
-                        "message": f"Product '{product_name}' not found. Resolving brand references...",
+                        "message": f"Product mapping reference '{fallback_identifier}' not found. Resolving brand references...",
                     }
                 ) + "\n"
 
@@ -451,7 +453,7 @@ class ChatService:
                 if not brand_record:
                     brand_record = Brand(
                         tenant_id=tenant_id,
-                        name=brand_name,  # Correctly saving the brand name inside Brand
+                        name=brand_name,
                         country=target_country,
                         created_by=user_id,
                     )
@@ -462,24 +464,28 @@ class ChatService:
                 product_record = Product(
                     tenant_id=tenant_id,
                     brand_id=brand_record.id,
-                    name=product_name,
+                    name=product_name or f"Product-{sku or ean or fallback_identifier}",
                     brand_name=brand_name,
+                    sku=sku,
+                    ean=ean,
+                    upc=upc,
+                    mpn=mpn,
                     created_by=user_id,
                 )
                 db.add(product_record)
-
-                # FORCE HARD RETENTION COMMIT
                 await db.commit()
 
                 yield json.dumps(
                     {
                         "type": "status",
                         "color": "green",
-                        "message": f"Registered new product profile for '{product_name}' successfully.",
+                        "message": f"Registered new product profile entry successfully.",
                     }
                 ) + "\n"
 
             product_id = product_record.id
+            if not product_name:
+                product_name = product_record.name
 
             # Parse competitor context out of relational entities safely
             if product_record.brand and product_record.brand.competitor:
@@ -629,8 +635,7 @@ This analytical matrix was compiled within your dynamic threshold window ({self.
             chat_record = Chat(
                 tenant_id=tenant_id,
                 product_id=final_output["matched_product_id"],
-                product_name=final_output["product_name"],
-                # Safely fallback to an empty string if product_url evaluates to None
+                product_name=final_output["product_name"] or "Unknown Product",
                 product_url=data.get("product_url") or "",
                 extra_context=final_output["extra_context"],
                 model_used=data.get("model", "gpt-4o"),
