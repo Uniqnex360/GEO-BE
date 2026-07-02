@@ -9,6 +9,7 @@ from .chat import router as chat_router
 from .ai_engine import router as ai_engine_router
 from .citation import router as citation_router
 from .competitor import router as competitor_router
+from .tenant import router as tenant_router
 
 router = APIRouter()
 
@@ -21,3 +22,4 @@ router.include_router(chat_router, prefix="/chat", tags=["Chat"])
 router.include_router(ai_engine_router, prefix="/ai-engine", tags=["AI Engine"])
 router.include_router(citation_router, prefix="/citation", tags=["Citation"])
 router.include_router(competitor_router, prefix="/competitor", tags=["Competitor"])
+router.include_router(tenant_router, prefix="/tenant", tags=["Tenant"])
