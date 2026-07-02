@@ -145,9 +145,6 @@ class PromptFactory:
         """
 
 
-# ==========================================
-# 3. CORE SERVICE IMPLEMENTATION
-# ==========================================
 class ChatService:
     NUM_QUERIES_TO_GENERATE = 2
     TARGET_PERSONA = "Generative Engine Optimization (GEO) Expert"
@@ -175,18 +172,27 @@ class ChatService:
             )
 
     # ==========================================
-    # LANGGRAPH EXECUTION PIPELINE NODES
+    # LANGGRAPH EXECUTION PIPELINE NODES (SAFE LOOKUPS)
     # ==========================================
 
-    async def generate_geo_queries_node(self, state: AgentState) -> Dict[str, Any]:
+    async def generate_geo_queries_node(self, state: dict) -> Dict[str, Any]:
         """Node 1: Generates exploration queries using the targeted LLM context."""
-        llm = self._get_llm(state["model_name"])
-        response = await llm.ainvoke(state["messages"])
+        model_name = state.get("model_name") or "gpt-4o"
+        llm = self._get_llm(model_name)
+        response = await llm.ainvoke(state.get("messages", []))
         return {"messages": [response]}
 
-    async def extract_queries_node(self, state: AgentState) -> Dict[str, Any]:
+    async def extract_queries_node(self, state: dict) -> Dict[str, Any]:
         """Node 2: Sanitizes, extracts, and parses responses into cleaner arrays."""
-        last_message = state["messages"][-1]
+        messages = state.get("messages", [])
+        if not messages:
+            return {
+                "generated_queries": [],
+                "current_query_index": 0,
+                "query_records_db_payload": [],
+            }
+
+        last_message = messages[-1]
         content = str(last_message.content)
         try:
             clean_content = content.strip().replace("```json", "").replace("```", "")
@@ -204,18 +210,24 @@ class ChatService:
             "query_records_db_payload": [],
         }
 
-    async def evaluate_query_visibility_node(self, state: AgentState) -> Dict[str, Any]:
+    async def evaluate_query_visibility_node(self, state: dict) -> Dict[str, Any]:
         """Node 3: Mentions trace loop. Aggregates metrics & computes historical variances."""
-        idx = state["current_query_index"]
-        current_query = state["generated_queries"][idx]
-        llm = self._get_llm(state["model_name"])
+        idx = state.get("current_query_index", 0)
+        generated_queries = state.get("generated_queries", [])
+
+        if not generated_queries or idx >= len(generated_queries):
+            return {"current_query_index": idx + 1}
+
+        current_query = generated_queries[idx]
+        model_name = state.get("model_name") or "gpt-4o"
+        llm = self._get_llm(model_name)
 
         competitor_context = state.get("competitors", [])
         evaluation_prompt = PromptFactory.get_visibility_evaluation_prompt(
             current_query=current_query,
-            product_name=state["product_name"] or "Unknown Product",
-            brand_name=state["brand_name"],
-            target_country=state["target_country"],
+            product_name=state.get("product_name") or "Unknown Product",
+            brand_name=state.get("brand_name") or "Generic/Multi-Brand",
+            target_country=state.get("target_country") or "United States of America",
             competitor_context=competitor_context,
         )
 
@@ -285,16 +297,19 @@ class ChatService:
         }
 
     def loop_queries_condition(
-        self, state: AgentState
+        self, state: dict
     ) -> Literal["evaluate_query", "compiler"]:
-        if state["current_query_index"] < len(state["generated_queries"]):
+        idx = state.get("current_query_index", 0)
+        generated_queries = state.get("generated_queries", [])
+        if idx < len(generated_queries):
             return "evaluate_query"
         return "compiler"
 
-    async def compile_geo_report_node(self, state: AgentState) -> Dict[str, Any]:
+    async def compile_geo_report_node(self, state: dict) -> Dict[str, Any]:
         """Node 4: Processes full analytical matrix dataset into a finalized strategic roadmap."""
-        llm = self._get_llm(state["model_name"])
-        matrix_context = json.dumps(state["query_records_db_payload"], indent=2)
+        model_name = state.get("model_name") or "gpt-4o"
+        llm = self._get_llm(model_name)
+        matrix_context = json.dumps(state.get("query_records_db_payload", []), indent=2)
 
         summary_prompt = PromptFactory.get_geo_report_prompt(matrix_context)
         response = await llm.ainvoke([HumanMessage(content=summary_prompt)])
@@ -306,7 +321,7 @@ class ChatService:
 
     async def start_analysis(
         self,
-        db: AsyncSession,
+        db: Any,  # AsyncSession
         data: dict,
         tenant_id: int,
         user_id: Optional[int] = None,
@@ -321,7 +336,9 @@ class ChatService:
         await asyncio.sleep(0.1)
 
         product_name = data.get("product_name")
-        product_url = data.get("product_url")
+        product_url = data.get("product_url") or data.get(
+            "website"
+        )  # Dynamic fallback mapping
         sku = data.get("sku")
         ean = data.get("ean")
         upc = data.get("upc")
@@ -397,7 +414,7 @@ class ChatService:
 
         brand_name = data.get("brand_name") or product_name or "Generic/Multi-Brand"
 
-        # Handle incoming target region lists or strings from frontend payload
+        # Safe parsing strategy for list or string variants from frontend payload
         fe_countries = data.get("countries")
         if isinstance(fe_countries, list) and len(fe_countries) > 0:
             target_country = ", ".join(fe_countries)
@@ -421,7 +438,6 @@ class ChatService:
         try:
             product_record = None
             if lookup_filters:
-                # Core query to find identity based on ANY matching properties provided
                 product_stmt = (
                     select(Product)
                     .options(selectinload(Product.brand))
@@ -443,43 +459,44 @@ class ChatService:
                     }
                 ) + "\n"
 
-                # Look up or build parent brand infrastructure
                 brand_stmt = select(Brand).where(
                     (Brand.name == brand_name) & (Brand.tenant_id == tenant_id)
                 )
                 brand_result = await db.execute(brand_stmt)
                 brand_record = brand_result.scalar_one_or_none()
 
-                if not brand_record:
-                    brand_record = Brand(
+                # Savepoint block isolates transaction failures safely
+                async with db.begin_nested():
+                    if not brand_record:
+                        brand_record = Brand(
+                            tenant_id=tenant_id,
+                            name=brand_name,
+                            country=target_country,
+                            created_by=user_id,
+                        )
+                        db.add(brand_record)
+                        await db.flush()
+
+                    product_record = Product(
                         tenant_id=tenant_id,
-                        name=brand_name,
-                        country=target_country,
+                        brand_id=brand_record.id,
+                        name=product_name
+                        or f"Product-{sku or ean or fallback_identifier}",
+                        brand_name=brand_name,
+                        sku=sku,
+                        ean=ean,
+                        upc=upc,
+                        mpn=mpn,
                         created_by=user_id,
                     )
-                    db.add(brand_record)
-                    await db.flush()  # Populates brand_record.id safely
-
-                # Create and insert the missing product entity structure
-                product_record = Product(
-                    tenant_id=tenant_id,
-                    brand_id=brand_record.id,
-                    name=product_name or f"Product-{sku or ean or fallback_identifier}",
-                    brand_name=brand_name,
-                    sku=sku,
-                    ean=ean,
-                    upc=upc,
-                    mpn=mpn,
-                    created_by=user_id,
-                )
-                db.add(product_record)
+                    db.add(product_record)
                 await db.commit()
 
                 yield json.dumps(
                     {
                         "type": "status",
                         "color": "green",
-                        "message": f"Registered new product profile entry successfully.",
+                        "message": "Registered new product profile entry successfully.",
                     }
                 ) + "\n"
 
@@ -487,7 +504,6 @@ class ChatService:
             if not product_name:
                 product_name = product_record.name
 
-            # Parse competitor context out of relational entities safely
             if product_record.brand and product_record.brand.competitor:
                 competitors = [
                     c.strip()
@@ -523,19 +539,11 @@ class ChatService:
                 yield json.dumps(
                     {
                         "type": "result",
-                        "content": f"""
-# Session Metrics Fetched via Warm Retention Cache
-
-This analytical matrix was compiled within your dynamic threshold window ({self.RETENTION_DAYS_THRESHOLD} days) for {target_country}. No additional system units were expended.
-
-## Executive GEO Roadmap Summary
-{existing_recent_chat.final_optimization_report}
-""",
+                        "content": f"\n# Session Metrics Fetched via Warm Retention Cache\n\nThis analytical matrix was compiled within your dynamic threshold window ({self.RETENTION_DAYS_THRESHOLD} days) for {target_country}. No additional system units were expended.\n\n## Executive GEO Roadmap Summary\n{existing_recent_chat.final_optimization_report}\n",
                     }
                 ) + "\n"
                 return
 
-            # Fetch historical data if no recent chat exists to build the benchmark
             metrics_stmt = (
                 select(ChatSearchQuery)
                 .join(Chat)
@@ -573,7 +581,9 @@ This analytical matrix was compiled within your dynamic threshold window ({self.
         # ==========================================
         # GRAPH CONTEXT STATE MACHINE BUILDER
         # ==========================================
-        workflow = StateGraph(AgentState)
+        workflow = StateGraph(
+            dict
+        )  # Native dict schema configuration handles merges safely
         workflow.add_node("generator", self.generate_geo_queries_node)
         workflow.add_node("extractor", self.extract_queries_node)
         workflow.add_node("evaluate_query", self.evaluate_query_visibility_node)
@@ -590,7 +600,6 @@ This analytical matrix was compiled within your dynamic threshold window ({self.
         workflow.add_edge("compiler", END)
         agent_graph = workflow.compile()
 
-        # Build execution prompts via the factory pattern engine
         system_prompt = SystemMessage(content=f"You are a {self.TARGET_PERSONA}.")
         user_prompt_content = PromptFactory.get_query_generation_prompt(
             product_name=product_name,
@@ -617,7 +626,7 @@ This analytical matrix was compiled within your dynamic threshold window ({self.
             "final_report": "",
         }
 
-        # Execute Graph processing sequence
+        # Invoking state pipeline execution run
         final_output = await agent_graph.ainvoke(initial_state)
 
         # ==========================================
@@ -632,33 +641,34 @@ This analytical matrix was compiled within your dynamic threshold window ({self.
         ) + "\n"
 
         try:
-            chat_record = Chat(
-                tenant_id=tenant_id,
-                product_id=final_output["matched_product_id"],
-                product_name=final_output["product_name"] or "Unknown Product",
-                product_url=data.get("product_url") or "",
-                extra_context=final_output["extra_context"],
-                model_used=data.get("model", "gpt-4o"),
-                final_optimization_report=final_output["final_report"],
-            )
-
-            for q_item in final_output["query_records_db_payload"]:
-                child_record = ChatSearchQuery(
-                    query_text=q_item["query_text"],
-                    product_found=q_item["product_found"],
-                    share_of_voice=q_item["share_of_voice"],
-                    total_websites_found=q_item["total_websites_found"],
-                    citation_rank=q_item["citation_rank"],
-                    platform_breakdown=q_item["platform_breakdown"],
-                    best_metrics_variance=q_item["best_metrics_variance"],
-                    raw_api_response=q_item["raw_api_response"],
-                    citing_sources=q_item["citing_sources"],
-                    competitors_mentioned=q_item["competitors_mentioned"],
-                    query_optimization_tips=q_item["query_optimization_tips"],
+            async with db.begin_nested():
+                chat_record = Chat(
+                    tenant_id=tenant_id,
+                    product_id=final_output.get("matched_product_id"),
+                    product_name=final_output.get("product_name") or "Unknown Product",
+                    product_url=product_url or "",
+                    extra_context=final_output.get("extra_context", ""),
+                    model_used=data.get("model", "gpt-4o"),
+                    final_optimization_report=final_output.get("final_report", ""),
                 )
-                chat_record.search_queries.append(child_record)
 
-            db.add(chat_record)
+                for q_item in final_output.get("query_records_db_payload", []):
+                    child_record = ChatSearchQuery(
+                        query_text=q_item["query_text"],
+                        product_found=q_item["product_found"],
+                        share_of_voice=q_item["share_of_voice"],
+                        total_websites_found=q_item["total_websites_found"],
+                        citation_rank=q_item["citation_rank"],
+                        platform_breakdown=q_item["platform_breakdown"],
+                        best_metrics_variance=q_item["best_metrics_variance"],
+                        raw_api_response=q_item["raw_api_response"],
+                        citing_sources=q_item["citing_sources"],
+                        competitors_mentioned=q_item["competitors_mentioned"],
+                        query_optimization_tips=q_item["query_optimization_tips"],
+                    )
+                    chat_record.search_queries.append(child_record)
+
+                db.add(chat_record)
             await db.commit()
 
         except Exception as write_err:
@@ -673,13 +683,6 @@ This analytical matrix was compiled within your dynamic threshold window ({self.
         yield json.dumps(
             {
                 "type": "result",
-                "content": f"""
-# Session Metrics Compiled Successfully
-
-The session architecture processed references using completely dynamic breakdowns without any schema-locked fields for {target_country}.
-
-## Executive GEO Roadmap Summary
-{final_output['final_report']}
-""",
+                "content": f"\n# Session Metrics Compiled Successfully\n\nThe session architecture processed references using completely dynamic breakdowns without any schema-locked fields for {target_country}.\n\n## Executive GEO Roadmap Summary\n{final_output.get('final_report', '')}\n",
             }
         ) + "\n"

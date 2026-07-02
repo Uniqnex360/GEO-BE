@@ -1,7 +1,9 @@
 from .user import UserService
 from .brand import BrandService
 from .product import ProductService
-from .chat import ChatService
 from .ai_engine import AIEngineService
 from .citation import CitationService
 from .competitor import CompetitorService
+
+from .chat import ChatService
+from .chat_v2 import ChatV2Service
