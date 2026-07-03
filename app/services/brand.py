@@ -121,9 +121,9 @@ class BrandService:
 
             if value is not None:
                 setattr(brand, field, value)
-        print("i am working")
+
         brand.last_updated_by = int(user.get("sub"))
-        print("i am not working")
+
         await BrandService._save(db)
 
         await db.refresh(brand)
@@ -176,25 +176,15 @@ class BrandService:
     ):
         """list brands"""
 
-        print("brand list user", user)
+        query = (
+            select(Brand)
+            .where(Brand.tenant_id == tenant_id, Brand.is_deleted == False)
+            .order_by(Brand.created_at.desc())
+        )
 
-        is_super_admin: bool = user.get("is_super_admin", False)
-
-        # query for super admin
-        if is_super_admin:
-            query = select(Brand).order_by(Brand.created_at.desc())
-
-            count_query = select(func.count(Brand.id))
-        else:
-            query = (
-                select(Brand)
-                .where(Brand.tenant_id == tenant_id, Brand.is_deleted == False)
-                .order_by(Brand.created_at.desc())
-            )
-
-            count_query = select(func.count(Brand.id)).where(
-                Brand.tenant_id == tenant_id, Brand.is_deleted == False
-            )
+        count_query = select(func.count(Brand.id)).where(
+            Brand.tenant_id == tenant_id, Brand.is_deleted == False
+        )
 
         if search:
             query = query.where(Brand.name.ilike(f"%{search}%"))
@@ -220,15 +210,12 @@ class BrandService:
     ):
         """Return brands metadata for dropdowns"""
 
-        is_super_admin: bool = user.get("is_super_admin", False)
-
         query = select(Brand.id, Brand.name).order_by(Brand.name.asc())
 
-        if not is_super_admin:
-            query = query.where(
-                Brand.tenant_id == tenant_id,
-                Brand.is_deleted == False,
-            )
+        query = query.where(
+            Brand.tenant_id == tenant_id,
+            Brand.is_deleted == False,
+        )
 
         result = await db.execute(query)
 

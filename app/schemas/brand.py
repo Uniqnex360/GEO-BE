@@ -10,6 +10,7 @@ class BrandBase(BaseModel):
     industry: str
     country: str
     competitor: str
+    tenant_id: Optional[int]
 
 
 class BrandCreate(BrandBase):

@@ -27,9 +27,13 @@ async def create_product(
     """create product"""
 
     try:
+        data = payload.model_dump()
+
+        is_super_admin = user.get("is_super_admin")
+        tenant_id = data.get("tenant_id") if is_super_admin else user.get("tenant_id")
 
         response = await ProductService.create_product(
-            db=db, data=payload.model_dump(), user=user, tenant_id=user.get("tenant_id")
+            db=db, data=payload.model_dump(), user=user, tenant_id=tenant_id
         )
 
         return {"message": "Product created successfully", "data": response}
@@ -107,15 +111,21 @@ async def list_products(
     search: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(validate_jwt_token),
+    tenant_id: Optional[int] = Query(
+        None, description="Super admins can filter by a specific tenant ID"
+    ),
 ):
     """list products"""
+
+    is_super_admin = user.get("is_super_admin", False)
+    active_tenant_id = tenant_id if is_super_admin else user.get("tenant_id")
 
     try:
 
         products, total = await ProductService.list_products(
             db=db,
             user=user,
-            tenant_id=user.get("tenant_id"),
+            tenant_id=active_tenant_id,
             page=page,
             limit=limit,
             search=search,
@@ -140,10 +150,11 @@ async def product_detail(
 
     try:
 
-        data = await ProductService.detail(db=db, product_id=product_id, tenant_id=user.get("tenant_id"), user=user)
+        data = await ProductService.detail(
+            db=db, product_id=product_id, tenant_id=user.get("tenant_id"), user=user
+        )
 
         return data
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-

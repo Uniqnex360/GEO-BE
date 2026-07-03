@@ -1,3 +1,4 @@
+from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, case, cast, or_, Numeric
 from sqlalchemy.orm import selectinload
@@ -440,74 +441,52 @@ class ProductService:
     async def list_products(
         db: AsyncSession,
         user: dict,
-        tenant_id: int,
+        tenant_id: Optional[int],
         page: int = 1,
         limit: int = 20,
         search: str = None,
     ):
-        """List products with GEO analytics summary"""
+        """List products with GEO analytics summary and correct admin filtering"""
 
-        is_super_admin = user.get(
-            "is_super_admin",
-            False,
-        )
+        is_super_admin = user.get("is_super_admin", False)
 
+        # Base query initialization matching your current logic...
         query = (
             select(
                 Product,
-                # Total GEO sessions
                 func.count(func.distinct(Chat.id)).label("total_chats"),
-                # Total search queries
                 func.count(ChatSearchQuery.id).label("total_queries"),
-                # Avg share of voice
                 func.coalesce(
                     func.round(
-                        cast(
-                            func.avg(ChatSearchQuery.share_of_voice),
-                            Numeric,
-                        ),
-                        2,
+                        cast(func.avg(ChatSearchQuery.share_of_voice), Numeric), 2
                     ),
                     0,
                 ).label("avg_share_of_voice"),
-                # Avg citation rank
                 func.coalesce(
                     func.round(
-                        cast(
-                            func.avg(ChatSearchQuery.citation_rank),
-                            Numeric,
-                        ),
-                        2,
+                        cast(func.avg(ChatSearchQuery.citation_rank), Numeric), 2
                     ),
                     0,
                 ).label("avg_citation_rank"),
-                # Visibility rate %
                 func.coalesce(
                     func.round(
                         (
                             cast(
                                 func.sum(
                                     case(
-                                        (
-                                            ChatSearchQuery.product_found.is_(True),
-                                            1,
-                                        ),
+                                        (ChatSearchQuery.product_found.is_(True), 1),
                                         else_=0,
                                     )
                                 ),
                                 Numeric,
                             )
-                            / func.nullif(
-                                func.count(ChatSearchQuery.id),
-                                0,
-                            )
+                            / func.nullif(func.count(ChatSearchQuery.id), 0)
                         )
                         * 100,
                         2,
                     ),
                     0,
                 ).label("visibility_rate"),
-                # Competitor mentions
                 func.coalesce(
                     func.sum(
                         func.coalesce(
@@ -519,21 +498,16 @@ class ProductService:
                     ),
                     0,
                 ).label("competitor_mentions"),
-                # Citation sources count
                 func.coalesce(
                     func.sum(
                         func.coalesce(
-                            func.jsonb_array_length(ChatSearchQuery.citing_sources),
-                            0,
+                            func.jsonb_array_length(ChatSearchQuery.citing_sources), 0
                         )
                     ),
                     0,
                 ).label("citation_count"),
-                # Last analyzed
                 func.max(Chat.created_at).label("last_analysis"),
             )
-            # Match by product_id
-            # Fallback: product_name when product_id missing
             .outerjoin(
                 Chat,
                 or_(
@@ -544,10 +518,7 @@ class ProductService:
                     ),
                 ),
             )
-            .outerjoin(
-                ChatSearchQuery,
-                Chat.id == ChatSearchQuery.chat_id,
-            )
+            .outerjoin(ChatSearchQuery, Chat.id == ChatSearchQuery.chat_id)
             .options(
                 selectinload(Product.features),
                 selectinload(Product.faqs),
@@ -558,45 +529,45 @@ class ProductService:
 
         count_query = select(func.count(Product.id))
 
+        # =========================================================
+        # FIXED FILTER PIPELINE
+        # =========================================================
+        # Rule 1: Nobody should see soft-deleted records
+        filters = [Product.is_deleted.is_(False)]
+
         if not is_super_admin:
+            # Regular users are locked strictly to their assigned active tenant
+            filters.append(Product.tenant_id == tenant_id)
+        else:
+            # Super admins only apply tenant filters if they passed one via query string params
+            if tenant_id:
+                filters.append(Product.tenant_id == tenant_id)
 
-            filters = [
-                Product.tenant_id == tenant_id,
-                Product.is_deleted.is_(False),
-            ]
+        # Inject calculated constraints safely
+        query = query.where(*filters)
+        count_query = count_query.where(*filters)
+        # =========================================================
 
-            query = query.where(*filters)
-
-            count_query = count_query.where(*filters)
-
+        # Search Filter
         if search:
-
             search_filter = Product.name.ilike(f"%{search}%")
-
             query = query.where(search_filter)
-
             count_query = count_query.where(search_filter)
 
+        # Ordering & Pagination Execution
         query = query.order_by(Product.created_at.desc())
-
         offset = (page - 1) * limit
-
         query = query.offset(offset).limit(limit)
 
         result = await db.execute(query)
-
         rows = result.all()
 
         total_result = await db.execute(count_query)
-
-        total = total_result.scalar()
+        total = total_result.scalar() or 0
 
         products = []
-
         for row in rows:
-
             product = row.Product
-
             product.analytics = {
                 "total_chats": int(row.total_chats or 0),
                 "total_queries": int(row.total_queries or 0),
@@ -607,7 +578,6 @@ class ProductService:
                 "citation_count": int(row.citation_count or 0),
                 "last_analysis": row.last_analysis,
             }
-
             products.append(product)
 
         return products, total

@@ -59,12 +59,12 @@ class ProductBase(BaseModel):
 class ProductCreate(ProductBase):
     """schema for product creation"""
 
-    pass
+    tenant_id: Optional[int]
 
 class ProductUpdate(ProductBase):
     """schema for product update"""
 
-    id: int
+    tenant_id: Optional[int]
 
 
 class ProductDetail(ProductBase):
