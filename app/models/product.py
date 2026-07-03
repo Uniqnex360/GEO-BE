@@ -1,3 +1,4 @@
+from typing import Optional
 from sqlalchemy import ForeignKey, String, Text, Float, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -78,6 +79,9 @@ class Product(BaseModel):
     meta_title: Mapped[str] = mapped_column(Text, nullable=True)
     meta_description: Mapped[str] = mapped_column(Text, nullable=True)
     meta_keywords: Mapped[str] = mapped_column(Text, nullable=True)
+
+    no_of_faqs: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=None)
+    no_of_reviews: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=None)
 
     # relationships
     tenant: Mapped["Tenant"] = relationship(back_populates="products")

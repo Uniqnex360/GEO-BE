@@ -27,9 +27,13 @@ async def create_brand(
     """create brand"""
 
     try:
-
+        is_super_admin = user.get("is_super_admin")
+        data = payload.model_dump()
+        print("data", data)
+        tenant_id = data.get("tenant_id") if is_super_admin else user.get("tenant_id")
+        print("tenant id", tenant_id)
         response = await BrandService.create_brand(
-            db=db, data=payload.model_dump(), user=user, tenant_id=user.get("tenant_id")
+            db=db, data=data, user=user, tenant_id=tenant_id
         )
 
         return {"message": "Brand created successfully", "data": response}
@@ -48,7 +52,6 @@ async def update_brand(
     """update brand"""
 
     try:
-
         response = await BrandService.update_brand(
             db=db,
             brand_id=brand_id,
@@ -104,6 +107,7 @@ async def delete_brand(
 async def list_brands(
     page: int = Query(1, ge=1),
     limit: int = Query(24, ge=1),
+    tenant_id: int = Query(None),
     search: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(validate_jwt_token),
@@ -112,10 +116,13 @@ async def list_brands(
 
     try:
 
+        is_super_admin = user.get("is_super_admin")
+        tenant_id = tenant_id if is_super_admin else user.get("tenant_id")
+
         brands, total = await BrandService.list_brands(
             db=db,
             user=user,
-            tenant_id=user.get("tenant_id"),
+            tenant_id=tenant_id,
             page=page,
             limit=limit,
             search=search,
@@ -132,15 +139,19 @@ async def list_brands(
 
 @router.get("/meta-list/")
 async def meta_brand_list(
-    db: AsyncSession = Depends(get_db), user: dict = Depends(validate_jwt_token)
+    tenant_id: int = Query(None),
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(validate_jwt_token),
 ):
     """api that lists all brands for a tenant"""
 
     try:
+        is_super_admin = user.get("is_super_admin")
+        tenant_id = tenant_id if is_super_admin else user.get("tenant_id")
         brands = await BrandService.meta_list(
             db=db,
             user=user,
-            tenant_id=user.get("tenant_id"),
+            tenant_id=tenant_id,
         )
         return brands
     except Exception as e:
