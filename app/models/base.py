@@ -1,4 +1,5 @@
 from datetime import datetime, UTC
+from enum import Enum as PyEnum
 
 from sqlalchemy import Boolean, DateTime
 from sqlalchemy.orm import Mapped, mapped_column
@@ -26,3 +27,14 @@ class BaseModel(Base):
     # delete and active status
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class LLMModels(str, PyEnum):
+    """Tracking Enum for allowed GEO execution engines."""
+
+    # OpenAI
+    GPT = "gpt-5-nano"
+    # Google Gemini
+    GEMINI = "gemini-2.5-flash-lite"
+    # Anthropic
+    CLAUDE = "claude-3-5-haiku"
