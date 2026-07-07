@@ -32,9 +32,13 @@ class BaseModel(Base):
 class LLMModels(str, PyEnum):
     """Tracking Enum for allowed GEO execution engines."""
 
-    # OpenAI
-    GPT = "gpt-5-nano"
-    # Google Gemini
-    GEMINI = "gemini-2.5-flash-lite"
-    # Anthropic
-    CLAUDE = "claude-3-5-haiku"
+    # # OpenAI
+    # GPT = "gpt-5-nano"
+    # # Google Gemini
+    # GEMINI = "gemini-2.5-flash-lite"
+    # # Anthropic
+    # CLAUDE = "claude-3-5-haiku"
+
+    GPT = "GPT"
+    GEMINI = "GEMINI"
+    CLAUDE = "CLAUDE"

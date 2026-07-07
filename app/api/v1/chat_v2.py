@@ -31,6 +31,7 @@ class GEOAuditRequest(BaseModel):
     model_choice: LLMModels = Field(
         default=LLMModels.GPT, description="Selected LLM execution engine"
     )
+    tenant_id: int
 
 
 @router.post("/init_llm_analyzes/")
@@ -43,11 +44,12 @@ async def execute_geo_audit_endpoint(
     Executes a multi-model responsive audit across your 3 allowed models.
     Streams immediate progress details, and records to postgresql asynchronously.
     """
-    
-    data = GEOAuditRequest().model_dump() 
-    print("data", type(data), data)
-    tenant_id = data.get("tenant_id")
-    
+
+    print("payload:", payload.model_dump())
+
     return StreamingResponse(
-        run_geo_audit_stream(payload, db, tenant_id), media_type="application/x-ndjson"
+        run_geo_audit_stream(
+            payload=payload, db=db, tenant_id=payload.tenant_id, user_id=user.get("id")
+        ),
+        media_type="application/x-ndjson",
     )

@@ -24,7 +24,9 @@ class Chat(BaseModel):
     extra_context: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     # Model Enum Implementation
-    model_choice = Column(SQLEnum(LLMModels), nullable=False, default=LLMModels.GPT)
+    model_choice: Mapped[LLMModels] = mapped_column(
+        SQLEnum(LLMModels, name="llmmodels"), nullable=False, default=LLMModels.GPT
+    )
 
     # Additional captured arrays
     competitor_analytics: Mapped[List[Dict[str, Any]]] = mapped_column(

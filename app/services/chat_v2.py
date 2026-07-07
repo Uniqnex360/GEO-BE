@@ -1,8 +1,7 @@
 import json
-import asyncio
 from typing import Optional, Any
 from datetime import datetime, timedelta
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, RootModel
 
 from langchain.agents import create_agent
 from langchain.tools import tool
@@ -15,6 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.base import LLMModels
 from app.models import Product, Brand, Chat, ChatSearchQuery, ChatGEOAuditRecord
 
+from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_anthropic import ChatAnthropic
+
 RETENTION_DAYS_THRESHOLD = 7
 
 
@@ -25,6 +28,12 @@ CRITICAL SCHEMA DIRECTION:
 Every dictionary field within the 'product_details' object MUST be structured as a JSON object containing EXACTLY these keys: "value", "score", and "tips".
 Output only valid JSON conforming perfectly to the schema definition.
 """
+
+
+class PlatformBreakdownMetrics(BaseModel):
+    google: int = Field(default=0, description="Count for Google platform.")
+    anthropic: int = Field(default=0, description="Count for Anthropic platform.")
+    openai: int = Field(default=0, description="Count for OpenAI search platform.")
 
 
 class GEOAuditRequest(BaseModel):
@@ -81,8 +90,18 @@ class GEOAuditRequest(BaseModel):
 
 
 # ==========================================
-# 3. YOUR EXACT PYDANTIC OUTPUT SCHEMAS
+# 3. DYNAMIC & COMPLIANT OUTPUT SCHEMAS
 # ==========================================
+class AssetMetrics(BaseModel):
+    images: bool = Field(default=False, description="True if images are present.")
+    videos: bool = Field(default=False, description="True if videos are present.")
+
+
+class PlatformBreakdownMetrics(BaseModel):
+    google: int = Field(default=0, description="Count for Google platform.")
+    anthropic: int = Field(default=0, description="Count for Anthropic platform.")
+    openai: int = Field(default=0, description="Count for OpenAI search platform.")
+    bing: int = Field(default=0, description="Count for Bing platform.")
 
 
 class CompetitorMetrics(BaseModel):
@@ -96,58 +115,57 @@ class CompetitorMetrics(BaseModel):
     no_of_attributes: int = Field(
         description="Count of product attributes/specs listed."
     )
-    assets_present: dict[str, bool] = Field(
-        description="Media asset indicators (e.g., {'images': true, 'videos': false})."
-    )
+    assets_present: AssetMetrics = Field(description="Media asset indicators.")
     no_of_features: int = Field(description="Count of main features listed.")
     word_count: int = Field(description="Word count of their product description.")
 
 
+class GEOAuditField(BaseModel):
+    """Used ONLY for elements undergoing rich copy visibility auditing."""
+
+    value: str = Field(
+        default="", description="The extracted data string or content description."
+    )
+    score: int = Field(
+        default=0, description="The evaluated visibility compliance score."
+    )
+    tips: str = Field(
+        default="", description="Actionable optimization recommendation text."
+    )
+
+
 class GEOProductDetail(BaseModel):
-    product_name: dict[str, Any] = Field(
-        description="Expected structure: {'value': str, 'score': int, 'tips': str}"
+    # Core Identity Strings (Simple primitives, no overengineering!)
+    product_name: str = Field(description="Name of the target product.")
+    product_url: str = Field(description="Target product landing page URL.")
+    sku: Optional[str] = Field(None, description="Stock Keeping Unit number.")
+    mpn: Optional[str] = Field(None, description="Manufacturer Part Number.")
+    upc: Optional[str] = Field(None, description="Universal Product Code.")
+    gtin: Optional[str] = Field(None, description="Global Trade Item Number.")
+    ean: Optional[str] = Field(None, description="European Article Number.")
+
+    # Quantitative Numeric Metrics
+    faqs: int = Field(default=0, description="Count of found target FAQs.")
+    reviews: int = Field(default=0, description="Count of user reviews integrated.")
+    attributes: int = Field(
+        default=0, description="Count of detailed product specifications."
     )
-    product_url: dict[str, Any] = Field(
-        description="Expected structure: {'value': str, 'score': int, 'tips': str}"
+    features: int = Field(
+        default=0, description="Count of unique item product features."
     )
-    sku: dict[str, Any] = Field(
-        description="Expected structure: {'value': str|None, 'score': int, 'tips': str}"
+
+    # Rich Content Undergoing Optimization & Scoring Analysis
+    product_title: GEOAuditField = Field(
+        description="Audit and scoring for visibility title formatting optimization."
     )
-    mpn: dict[str, Any] = Field(
-        description="Expected structure: {'value': str|None, 'score': int, 'tips': str}"
+    description_analysis: GEOAuditField = Field(
+        description="Audit and scoring for description keyword optimization."
     )
-    upc: dict[str, Any] = Field(
-        description="Expected structure: {'value': str|None, 'score': int, 'tips': str}"
+    keywords: GEOAuditField = Field(
+        description="Audit and scoring for extracted target context search terms."
     )
-    gtin: dict[str, Any] = Field(
-        description="Expected structure: {'value': str|None, 'score': int, 'tips': str}"
-    )
-    ean: dict[str, Any] = Field(
-        description="Expected structure: {'value': str|None, 'score': int, 'tips': str}"
-    )
-    product_title: dict[str, Any] = Field(
-        description="Expected structure: {'value': str, 'score': int, 'tips': str}"
-    )
-    description_analysis: dict[str, Any] = Field(
-        description="Expected structure: {'value': str, 'score': int, 'tips': str}"
-    )
-    faqs: dict[str, Any] = Field(
-        description="Expected structure: {'value': int, 'score': int, 'tips': str}"
-    )
-    reviews: dict[str, Any] = Field(
-        description="Expected structure: {'value': int, 'score': int, 'tips': str}"
-    )
-    keywords: dict[str, Any] = Field(
-        description="Expected structure: {'value': list[str], 'score': int, 'tips': str}"
-    )
-    attributes: dict[str, Any] = Field(
-        description="Expected structure: {'value': int, 'score': int, 'tips': str}"
-    )
-    features: dict[str, Any] = Field(
-        description="Expected structure: {'value': int, 'score': int, 'tips': str}"
-    )
-    assets: dict[str, Any] = Field(
-        description="Expected structure: {'value': dict[str, bool], 'score': int, 'tips': str}"
+    assets: GEOAuditField = Field(
+        description="Audit and scoring for structural image/video configurations."
     )
 
 
@@ -161,8 +179,8 @@ class ChatQueryBase(BaseModel):
         description="Count of unique reference web sources found."
     )
     citation_rank: int = Field(description="Organic ranking position across sources.")
-    platform_breakdown: dict[str, int] = Field(
-        description="Distribution count across platforms."
+    platform_breakdown: PlatformBreakdownMetrics = Field(
+        description="Distribution metrics across discovery platforms."
     )
     citing_sources: list[str] = Field(description="List of source URLs referenced.")
     competitors_mentioned: list[str] = Field(
@@ -213,16 +231,45 @@ GEO_TOOLS = [geo_web_search, scrape_product_metadata]
 
 
 async def run_geo_audit_stream(
-    payload: dict,
+    payload: GEOAuditRequest,
     db: AsyncSession,
     tenant_id: int,
     user_id: int | None = None,
 ):
-
     try:
 
+        # ======================================
+        # STRICT VALIDATION
+        # ======================================
+
+        if tenant_id is None:
+            yield json.dumps(
+                {
+                    "color": "red",
+                    "status": "failed",
+                    "message": "tenant_id is required.",
+                }
+            ) + "\n"
+            return
+
+        if payload is None:
+            yield json.dumps(
+                {
+                    "color": "red",
+                    "status": "failed",
+                    "message": "Payload cannot be empty.",
+                }
+            ) + "\n"
+            return
+
         yield json.dumps(
-            {"status": "progress", "message": "Checking product registry..."}
+            {
+                "type": "status",
+                "color": "#4f46e5",
+                "status": "progress",
+                "message": "Checking product registry...",
+                "progress_pct": 5,
+            }
         ) + "\n"
 
         product_name = payload.product_name
@@ -232,17 +279,16 @@ async def run_geo_audit_stream(
         mpn = payload.mpn
         upc = payload.upc
 
-        country = payload.country or "United States"
+        country = payload.country
 
         product_record = None
         product_id = None
         competitors = []
-
         historical_best = None
 
-        # ==============================
-        # PRODUCT LOOKUP FILTERS
-        # ==============================
+        # ======================================
+        # REQUIRE IDENTIFIERS
+        # ======================================
 
         lookup_filters = []
 
@@ -259,58 +305,63 @@ async def run_geo_audit_stream(
             lookup_filters.append(Product.upc == upc)
 
         if not lookup_filters and not product_url:
-
             yield json.dumps(
-                {"status": "failed", "message": "Missing structural identifiers."}
+                {
+                    "type": "error",
+                    "color": "#ef4444",
+                    "status": "failed",
+                    "message": "One identifier is required (product_name/sku/mpn/upc/product_url)",
+                }
             ) + "\n"
 
             return
 
-        # ==============================
-        # LOAD PRODUCT + BRAND
-        # ==============================
+        # ======================================
+        # PRODUCT LOOKUP
+        # ======================================
 
         if lookup_filters:
 
             stmt = (
                 select(Product)
                 .options(selectinload(Product.brand))
-                .where((Product.tenant_id == tenant_id) & or_(*lookup_filters))
+                .where(Product.tenant_id == tenant_id, or_(*lookup_filters))
             )
 
             result = await db.execute(stmt)
 
             product_record = result.scalar_one_or_none()
 
-        # ==============================
-        # PRODUCT EXISTS LOGIC
-        # ==============================
+        # ======================================
+        # EXISTING PRODUCT
+        # ======================================
 
         if product_record:
 
             product_id = product_record.id
 
             yield json.dumps(
-                {"status": "progress", "message": "Existing product located"}
+                {
+                    "type": "status",
+                    "color": "#4f46e5",
+                    "status": "progress",
+                    "message": "Existing product located",
+                    "progress_pct": 10,
+                }
             ) + "\n"
 
             if product_record.brand and product_record.brand.competitor:
-
                 competitors = [
                     c.strip()
                     for c in product_record.brand.competitor.split(",")
                     if c.strip()
                 ]
 
-            # ==========================
-            # CACHE RETENTION
-            # ==========================
-
             threshold = datetime.now() - timedelta(days=RETENTION_DAYS_THRESHOLD)
 
             recent_stmt = (
                 select(Chat)
-                .where((Chat.product_id == product_id) & (Chat.created_at >= threshold))
+                .where(Chat.product_id == product_id, Chat.created_at >= threshold)
                 .order_by(Chat.created_at.desc())
                 .limit(1)
             )
@@ -320,53 +371,88 @@ async def run_geo_audit_stream(
             recent_chat = recent_result.scalar_one_or_none()
 
             if recent_chat:
-
                 yield json.dumps(
                     {
+                        "type": "result",
+                        "color": "#22c55e",
                         "status": "completed",
                         "message": "Warm cache hit",
                         "report": recent_chat.final_optimization_report,
+                        "progress_pct": 100,
                     }
                 ) + "\n"
 
                 return
 
-            # ==========================
-            # HISTORICAL BENCHMARK
-            # ==========================
-
-            metrics_stmt = (
-                select(ChatSearchQuery)
-                .join(Chat)
-                .where(Chat.product_id == product_id)
-                .order_by(ChatSearchQuery.share_of_voice.desc())
-            )
-
-            metrics_result = await db.execute(metrics_stmt)
-
-            best_record = metrics_result.scalars().first()
-
-            if best_record:
-
-                historical_best = {
-                    "best_share_of_voice": best_record.share_of_voice,
-                    "best_citation_rank": best_record.citation_rank,
-                }
-
-        # ==============================
-        # PRODUCT DOES NOT EXIST
-        # ==============================
+        # ======================================
+        # NEW PRODUCT CREATION
+        # ======================================
 
         else:
 
+            # ======================================
+            # ENRICH MISSING PRODUCT DATA USING LLM
+            # ======================================
+
             yield json.dumps(
-                {"status": "progress", "message": "Creating new registry entities..."}
+                {
+                    "type": "status",
+                    "color": "#4f46e5",
+                    "status": "progress",
+                    "message": "Enriching missing product metadata...",
+                    "progress_pct": 15,
+                }
             ) + "\n"
 
-            brand_name = "Generic/Multi-Brand"
+            class ProductEnrichment(BaseModel):
+                product_name: Optional[str] = None
+                brand_name: Optional[str] = None
+                country: Optional[str] = None
+                category: Optional[str] = None
+
+            try:
+
+                enrichment_prompt = f"""
+                Extract product metadata from available identifiers.
+
+                Product Name: {product_name}
+                Product URL: {product_url}
+                SKU: {sku}
+                MPN: {mpn}
+                UPC: {upc}
+                Extra Context: {payload.extra_context}
+
+                Rules:
+                - Infer brand if possible
+                - Infer likely country if possible
+                - Infer product name if missing
+                - Return null if uncertain
+                """
+
+                enrichment_llm = ChatOpenAI(model="gpt-5-nano", temperature=0)
+
+                enriched = await enrichment_llm.with_structured_output(
+                    ProductEnrichment
+                ).ainvoke(enrichment_prompt)
+
+            except Exception:
+
+                enriched = ProductEnrichment()
+
+            # Merge inferred values safely
+
+            product_name = (
+                product_name
+                or enriched.product_name
+                or f"Unknown Product {datetime.now().timestamp()}"
+            )
+
+            brand_name = enriched.brand_name or product_name
+
+            country = country or enriched.country or "Unknown"
 
             brand_stmt = select(Brand).where(
-                (Brand.name == brand_name) & (Brand.tenant_id == tenant_id)
+                Brand.name == brand_name, Brand.tenant_id == tenant_id
             )
 
             brand_result = await db.execute(brand_stmt)
@@ -389,8 +475,9 @@ async def run_geo_audit_stream(
             product_record = Product(
                 tenant_id=tenant_id,
                 brand_id=brand_record.id,
-                name=(product_name or f"Product-{sku}"),
+                name=product_name,
                 brand_name=brand_name,
+                model_choice=LLMModels.GPT,
                 sku=sku,
                 mpn=mpn,
                 upc=upc,
@@ -404,7 +491,7 @@ async def run_geo_audit_stream(
             product_id = product_record.id
 
         # ======================================
-        # KEEP YOUR EXISTING MODEL LOOP
+        # MODEL INTERACTION LOOP
         # ======================================
 
         models = list(LLMModels)
@@ -423,6 +510,8 @@ async def run_geo_audit_stream(
 
             yield json.dumps(
                 {
+                    "type": "status",
+                    "color": "#4f46e5",
                     "status": "progress",
                     "progress_pct": progress_start,
                     "message": f"Configuring runtime pool engine: '{model_name}'...",
@@ -430,16 +519,23 @@ async def run_geo_audit_stream(
             ) + "\n"
 
             try:
+                if model_name == "GPT":
+                    actual_ai_model = ChatOpenAI(model="gpt-5-nano", temperature=0)
 
-                agent = create_agent(
-                    model=model_name,
-                    tools=GEO_TOOLS,
-                    system_prompt=GEO_SYSTEM_PROMPT,
-                    response_format=UnifiedGEOResponse,
-                )
+                elif model_name == "GEMINI":
+                    actual_ai_model = ChatGoogleGenerativeAI(
+                        model="gemini-2.5-flash", temperature=0
+                    )
+
+                else:
+                    actual_ai_model = ChatAnthropic(
+                        model="claude-3-5-sonnet-latest", temperature=0
+                    )
 
                 yield json.dumps(
                     {
+                        "type": "status",
+                        "color": "#4f46e5",
                         "status": "progress",
                         "progress_pct": progress_start + 10,
                         "message": f"[{model_name}] Extracting payload identifier strings...",
@@ -448,38 +544,95 @@ async def run_geo_audit_stream(
 
                 yield json.dumps(
                     {
+                        "type": "status",
+                        "color": "#4f46e5",
                         "status": "progress",
                         "progress_pct": progress_start + 20,
                         "message": f"[{model_name}] Invoking context analysis tracing...",
                     }
                 ) + "\n"
 
-                response_state = await asyncio.to_thread(
-                    agent.invoke,
-                    {
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": user_prompt,
-                            }
-                        ]
-                    },
-                )
+                response = await actual_ai_model.with_structured_output(
+                    UnifiedGEOResponse
+                ).ainvoke(user_prompt)
 
-                structured_json: UnifiedGEOResponse = response_state.get(
-                    "structured_response"
-                )
+                structured_json = response
 
                 if structured_json:
                     structured_json.model_used = model_name
 
                 yield json.dumps(
                     {
+                        "type": "status",
+                        "color": "#4f46e5",
                         "status": "progress",
                         "progress_pct": progress_start + 30,
                         "message": f"[{model_name}] Recording PostgreSQL logs...",
                     }
                 ) + "\n"
+
+                # ======================================================
+                # SAVE CHAT
+                # ======================================================
+
+                if structured_json:
+
+                    chat_record = Chat(
+                        tenant_id=tenant_id,
+                        product_id=product_id,
+                        product_name=(payload.product_name or ""),
+                        product_url=(payload.product_url or payload.website or ""),
+                        extra_context=payload.extra_context,
+                        model_choice=model_enum,
+                        # FIX: Using mode="json" ensures sub-models (like assets_present) flatten completely to standard dicts
+                        competitor_analytics=[
+                            competitor.model_dump(mode="json")
+                            for competitor in structured_json.competitor_analytics
+                        ],
+                        final_optimization_report=structured_json.final_optimized_tips_summary,
+                    )
+
+                    db.add(chat_record)
+
+                    # Generate ID
+                    await db.flush()
+
+                    # ======================================================
+                    # SAVE CHAT SEARCH QUERIES
+                    # ======================================================
+
+                    for query in structured_json.queries_executed:
+
+                        # FIX: Extract native python dict elements from Pydantic schemas using model_dump(mode="json")
+                        # This turns RootModels and custom sub-schemas into serializable databases primitives.
+                        platform_breakdown_dict = query.platform_breakdown.model_dump(
+                            mode="json"
+                        )
+
+                        search_record = ChatSearchQuery(
+                            chat_id=chat_record.id,
+                            chat_context=query.chat_context,
+                            brand_name=query.brand,
+                            query_text=query.query,
+                            product_found=query.product_found,
+                            share_of_voice=query.share_of_voice,
+                            total_websites_found=query.total_websites_found,
+                            citation_rank=query.citation_rank,
+                            platform_breakdown=platform_breakdown_dict,  # FIX applied here
+                            best_metrics_variance={},
+                            raw_api_response=json.dumps(
+                                query.model_dump(mode="json")
+                            ),  # FIX applied here
+                            citing_sources=query.citing_sources,
+                            competitors_mentioned=query.competitors_mentioned,
+                            query_optimization_tips=query.optimization_tips_for_better_result,
+                        )
+
+                        db.add(search_record)
+
+                # ======================================================
+                # SAVE GEO AUDIT LOGIC
+                # ======================================================
 
                 identifier_field = (
                     payload.product_name
@@ -494,15 +647,25 @@ async def run_geo_audit_stream(
                     model_used=model_name,
                     status="SUCCESS",
                     audit_data=(
-                        structured_json.model_dump() if structured_json else {}
+                        # FIX: mode="json" safely flattens all internal fields for database json storage
+                        structured_json.model_dump(mode="json")
+                        if structured_json
+                        else {}
                     ),
                 )
 
                 db.add(db_record)
+
+                # ======================================================
+                # SINGLE COMMIT
+                # ======================================================
+
                 await db.commit()
 
                 if structured_json:
-                    all_reports.append(structured_json.model_dump())
+                    all_reports.append(
+                        structured_json.model_dump(mode="json")
+                    )  # FIX applied here
 
                 yield json.dumps(
                     {
@@ -512,10 +675,25 @@ async def run_geo_audit_stream(
                     }
                 ) + "\n"
 
-            except Exception as model_error:
+                if all_reports:
 
+                    yield json.dumps(
+                        {
+                            "type": "result",
+                            "color": "#22c55e",
+                            "status": "completed",
+                            "message": "GEO audit completed successfully",
+                            "report": all_reports[-1]["final_optimized_tips_summary"],
+                            "progress_pct": 100,
+                        }
+                    ) + "\n"
+
+            except Exception as model_error:
+                await db.rollback()  # Ensure transaction failure doesn't taint future loop operations
                 yield json.dumps(
                     {
+                        "type": "error",
+                        "color": "#f59e0b",
                         "status": "warning",
                         "message": f"{model_name} failed: {str(model_error)}",
                     }

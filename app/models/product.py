@@ -1,9 +1,9 @@
 from typing import Optional
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy import ForeignKey, String, Text, Float, Integer
+from sqlalchemy import ForeignKey, String, Text, Float, Integer, Enum as SQLEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models.base import BaseModel
+from app.models.base import BaseModel, LLMModels
 
 
 class ProductFeature(BaseModel):
@@ -57,13 +57,21 @@ class Product(BaseModel):
     product_type: Mapped[str] = mapped_column(String(255), nullable=True)
     category: Mapped[str] = mapped_column(String(255), nullable=True)
 
-    sku: Mapped[dict] = mapped_column(JSONB, nullable=True)
-    mpn: Mapped[dict] = mapped_column(JSONB, nullable=True)
-    upc: Mapped[dict] = mapped_column(JSONB, nullable=True)
-    gtin: Mapped[dict] = mapped_column(JSONB, nullable=True)
-    ean: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    model_choice: Mapped[LLMModels] = mapped_column(
+        SQLEnum(
+            LLMModels, values_callable=lambda x: [e.value for e in x], name="llmmodels"
+        ),
+        nullable=False,
+        default=LLMModels.GPT,
+    )
 
-    product_url: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    sku: Mapped[str] = mapped_column(String(255), nullable=True)
+    mpn: Mapped[str] = mapped_column(String(255), nullable=True)
+    upc: Mapped[str] = mapped_column(String(255), nullable=True)
+    gtin: Mapped[str] = mapped_column(String(255), nullable=True)
+    ean: Mapped[str] = mapped_column(String(255), nullable=True)
+
+    product_url: Mapped[str] = mapped_column(Text, nullable=True)
     texonomy: Mapped[str] = mapped_column(Text, nullable=True)
     short_description: Mapped[str] = mapped_column(Text, nullable=True)
     long_description: Mapped[str] = mapped_column(Text, nullable=True)
