@@ -209,7 +209,7 @@ async def validate_headers(headers: list, template_headers: list[dict]) -> list:
 
     # 2. NEW: Standardize incoming Excel headers (lowercase, stripped, and spaces to underscores)
     cleaned_headers = [str(h).strip().lower().replace(" ", "_") for h in headers]
-
+    print('log', target_ids, cleaned_headers)
     # 3. Compare the cleaned headers
     missing_fields = [target for target in target_ids if target not in cleaned_headers]
 
