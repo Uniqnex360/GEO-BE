@@ -158,3 +158,26 @@ async def product_detail(
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/detail/v2/{product_id}")
+async def product_detail(
+    product_id: int,
+    tab: str = Query(
+        "visibility", description="Target specific dashboard tab dataset dynamically"
+    ),
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(validate_jwt_token),
+):
+    """Product detail version 2 - Dynamically filtered by active tab state"""
+    try:
+        data = await ProductService.product_detail_v2(
+            db=db,
+            product_id=product_id,
+            tenant_id=user.get("tenant_id"),
+            user=user,
+            tab=tab.lower().strip(),
+        )
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))

@@ -1,8 +1,9 @@
 from typing import Optional
-from sqlalchemy import ForeignKey, String, Text, Float, Integer
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import ForeignKey, String, Text, Float, Integer, Enum as SQLEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models.base import BaseModel
+from app.models.base import BaseModel, LLMModels
 
 
 class ProductFeature(BaseModel):
@@ -48,13 +49,21 @@ class Product(BaseModel):
     last_updated_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=True)
     deleted_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=True)
 
-    # product fields
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # product fields - Altered to JSONB to store {value, score, tips}
+    name: Mapped[dict] = mapped_column(JSONB, nullable=False)
     brand_name: Mapped[str] = mapped_column(String(255), nullable=False)
     manufacturer: Mapped[str] = mapped_column(String(255), nullable=True)
     model_number: Mapped[str] = mapped_column(String(255), nullable=True)
     product_type: Mapped[str] = mapped_column(String(255), nullable=True)
     category: Mapped[str] = mapped_column(String(255), nullable=True)
+
+    model_choice: Mapped[LLMModels] = mapped_column(
+        SQLEnum(
+            LLMModels, values_callable=lambda x: [e.value for e in x], name="llmmodels"
+        ),
+        nullable=False,
+        default=LLMModels.GPT,
+    )
 
     sku: Mapped[str] = mapped_column(String(255), nullable=True)
     mpn: Mapped[str] = mapped_column(String(255), nullable=True)
@@ -68,6 +77,14 @@ class Product(BaseModel):
     long_description: Mapped[str] = mapped_column(Text, nullable=True)
     specifications: Mapped[str] = mapped_column(Text, nullable=True)
 
+    # analysis specific fields to catch JSON details
+    description_analysis: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    features_analysis: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    attributes_analysis: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    assets: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    faqs_analysis: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    reviews_analysis: Mapped[dict] = mapped_column(JSONB, nullable=True)
+
     # price
     regular_price: Mapped[float] = mapped_column(Float, nullable=True)
     sale_price: Mapped[float] = mapped_column(Float, nullable=True)
@@ -76,12 +93,20 @@ class Product(BaseModel):
     # meta
     rating: Mapped[float] = mapped_column(Float, nullable=True)
     rating_count: Mapped[float] = mapped_column(Float, nullable=True)
-    meta_title: Mapped[str] = mapped_column(Text, nullable=True)
+    meta_title: Mapped[dict] = mapped_column(
+        JSONB, nullable=True
+    )  # Acts as product_title dict
     meta_description: Mapped[str] = mapped_column(Text, nullable=True)
-    meta_keywords: Mapped[str] = mapped_column(Text, nullable=True)
+    meta_keywords: Mapped[dict] = mapped_column(
+        JSONB, nullable=True
+    )  # Catch JSON list, score, tips
 
-    no_of_faqs: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=None)
-    no_of_reviews: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=None)
+    no_of_faqs: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, default=None
+    )
+    no_of_reviews: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, default=None
+    )
 
     # relationships
     tenant: Mapped["Tenant"] = relationship(back_populates="products")

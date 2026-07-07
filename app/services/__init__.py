@@ -6,4 +6,4 @@ from .citation import CitationService
 from .competitor import CompetitorService
 
 from .chat import ChatService
-from .chat_v2 import ChatV2Service
+from .chat_v2 import run_geo_audit_stream
