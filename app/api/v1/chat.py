@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from app.core.database import get_db, SessionLocal
 from app.core.config import settings
 from app.core.security import validate_jwt_token
-from app.services import ChatService
+from app.services import ChatService, run_geo_audit_stream
 from app.helpers import ExcelTemplateBulider, validate_headers
 
 router = APIRouter()
@@ -20,13 +20,12 @@ async def init_llm_analyzes(
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(validate_jwt_token),
 ):
-
     """
     example body
     {
-    'product_name': 'test', 
-    'product_url': 'https://www.chmarine.com/international-cruiser-250-antifoul-3L/', 
-    'extra_context': 'test', 
+    'product_name': 'test',
+    'product_url': 'https://www.chmarine.com/international-cruiser-250-antifoul-3L/',
+    'extra_context': 'test',
     'model': 'gpt-5-nano'}
     """
 
@@ -46,52 +45,73 @@ CHAT_TEMPLATE_HEADERS = [
         "comment": "Name of the Product",
     },
     {
-        "id": "brand",
-        "identity": "Brand",
+        "id": "product_url",
+        "identity": "Product URL",
         "required": False,
-        "comment": "Brand",
+        "comment": "Product landing page URL",
+    },
+    {
+        "id": "website",
+        "identity": "Website",
+        "required": True,
+        "comment": "Brand or company website/domain",
+    },
+    {
+        "id": "sku",
+        "identity": "SKU",
+        "required": False,
+        "comment": "Stock Keeping Unit",
     },
     {
         "id": "mpn",
         "identity": "MPN",
         "required": False,
-        "comment": "MPN",
+        "comment": "Manufacturer Part Number",
     },
     {
         "id": "ean",
         "identity": "EAN",
         "required": False,
-        "comment": "EAN",
+        "comment": "European Article Number (optional)",
     },
     {
         "id": "upc",
         "identity": "UPC",
         "required": False,
-        "comment": "UPC",
+        "comment": "Universal Product Code",
     },
     {
-        "id": "category",
-        "identity": "Category",
+        "id": "country",
+        "identity": "Country",
         "required": False,
-        "comment": "Category",
+        "comment": "Target country for the GEO audit",
     },
     {
-        "id": "taxonomy",
-        "identity": "Taxonomy",
+        "id": "extra_context",
+        "identity": "Extra Context",
         "required": False,
-        "comment": "Taxonomy",
+        "comment": "Additional instructions or context",
+    },
+    {
+        "id": "model_choice",
+        "identity": "Model Choice",
+        "required": False,
+        "comment": "LLM model (e.g. GPT, Gemini, Claude)",
     },
 ]
 
 CHAT_EXAMPLE_DATA = [
     {
         "product_name": "Premium Brake Pads",
-        "brand": "StopSafe",
+        "product_url": "https://example.com/products/premium-brake-pads",
+        "website": "https://stopsafe.com",
+        "sku": "SKU-10001",
         "mpn": "BP-9923-X",
         "ean": "4006381333931",
         "upc": "884616012345",
-        "category": "Braking System",
-        "taxonomy": "Auto Parts > Brakes > Brake Pads",
+        "country": "United States",
+        "extra_context": "Focus on automotive aftermarket competitors.",
+        "model_choice": "GPT",
     },
 ]
 
@@ -122,94 +142,29 @@ async def generate_chat_template(
     )
 
 
-# @router.post("/bulk-upload/")
-# async def upload_excel(
-#     file: UploadFile = File(...),
-#     user: dict = Depends(validate_jwt_token),
-#     db: AsyncSession = Depends(get_db),
-# ):
-#     try:
-#         # -------- Step 1: Read and parse the file --------
-#         contents = await file.read()
-#         excel_file = BytesIO(contents)
-
-#         workbook = load_workbook(excel_file)
-#         sheet = workbook.active
-#         data = list(sheet.iter_rows(values_only=True))
-
-#         if not data:
-#             raise HTTPException(status_code=400, detail="Excel file is empty")
-
-#         headers = data[0]
-#         rows = data[1:]
-
-#         # -------- Step 2: Validate Headers --------
-#         validation = await validate_headers(headers, CHAT_TEMPLATE_HEADERS)
-
-#         if validation:
-#             raise HTTPException(
-#                 status_code=400,
-#                 detail=f"Missing Columns: {', '.join(validation)}, kindly use the template file",
-#             )
-
-#         # -------- Step 3: Initialize tracking variables --------
-#         created = 0
-#         updated = 0
-#         error_rows = []
-
-#         # ==========================================
-#         # TODO: PLACE YOUR BUSINESS LOGIC HERE
-#         # - Clean & validate rows in memory
-#         # - Fetch existing database records
-#         # - Compare and build insert/update instances
-#         # - db.add_all() / db.commit()
-#         # ==========================================
-
-#         # -------- Step 4: Handle error file generation if necessary --------
-#         if error_rows:
-#             error_headers = [
-#                 *CHAT_TEMPLATE_HEADERS,
-#                 {
-#                     "id": "error",
-#                     "identity": "Error",
-#                     "error": True,
-#                     "comment": "Reason for the failure",
-#                 },
-#             ]
-
-#             builder = ExcelTemplateBulider(
-#                 headers=error_headers,
-#                 sheet_name="chat_bulk_import_errors",
-#                 data=error_rows,
-#             )
-
-#             wb = builder.build()
-#             buffer = BytesIO()
-#             wb.save(buffer)
-#             buffer.seek(0)
-
-#             return StreamingResponse(
-#                 buffer,
-#                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-#                 headers={
-#                     "Content-Disposition": "attachment; filename=chat_bulk_import_errors.xlsx"
-#                 },
-#             )
-
-#         # -------- Step 5: Return successful response --------
-#         return {
-#             "created": created,
-#             "updated": updated,
-#             "errors": 0,
-#         }
-
-#     except HTTPException:
-#         # Re-raise FastAPIs HTTPExceptions so they don't get caught by the generic Exception handler
-#         raise
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Import Failed: {str(e)}")
+from pydantic import BaseModel, Field
+from typing import Optional
+from app.models.base import LLMModels
 
 
+class GEOAuditRequest(BaseModel):
+    """V2 Flexible Request Inputs for multiple source identification types."""
+
+    product_name: Optional[str] = Field(None, description="Name of the target product")
+    product_url: Optional[str] = Field(
+        None, description="Target product landing page URL"
+    )
+    website: Optional[str] = Field(None, description="Brand/corporate target domain")
+    sku: Optional[str] = Field(None, description="Stock Keeping Unit number")
+    mpn: Optional[str] = Field(None, description="Manufacturer Part Number")
+    upc: Optional[str] = Field(None, description="Universal Product Code")
+    country: Optional[str] = Field(None, description="Target geographical focus region")
+    extra_context: Optional[str] = Field(
+        None, description="Additional context parameter text"
+    )
+    model_choice: LLMModels = Field(
+        default=LLMModels.GPT, description="Selected LLM execution engine"
+    )
 
 
 async def process_row_background_task(
@@ -223,10 +178,15 @@ async def process_row_background_task(
     # Create an isolated database session block per row context loop to avoid session contention
     async with session_factory() as db:
         try:
-            chat_service = ChatService()
             # Consume generator results safely without breaking execution loops
-            async for log in chat_service.start_analysis(
-                db=db, data=row_data, tenant_id=tenant_id, user_id=user_id
+            # async for log in chat_service.start_analysis(
+            #     db=db, data=row_data, tenant_id=tenant_id, user_id=user_id
+            # ):
+            async for log in run_geo_audit_stream(
+                payload=row_data,
+                db=db,
+                tenant_id=tenant_id,
+                user_id=user_id,
             ):
                 # Optionally stream or log pipeline events to external cloud monitoring engines
                 pass
@@ -295,18 +255,17 @@ async def upload_excel(
                     if row_dict.get("product_url")
                     else None
                 ),
-                "sku": str(row_dict["sku"]).strip() if row_dict.get("sku") else None,
-                "ean": str(row_dict["ean"]).strip() if row_dict.get("ean") else None,
-                "upc": str(row_dict["upc"]).strip() if row_dict.get("upc") else None,
-                "mpn": str(row_dict["mpn"]).strip() if row_dict.get("mpn") else None,
-                "brand_name": (
-                    str(row_dict["brand_name"]).strip()
-                    if row_dict.get("brand_name")
-                    else "Generic/Multi-Brand"
+                "website": (
+                    str(row_dict["website"]).strip()
+                    if row_dict.get("website")
+                    else None
                 ),
-                "countries": (
-                    str(row_dict["countries"]).strip()
-                    if row_dict.get("countries")
+                "sku": (str(row_dict["sku"]).strip() if row_dict.get("sku") else None),
+                "mpn": (str(row_dict["mpn"]).strip() if row_dict.get("mpn") else None),
+                "upc": (str(row_dict["upc"]).strip() if row_dict.get("upc") else None),
+                "country": (
+                    str(row_dict["country"]).strip()
+                    if row_dict.get("country")
                     else "United States of America"
                 ),
                 "extra_context": (
@@ -314,13 +273,12 @@ async def upload_excel(
                     if row_dict.get("extra_context")
                     else ""
                 ),
-                "model": (
-                    str(row_dict["model"]).strip()
+                "model_choice": (
+                    LLMModels(row_dict["model"])
                     if row_dict.get("model")
-                    else "gpt-4o"
+                    else LLMModels.GPT
                 ),
             }
-
             # Append the processing run straight to background execution queue loops
             background_tasks.add_task(
                 process_row_background_task,
