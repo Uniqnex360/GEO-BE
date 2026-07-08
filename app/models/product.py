@@ -50,7 +50,7 @@ class Product(BaseModel):
     deleted_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=True)
 
     # product fields - Altered to JSONB to store {value, score, tips}
-    name: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    name: Mapped[dict] = mapped_column(String, nullable=False)
     brand_name: Mapped[str] = mapped_column(String(255), nullable=False)
     manufacturer: Mapped[str] = mapped_column(String(255), nullable=True)
     model_number: Mapped[str] = mapped_column(String(255), nullable=True)
@@ -94,11 +94,11 @@ class Product(BaseModel):
     rating: Mapped[float] = mapped_column(Float, nullable=True)
     rating_count: Mapped[float] = mapped_column(Float, nullable=True)
     meta_title: Mapped[dict] = mapped_column(
-        JSONB, nullable=True
+        String, nullable=True
     )  # Acts as product_title dict
     meta_description: Mapped[str] = mapped_column(Text, nullable=True)
     meta_keywords: Mapped[dict] = mapped_column(
-        JSONB, nullable=True
+        String, nullable=True
     )  # Catch JSON list, score, tips
 
     no_of_faqs: Mapped[Optional[int]] = mapped_column(
