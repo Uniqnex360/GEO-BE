@@ -7,3 +7,4 @@ from .competitor import CompetitorService
 
 from .chat import ChatService
 from .chat_v2 import run_geo_audit_stream
+from .dashboard import TenantDashboardService
