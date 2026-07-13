@@ -29,8 +29,8 @@ class AIEngineService:
         # ------------------------------------
 
         engine_query = select(
-            Chat.model_used, func.count(Chat.id).label("queries")
-        ).group_by(Chat.model_used)
+            Chat.model_choice, func.count(Chat.id).label("queries")
+        ).group_by(Chat.model_choice)
 
         if not is_super_admin:
             engine_query = engine_query.where(Chat.tenant_id == tenant_id)
@@ -43,7 +43,7 @@ class AIEngineService:
 
         for row in engine_rows:
             engines_data.append(
-                {"name": row.model_used or "Unknown", "queries": row.queries or 0}
+                {"name": row.model_choice or "Unknown", "queries": row.queries or 0}
             )
 
         # ------------------------------------
@@ -70,7 +70,7 @@ class AIEngineService:
                     "product_name": chat.product_name or "",
                     "product_url": chat.product_url or "",
                     "extra_context": chat.extra_context or "",
-                    "engine": chat.model_used or "Unknown",
+                    "engine": chat.model_choice or "Unknown",
                     "created_at": (
                         chat.created_at.isoformat() if chat.created_at else None
                     ),

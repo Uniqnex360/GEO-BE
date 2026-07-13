@@ -225,7 +225,7 @@ class CitationService:
                     "product_name": chat.product_name,
                     "product_url": chat.product_url,
                     "extra_context": chat.extra_context,
-                    "model_used": chat.model_used,
+                    "model_used": chat.model_choice,
                     "created_at": (
                         chat.created_at.isoformat() if chat.created_at else None
                     ),
