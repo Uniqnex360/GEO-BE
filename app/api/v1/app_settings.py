@@ -11,7 +11,7 @@ router = APIRouter()
 
 @router.get("/")
 async def get_settings_data(
-    tenant_id: int = Query(6),
+    tenant_id: int = Query(2),
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(validate_jwt_token),
 ):
