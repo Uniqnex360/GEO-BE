@@ -22,3 +22,4 @@ class Tenant(BaseModel):
     users: Mapped[list["User"]] = relationship(back_populates="tenant")
     brands: Mapped[list["Brand"]] = relationship(back_populates="tenant")
     products: Mapped[list["Product"]] = relationship(back_populates="tenant")
+    app_settings: Mapped[list["AppSettings"]] = relationship(back_populates="tenant")

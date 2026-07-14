@@ -529,7 +529,7 @@ async def run_geo_audit_stream(
 
                 else:
                     actual_ai_model = ChatAnthropic(
-                        model="claude-3-5-sonnet-latest", temperature=0
+                        model="claude-haiku-4-5", temperature=0
                     )
 
                 yield json.dumps(

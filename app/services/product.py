@@ -787,7 +787,7 @@ class ProductService:
         total_queries = len(all_queries)
 
         # ------------------------------------------------------------------
-        # 3. Dynamic Platform Breakdown Engine Analysis
+        # 3. Dynamic Platform Breakdown Engine Analysis (ADAPTED TO DB COLS)
         # ------------------------------------------------------------------
         engine_scores = {
             "chatgpt": 0.0,
@@ -797,13 +797,26 @@ class ProductService:
         }
         engine_counts = {"chatgpt": 0, "gemini": 0, "claude": 0, "perplexity": 0}
 
+        # Mapper translates your database keys into frontend dashboard keys
+        platform_mapper = {
+            "openai": "chatgpt",
+            "google": "gemini",
+            "gemini": "gemini",
+            "anthropic": "claude",
+            "perplexity": "perplexity",
+        }
+
         for q in all_queries:
             breakdown = q.platform_breakdown or {}
             for platform, values in breakdown.items():
                 norm_platform = platform.lower()
-                if norm_platform in engine_scores:
-                    engine_scores[norm_platform] += float(values)
-                    engine_counts[norm_platform] += 1
+
+                # Dynamic translation from DB keys to payload keys
+                mapped_engine = platform_mapper.get(norm_platform, norm_platform)
+
+                if mapped_engine in engine_scores:
+                    engine_scores[mapped_engine] += float(values)
+                    engine_counts[mapped_engine] += 1
 
         engine_visibility_summary = {}
         for engine in engine_scores.keys():
@@ -1022,7 +1035,6 @@ class ProductService:
                         "You": min(100, total_reviews),
                         "Competitor": 75,
                     },
-                    # FIXED: Changed from len(product.faqs) to total_faqs column property to eliminate lazy loading
                     {
                         "subject": "FAQ Coverage",
                         "You": min(100, total_faqs * 5),

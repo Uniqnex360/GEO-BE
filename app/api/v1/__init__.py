@@ -13,6 +13,7 @@ from .competitor import router as competitor_router
 from .tenant import router as tenant_router
 from .meta import router as meta_router
 from .dashboard import router as dashboard_router
+from .app_settings import router as app_settings_router
 
 router = APIRouter()
 
@@ -29,4 +30,4 @@ router.include_router(competitor_router, prefix="/competitor", tags=["Competitor
 router.include_router(tenant_router, prefix="/tenant", tags=["Tenant"])
 router.include_router(meta_router, prefix="/meta", tags=["Meta"])
 router.include_router(dashboard_router, prefix="/dashboard", tags=["Dashboard"])
-
+router.include_router(app_settings_router, prefix="/settings", tags=["Settings"])
