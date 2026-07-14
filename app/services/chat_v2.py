@@ -389,11 +389,6 @@ async def run_geo_audit_stream(
         # ======================================
 
         else:
-
-            # ======================================
-            # ENRICH MISSING PRODUCT DATA USING LLM
-            # ======================================
-
             yield json.dumps(
                 {
                     "type": "status",
@@ -404,74 +399,76 @@ async def run_geo_audit_stream(
                 }
             ) + "\n"
 
+            # Add the metrics to the temporary enrichment schema
             class ProductEnrichment(BaseModel):
                 product_name: Optional[str] = None
                 brand_name: Optional[str] = None
                 country: Optional[str] = None
                 category: Optional[str] = None
+                no_of_faqs: int = Field(
+                    default=None,
+                    description="Estimated number of FAQs for this item. CRITICAL: Do not return 0; if unknown, estimate a realistic baseline count based on product type.",
+                )
+                no_of_reviews: int = Field(
+                    default=None,
+                    description="Estimated number of customer reviews for this item. CRITICAL: Do not return 0; if unknown, estimate a realistic baseline count based on product type.",
+                )
 
             try:
-
                 enrichment_prompt = f"""
-                Extract product metadata from available identifiers.
+                    You are a real-time web crawler agent. Analyze the following product metadata footprints:
 
-                Product Name: {product_name}
-                Product URL: {product_url}
-                SKU: {sku}
-                MPN: {mpn}
-                UPC: {upc}
-                Extra Context: {payload.extra_context}
+                    Product Name: {product_name}
+                    Product URL: {product_url}
+                    SKU: {sku} | MPN: {mpn} | UPC: {upc}
+                    Extra Context: {payload.extra_context}
 
-                Rules:
-                - Infer brand if possible
-                - Infer likely country if possible
-                - Infer product name if missing
-                - Return null if uncertain
+                    CRITICAL ASSIGNMENT DIRECTIONS:
+                    1. Estimate or look up real-world search index results for this item.
+                    2. Natively determine non-zero values for 'no_of_faqs' and 'no_of_reviews'. 
+                    3. If this exact SKU/MPN item has a low digital footprint in your training data, pull baseline statistics from similar marine/e-commerce category listings (e.g., popular 2.7m inflatable boat tenders usually carry 3-5 FAQs and 5-15 customer reviews across marine chandlery networks).
+                    4. Strictly DO NOT return 0 or null for these metric fields. Provide your best contextual evaluation value.
                 """
 
-                enrichment_llm = ChatOpenAI(model="gpt-5-nano", temperature=0)
+                base_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-                enriched = await enrichment_llm.with_structured_output(
+                # 2. FIX: Bind your tools list to the model instance first
+                llm_with_tools = base_llm.bind_tools(GEO_TOOLS)
+
+                # 3. Apply the structured output formatting on top of the tool-aware model
+                enriched = await llm_with_tools.with_structured_output(
                     ProductEnrichment
                 ).ainvoke(enrichment_prompt)
 
             except Exception:
-
                 enriched = ProductEnrichment()
 
             # Merge inferred values safely
-
             product_name = (
                 product_name
                 or enriched.product_name
                 or f"Unknown Product {datetime.now().timestamp()}"
             )
-
             brand_name = enriched.brand_name or product_name
-
             country = country or enriched.country or "Unknown"
 
             brand_stmt = select(Brand).where(
                 Brand.name == brand_name, Brand.tenant_id == tenant_id
             )
-
             brand_result = await db.execute(brand_stmt)
-
             brand_record = brand_result.scalar_one_or_none()
 
             if not brand_record:
-
                 brand_record = Brand(
                     tenant_id=tenant_id,
                     name=brand_name,
                     country=country,
                     created_by=user_id,
                 )
-
                 db.add(brand_record)
-
                 await db.flush()
 
+            # Create the record using the freshly extracted metrics from the enrichment LLM
             product_record = Product(
                 tenant_id=tenant_id,
                 brand_id=brand_record.id,
@@ -481,13 +478,13 @@ async def run_geo_audit_stream(
                 sku=sku,
                 mpn=mpn,
                 upc=upc,
+                no_of_faqs=enriched.no_of_faqs,  # Pass the enriched count here
+                no_of_reviews=enriched.no_of_reviews,  # Pass the enriched count here
                 created_by=user_id,
             )
 
             db.add(product_record)
-
             await db.flush()
-
             product_id = product_record.id
 
         # ======================================
@@ -560,6 +557,12 @@ async def run_geo_audit_stream(
 
                 if structured_json:
                     structured_json.model_used = model_name
+
+                    if structured_json.product_details:
+                        product_record.no_of_faqs = structured_json.product_details.faqs
+                        product_record.no_of_reviews = (
+                            structured_json.product_details.reviews
+                        )
 
                 yield json.dumps(
                     {
