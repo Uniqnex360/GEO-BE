@@ -114,6 +114,7 @@ async def list_products(
     tenant_id: Optional[int] = Query(
         None, description="Super admins can filter by a specific tenant ID"
     ),
+    brand: Optional[str] = Query(None, description="Comma-separated list of brands"),
 ):
     """list products"""
 
@@ -129,6 +130,7 @@ async def list_products(
             page=page,
             limit=limit,
             search=search,
+            brand=brand
         )
 
         return {
