@@ -548,13 +548,13 @@ class ProductService:
         if brand:
             # 1. Split the string by commas and strip any accidental whitespace
             brand_list = [b.strip() for b in brand.split(",") if b.strip()]
-            
+
             if brand_list:
                 # 2. Add the filter checking if Product.brand table name matches the list
-                # Note: We use .has() because Brand is likely a joined relationship. 
+                # Note: We use .has() because Brand is likely a joined relationship.
                 # If you have a direct column like Product.brand_name, use Product.brand_name.in_(brand_list)
                 brand_filter = Product.brand.has(Brand.name.in_(brand_list))
-                
+
                 filters.append(brand_filter)
 
         query = query.where(*filters)
@@ -831,13 +831,15 @@ class ProductService:
     ) -> Dict[str, Any]:
         """
         V2 Detail endpoint tailored exactly to frontend dashboard specifications.
-        Fixed greenlet_spawn async I/O tracking error by utilizing structural column fallbacks.
+        Optimized to extract competitor listings from JSON fields and map model choices
+        to dynamic recommendation actions.
         """
         is_super_admin = user.get("is_super_admin", False)
 
         # ------------------------------------------------------------------
         # 1. Unified Eager-Load Query Execution (Optimized by Tab Type)
         # ------------------------------------------------------------------
+        # We explicitly eager-load Product -> Chat -> ChatSearchQuery
         load_options = [
             selectinload(Product.brand),
             selectinload(Product.chats).selectinload(Chat.search_queries),
@@ -869,12 +871,17 @@ class ProductService:
             )
 
         # ------------------------------------------------------------------
-        # 2. Extract and Flatten Associated Analytics Records
+        # 2. Extract and Flatten Associated Analytics Records (Link Parents)
         # ------------------------------------------------------------------
         all_chats: List[Chat] = product.chats or []
-        all_queries: List[ChatSearchQuery] = [
-            q for chat in all_chats for q in (chat.search_queries or [])
-        ]
+        all_queries: List[ChatSearchQuery] = []
+
+        # We loop and save a dynamic reference back to the parent Chat
+        # so we can access chat.model_choice later without lazy-load issues.
+        for chat in all_chats:
+            for q in chat.search_queries or []:
+                q._parent_chat = chat
+                all_queries.append(q)
 
         total_queries = len(all_queries)
 
@@ -889,7 +896,7 @@ class ProductService:
         }
         engine_counts = {"chatgpt": 0, "gemini": 0, "claude": 0, "perplexity": 0}
 
-        # Mapper translates your database keys into frontend dashboard keys
+        # Mapper translates database keys into frontend dashboard keys
         platform_mapper = {
             "openai": "chatgpt",
             "google": "gemini",
@@ -1021,9 +1028,25 @@ class ProductService:
 
         elif tab == "competitor":
             competitors_set = set()
-            for q in all_queries:
-                if q.competitors_mentioned:
-                    competitors_set.update(q.competitors_mentioned)
+
+            # A. First check and parse from product.competitor_analytics JSON field
+            if (
+                hasattr(product, "competitor_analytics")
+                and product.competitor_analytics
+            ):
+                if isinstance(product.competitor_analytics, list):
+                    for comp_entry in product.competitor_analytics:
+                        if (
+                            isinstance(comp_entry, dict)
+                            and "competitor_name" in comp_entry
+                        ):
+                            competitors_set.add(comp_entry["competitor_name"])
+
+            # B. Fallback to query-level mentions if JSON field is empty
+            if not competitors_set:
+                for q in all_queries:
+                    if q.competitors_mentioned:
+                        competitors_set.update(q.competitors_mentioned)
 
             ui_competitors = []
             for comp in list(competitors_set):
@@ -1183,6 +1206,24 @@ class ProductService:
             ui_actions = []
             for q in all_queries:
                 if q.query_optimization_tips and q.query_optimization_tips.strip():
+                    # 1. Resolve parent Chat safely
+                    parent_chat = getattr(q, "_parent_chat", None)
+
+                    # 2. Extract model choice from parent chat
+                    model_choice = (
+                        parent_chat.model_choice if parent_chat else "Unknown Model"
+                    )
+
+                    # 3. Extract the competitor_analytics JSON list directly from the parent chat
+                    chat_competitors = []
+                    if (
+                        parent_chat
+                        and hasattr(parent_chat, "competitor_analytics")
+                        and parent_chat.competitor_analytics
+                    ):
+                        if isinstance(parent_chat.competitor_analytics, list):
+                            chat_competitors = parent_chat.competitor_analytics
+
                     ui_actions.append(
                         {
                             "type": (
@@ -1196,7 +1237,8 @@ class ProductService:
                                 else "Medium Effort"
                             ),
                             "title": q.query_optimization_tips.strip(),
-                            "competitors": "Market Leaders",
+                            "model": model_choice,
+                            "competitors": chat_competitors,  # Structured JSON list from Chat model
                             "impact": 85 if q.product_found is False else 60,
                         }
                     )
@@ -1207,7 +1249,8 @@ class ProductService:
                         "type": "citation",
                         "effort": "Medium Effort",
                         "title": "Inject missing merchant schema markup and structural FAQs to expand engine crawl vectors.",
-                        "competitors": "Top Rank Competitors",
+                        "model": "Unknown Model",
+                        "competitors": [],
                         "impact": 90,
                     }
                 )
