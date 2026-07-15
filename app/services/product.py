@@ -446,6 +446,7 @@ class ProductService:
         page: int = 1,
         limit: int = 20,
         search: str = None,
+        brand: str | None = None,
     ):
         """List products with GEO analytics summary and correct admin filtering"""
 
@@ -540,6 +541,21 @@ class ProductService:
         else:
             if tenant_id:
                 filters.append(Product.tenant_id == tenant_id)
+
+        # =========================================================
+        # NEW: BRAND FILTER PARSING & APPLICATION
+        # =========================================================
+        if brand:
+            # 1. Split the string by commas and strip any accidental whitespace
+            brand_list = [b.strip() for b in brand.split(",") if b.strip()]
+            
+            if brand_list:
+                # 2. Add the filter checking if Product.brand table name matches the list
+                # Note: We use .has() because Brand is likely a joined relationship. 
+                # If you have a direct column like Product.brand_name, use Product.brand_name.in_(brand_list)
+                brand_filter = Product.brand.has(Brand.name.in_(brand_list))
+                
+                filters.append(brand_filter)
 
         query = query.where(*filters)
         count_query = count_query.where(*filters)
