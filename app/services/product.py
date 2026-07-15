@@ -451,7 +451,7 @@ class ProductService:
 
         is_super_admin = user.get("is_super_admin", False)
 
-        # Base query initialization matching your current logic...
+        # Base query initialization
         query = (
             select(
                 Product,
@@ -533,23 +533,19 @@ class ProductService:
         # =========================================================
         # FIXED FILTER PIPELINE
         # =========================================================
-        # Rule 1: Nobody should see soft-deleted records
         filters = [Product.is_deleted.is_(False)]
 
         if not is_super_admin:
-            # Regular users are locked strictly to their assigned active tenant
             filters.append(Product.tenant_id == tenant_id)
         else:
-            # Super admins only apply tenant filters if they passed one via query string params
             if tenant_id:
                 filters.append(Product.tenant_id == tenant_id)
 
-        # Inject calculated constraints safely
         query = query.where(*filters)
         count_query = count_query.where(*filters)
         # =========================================================
 
-        # Search Filter
+        # Search Filter (Applies only to paginated list and count)
         if search:
             search_filter = Product.name.ilike(f"%{search}%")
             query = query.where(search_filter)
@@ -566,6 +562,86 @@ class ProductService:
         total_result = await db.execute(count_query)
         total = total_result.scalar() or 0
 
+        # =========================================================
+        # NEW: TENANT METRICS OVERVIEW QUERY
+        # =========================================================
+        # Note: We do NOT apply the 'search' filter here because we want
+        # overall tenant totals regardless of what the user is currently searching.
+        tenant_summary_query = (
+            select(
+                func.count(func.distinct(Product.id)).label("total_products"),
+                func.count(func.distinct(Product.brand_id)).label("brands_tracked"),
+                func.coalesce(
+                    func.round(
+                        (
+                            cast(
+                                func.sum(
+                                    case(
+                                        (ChatSearchQuery.product_found.is_(True), 1),
+                                        else_=0,
+                                    )
+                                ),
+                                Numeric,
+                            )
+                            / func.nullif(func.count(ChatSearchQuery.id), 0)
+                        )
+                        * 100,
+                        2,
+                    ),
+                    0,
+                ).label("avg_visibility_score"),
+                func.coalesce(
+                    func.round(
+                        cast(
+                            func.avg(
+                                func.coalesce(
+                                    func.jsonb_array_length(
+                                        ChatSearchQuery.competitors_mentioned
+                                    ),
+                                    0,
+                                )
+                            ),
+                            Numeric,
+                        ),
+                        2,
+                    ),
+                    0,
+                ).label("avg_mention_rate"),
+            )
+            .select_from(Product)
+            .outerjoin(
+                Chat,
+                or_(
+                    Chat.product_id == Product.id,
+                    (
+                        Chat.product_id.is_(None)
+                        & (func.lower(Chat.product_name) == func.lower(Product.name))
+                    ),
+                ),
+            )
+            .outerjoin(ChatSearchQuery, Chat.id == ChatSearchQuery.chat_id)
+            .where(*filters)  # Uses the base tenant/soft-delete filters
+        )
+
+        summary_result = await db.execute(tenant_summary_query)
+        summary_row = summary_result.one_or_none()
+
+        tenant_stats = {
+            "total_products": 0,
+            "avg_visibility_score": 0.0,
+            "avg_mention_rate": 0.0,
+            "brands_tracked": 0,
+        }
+
+        if summary_row:
+            tenant_stats = {
+                "total_products": int(summary_row.total_products or 0),
+                "avg_visibility_score": float(summary_row.avg_visibility_score or 0),
+                "avg_mention_rate": float(summary_row.avg_mention_rate or 0),
+                "brands_tracked": int(summary_row.brands_tracked or 0),
+            }
+        # =========================================================
+
         products = []
         for row in rows:
             product = row.Product
@@ -581,7 +657,7 @@ class ProductService:
             }
             products.append(product)
 
-        return products, total
+        return products, total, tenant_stats
 
     @staticmethod
     async def detail(
