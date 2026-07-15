@@ -337,7 +337,7 @@ class TenantDashboardService:
             "metaContext": {
                 "countriesCount": len(unique_countries) if unique_countries else 1,
                 "productsCount": len(unique_product_ids),
-                "queriesTrackedCount": len(rows),
+                "queriesTrackedCount": len(current_period_rows),
                 "competitorsCount": max(0, len(current_metrics["competitor_share"])),
             },
             "kpiCards": [
