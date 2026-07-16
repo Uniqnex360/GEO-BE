@@ -104,7 +104,6 @@ class PromptFactory:
             "citation_rank": 2,
             "platform_breakdown": {{
                 "Google Engine": 6,
-                "Perplexity": 4
             }},
             "citing_sources": ["https://example.com/product"],
             "competitors_mentioned": ["competitor_a"],

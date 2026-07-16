@@ -186,6 +186,15 @@ class ChatQueryBase(BaseModel):
     competitors_mentioned: list[str] = Field(
         description="Competitor platforms or alternative brands found."
     )
+    optimization_tag: str = Field(
+        description=(
+            "A single-word category representing the primary optimization recommendation. "
+            "Examples: 'title', 'brand', 'attributes','description', 'faq', 'content', 'schema', 'images', "
+            "'reviews', 'pricing', 'specifications', 'comparison', 'keywords', "
+            "'metadata', 'headings', 'internal-links', 'external-links', 'trust', "
+            "'availability',  'video', 'performance', 'citations'."
+        )
+    )
     optimization_tips_for_better_result: str = Field(
         description="Query-specific optimization tip."
     )
@@ -628,6 +637,7 @@ async def run_geo_audit_stream(
                             ),  # FIX applied here
                             citing_sources=query.citing_sources,
                             competitors_mentioned=query.competitors_mentioned,
+                            query_optimization_tag=query.optimization_tag,
                             query_optimization_tips=query.optimization_tips_for_better_result,
                         )
 
