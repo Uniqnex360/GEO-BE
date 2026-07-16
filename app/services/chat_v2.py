@@ -627,7 +627,7 @@ async def run_geo_audit_stream(
                             brand_name=query.brand,
                             query_text=query.query,
                             product_found=query.product_found,
-                            share_of_voice=query.share_of_voice,
+                            share_of_voice=min(query.share_of_voice, 100.0),
                             total_websites_found=query.total_websites_found,
                             citation_rank=query.citation_rank,
                             platform_breakdown=platform_breakdown_dict,  # FIX applied here
