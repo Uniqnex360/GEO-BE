@@ -110,7 +110,6 @@ class TenantDashboardService:
                         "google": 0,
                         "openai": 0,
                         "anthropic": 0,
-                        "bing": 0,
                     },
                     "citation_categories": {
                         "Blogs": 0,
@@ -432,11 +431,6 @@ class TenantDashboardService:
                             "anthropic", 0.0
                         ),
                         "color": "#f59e0b",
-                    },
-                    {
-                        "name": "Bing Search",
-                        "score": current_metrics["engine_breakdown"].get("bing", 0.0),
-                        "color": "#a855f7",
                     },
                 ],
                 "citationSourcesPie": [

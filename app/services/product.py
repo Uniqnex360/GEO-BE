@@ -892,9 +892,8 @@ class ProductService:
             "chatgpt": 0.0,
             "gemini": 0.0,
             "claude": 0.0,
-            "perplexity": 0.0,
         }
-        engine_counts = {"chatgpt": 0, "gemini": 0, "claude": 0, "perplexity": 0}
+        engine_counts = {"chatgpt": 0, "gemini": 0, "claude": 0}
 
         # Mapper translates database keys into frontend dashboard keys
         platform_mapper = {
@@ -902,7 +901,6 @@ class ProductService:
             "google": "gemini",
             "gemini": "gemini",
             "anthropic": "claude",
-            "perplexity": "perplexity",
         }
 
         for q in all_queries:
@@ -979,10 +977,6 @@ class ProductService:
                         "name": "Claude",
                         "score": engine_visibility_summary.get("claude", 0.0),
                     },
-                    {
-                        "name": "Perplexity",
-                        "score": engine_visibility_summary.get("perplexity", 0.0),
-                    },
                 ],
             },
             "tabData": {},
@@ -1014,12 +1008,7 @@ class ProductService:
                         "name": "Claude",
                         "score": engine_visibility_summary.get("claude", 0.0),
                         "color": "#f59e0b",
-                    },
-                    {
-                        "name": "Perplexity",
-                        "score": engine_visibility_summary.get("perplexity", 0.0),
-                        "color": "#a855f7",
-                    },
+                    }
                 ],
                 "faqCount": calculated_faqs,
                 "reviewCount": total_reviews,
@@ -1065,12 +1054,6 @@ class ProductService:
                             0.0,
                             round(engine_visibility_summary.get("claude", 0.0) * 0.95),
                         ),
-                        "perplexity": max(
-                            0.0,
-                            round(
-                                engine_visibility_summary.get("perplexity", 0.0) * 1.05
-                            ),
-                        ),
                         "avg": max(0.0, round(ai_visibility_score * 0.95)),
                         "active": False,
                     }
@@ -1083,7 +1066,6 @@ class ProductService:
                     "chatGPT": engine_visibility_summary.get("chatgpt", 0.0),
                     "gemini": engine_visibility_summary.get("gemini", 0.0),
                     "claude": engine_visibility_summary.get("claude", 0.0),
-                    "perplexity": engine_visibility_summary.get("perplexity", 0.0),
                     "avg": ai_visibility_score,
                     "active": True,
                 },
@@ -1211,7 +1193,7 @@ class ProductService:
 
                     # 2. Extract model choice from parent chat
                     model_choice = (
-                        parent_chat.model_choice if parent_chat else "Unknown Model"
+                        parent_chat.model_choice if parent_chat else ""
                     )
 
                     # 3. Extract the competitor_analytics JSON list directly from the parent chat
@@ -1236,6 +1218,7 @@ class ProductService:
                                 if len(q.query_optimization_tips) < 50
                                 else "Medium Effort"
                             ),
+                            "query_optimization_tag": q.query_optimization_tag,
                             "title": q.query_optimization_tips.strip(),
                             "model": model_choice,
                             "competitors": chat_competitors,  # Structured JSON list from Chat model
