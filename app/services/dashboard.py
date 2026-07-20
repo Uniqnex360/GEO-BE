@@ -10,8 +10,12 @@ from sqlalchemy import select, cast, String
 
 from fastapi import HTTPException, status
 
-
 from app.models import Product, Chat, ChatGEOAuditRecord, ChatSearchQuery
+
+
+class DynamicRow:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 
 
 class TenantDashboardService:
@@ -26,13 +30,9 @@ class TenantDashboardService:
         Calculates and returns the overall dashboard metrics for a specific tenant.
         Explicitly joins and aggregates data from 4 tables:
         Product, Chat, ChatSearchQuery, and GeoAudit.
-
-        All trends, metrics, and visualization percentages are calculated
-        dynamically from the actual row attributes with zero hardcoding.
         """
         is_super_admin = user.get("is_super_admin", False)
 
-        # Multi-tenant data verification guardrail
         if not is_super_admin and user.get("tenant_id") != tenant_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -40,11 +40,26 @@ class TenantDashboardService:
             )
 
         # ------------------------------------------------------------------
-        # 1. Unified 4-Table Join Query Execution
+        # 1. Optimized 4-Table Join Query Execution
         # ------------------------------------------------------------------
-        # Explicitly joins Product -> Chat -> ChatSearchQuery, and cross-references GeoAudit records
         dashboard_query = (
-            select(ChatSearchQuery, Chat, Product, ChatGEOAuditRecord)
+            select(
+                ChatSearchQuery.id,
+                ChatSearchQuery.created_at,
+                ChatSearchQuery.product_found,
+                ChatSearchQuery.share_of_voice,
+                ChatSearchQuery.citation_rank,
+                ChatSearchQuery.platform_breakdown,
+                ChatSearchQuery.citing_sources,
+                ChatSearchQuery.competitors_mentioned,
+                Product.id.label("product_table_id"),
+                ChatGEOAuditRecord.id.label("geo_table_id"),
+                (
+                    ChatGEOAuditRecord.country
+                    if hasattr(ChatGEOAuditRecord, "country")
+                    else ChatGEOAuditRecord.id.label("no_country")
+                ),
+            )
             .join(Chat, ChatSearchQuery.chat_id == Chat.id)
             .join(Product, Chat.product_id == Product.id)
             .join(
@@ -56,15 +71,39 @@ class TenantDashboardService:
         )
 
         query_result = await db.execute(dashboard_query)
-        rows = query_result.all()
+        results = query_result.all()
 
-        # Unique entity tracking metrics
+        rows = []
+        has_country_col = hasattr(ChatGEOAuditRecord, "country")
+
+        for r in results:
+            q_row = DynamicRow(
+                id=r.id,
+                created_at=r.created_at,
+                product_found=r.product_found,
+                share_of_voice=r.share_of_voice,
+                citation_rank=r.citation_rank,
+                platform_breakdown=r.platform_breakdown,
+                citing_sources=r.citing_sources,
+                competitors_mentioned=r.competitors_mentioned,
+            )
+            chat_row = DynamicRow()
+            product_row = DynamicRow(id=r.product_table_id)
+
+            geo_init = {"id": r.geo_table_id}
+            if has_country_col:
+                geo_init["country"] = getattr(r, "country", None)
+
+            geo_row = DynamicRow(**geo_init)
+
+            rows.append((q_row, chat_row, product_row, geo_row))
+
         unique_product_ids = set()
         unique_countries = set()
         total_successful_audits = set()
 
         # ------------------------------------------------------------------
-        # 2. Time Horizon Segmentation (Period-over-Period Performance)
+        # 2. Time Horizon Segmentation
         # ------------------------------------------------------------------
         now = datetime.now(timezone.utc)
         midpoint_date = now - timedelta(days=15)
@@ -76,14 +115,11 @@ class TenantDashboardService:
             unique_product_ids.add(product_row.id)
             total_successful_audits.add(geo_row.id)
 
-            # Safely harvest geographic data from the GeoAudit rows
             if hasattr(geo_row, "country") and geo_row.country:
                 unique_countries.add(geo_row.country)
             else:
-                # Default fallback inferred from query formats like 'price US'
                 unique_countries.add("US")
 
-            # Determine temporal window placement using the ChatSearchQuery timestamp
             q_date = (
                 q_row.created_at.replace(tzinfo=timezone.utc)
                 if q_row.created_at
@@ -95,7 +131,7 @@ class TenantDashboardService:
                 previous_period_rows.append((q_row, chat_row, product_row, geo_row))
 
         # ------------------------------------------------------------------
-        # 3. DRY Metric Aggregator Engine (Processes JSON Arrays & Data Types)
+        # 3. DRY Metric Aggregator Engine
         # ------------------------------------------------------------------
         def process_aggregated_metrics(period_data_rows) -> Dict[str, Any]:
             total_queries = len(period_data_rows)
@@ -138,19 +174,15 @@ class TenantDashboardService:
             sov_accumulation = 0.0
 
             for q_row, chat_row, product_row, geo_row in period_data_rows:
-                # 1. Process explicit Mention Discovery Flag
                 if q_row.product_found is True:
                     found_count += 1
 
-                # 2. Accumulate individual Share of Voice floats (e.g., 0.55, 0.8)
                 sov_accumulation += float(q_row.share_of_voice or 0.0)
 
-                # 3. Calculate Citation Ranks (e.g., 1, 2, 3)
                 if q_row.citation_rank is not None:
                     rank_sum += float(q_row.citation_rank)
                     valid_rank_count += 1
 
-                # 4. Parse platform engine distributions safely
                 breakdown = q_row.platform_breakdown or {}
                 if isinstance(breakdown, str):
                     try:
@@ -161,7 +193,6 @@ class TenantDashboardService:
                 for engine, hit_count in breakdown.items():
                     engine_score_lists[engine.lower()].append(float(hit_count))
 
-                # 5. Parse citing source URLs into frontend display categories
                 sources = q_row.citing_sources or []
                 if isinstance(sources, str):
                     try:
@@ -205,7 +236,6 @@ class TenantDashboardService:
                     else:
                         citation_distribution["Forums"] += 1
 
-                # 6. Parse competing brand string lists
                 competitors = q_row.competitors_mentioned or []
                 if isinstance(competitors, str):
                     try:
@@ -216,9 +246,9 @@ class TenantDashboardService:
                 for comp_name in competitors:
                     competitor_mention_map[comp_name] += 1
 
-            # Transform tracking states into clean averages
+            # FIX: Removed the '* 100' multiplier since the value is already scaled to a percentage point scale
             avg_sov_percentage = (
-                (sov_accumulation / total_queries) * 100 if total_queries > 0 else 0.0
+                (sov_accumulation / total_queries) if total_queries > 0 else 0.0
             )
 
             engine_averages = {
@@ -227,9 +257,7 @@ class TenantDashboardService:
             }
 
             return {
-                "visibility_score": round(
-                    avg_sov_percentage, 1
-                ),  # Dynamic visibility index built from SOV pool
+                "visibility_score": round(avg_sov_percentage, 1),
                 "mention_rate": round((found_count / total_queries) * 100, 1),
                 "avg_rank": (
                     round(rank_sum / valid_rank_count, 1)
@@ -250,12 +278,11 @@ class TenantDashboardService:
                 "competitor_share": competitor_mention_map,
             }
 
-        # Calculate metrics using structural parameters
         current_metrics = process_aggregated_metrics(current_period_rows)
         prev_metrics = process_aggregated_metrics(previous_period_rows)
 
         # ------------------------------------------------------------------
-        # 4. Comparative Trend Vector Generator (Zero Hardcoding)
+        # 4. Comparative Trend Vector Generator
         # ------------------------------------------------------------------
         def calculate_trend_delta(
             current_val: float, prev_val: float, lower_is_better: bool = False
@@ -277,16 +304,15 @@ class TenantDashboardService:
             }
 
         # ------------------------------------------------------------------
-        # 5. Build Dynamic Timeseries Chart (Fixing the undefined map bug)
+        # 5. Build Dynamic Timeseries Chart
         # ------------------------------------------------------------------
         daily_timeline_map = defaultdict(list)
         for q_row, _, _, _ in current_period_rows:
             date_key = (
                 q_row.created_at.strftime("%b %d") if q_row.created_at else "Active"
             )
-            daily_timeline_map[date_key].append(
-                float(q_row.share_of_voice or 0.0) * 100
-            )
+            # FIX: Removed the '* 100' multiplier here as well to maintain uniformity
+            daily_timeline_map[date_key].append(float(q_row.share_of_voice or 0.0))
 
         visibility_trend_chart = (
             [
