@@ -1,7 +1,9 @@
 import statistics
+import json
+from collections import defaultdict
 from typing import Optional, Dict, Any, List
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, case, cast, or_, Numeric
+from sqlalchemy import select, func, cast, String, Float, case, distinct
 from sqlalchemy.orm import selectinload
 from statistics import mean
 from fastapi import HTTPException, status
@@ -14,7 +16,13 @@ from app.models import (
     Brand,
     Chat,
     ChatSearchQuery,
+    ChatGEOAuditRecord,
 )
+
+
+class DynamicRow:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 
 
 class ProductService:
@@ -378,303 +386,6 @@ class ProductService:
 
         return True
 
-    # @staticmethod
-    # async def list_products(
-    #     db: AsyncSession,
-    #     user: dict,
-    #     tenant_id: int,
-    #     page: int = 1,
-    #     limit: int = 20,
-    #     search: str = None,
-    # ):
-    #     """list products"""
-
-    #     is_super_admin = user.get(
-    #         "is_super_admin",
-    #         False,
-    #     )
-
-    #     query = select(Product).options(
-    #         selectinload(Product.features),
-    #         selectinload(Product.faqs),
-    #         selectinload(Product.brand),
-    #     )
-
-    #     count_query = select(func.count(Product.id))
-
-    #     if not is_super_admin:
-
-    #         query = query.where(
-    #             Product.tenant_id == tenant_id,
-    #             Product.is_deleted == False,
-    #         )
-
-    #         count_query = count_query.where(
-    #             Product.tenant_id == tenant_id,
-    #             Product.is_deleted == False,
-    #         )
-
-    #     if search:
-
-    #         search_filter = Product.name.ilike(f"%{search}%")
-
-    #         query = query.where(search_filter)
-
-    #         count_query = count_query.where(search_filter)
-
-    #     query = query.order_by(Product.created_at.desc())
-
-    #     offset = (page - 1) * limit
-
-    #     query = query.offset(offset).limit(limit)
-
-    #     result = await db.execute(query)
-
-    #     products = result.scalars().all()
-
-    #     total_result = await db.execute(count_query)
-
-    #     total = total_result.scalar()
-
-    #     return products, total
-
-    @staticmethod
-    async def list_products(
-        db: AsyncSession,
-        user: dict,
-        tenant_id: Optional[int],
-        page: int = 1,
-        limit: int = 20,
-        search: str = None,
-        brand: str | None = None,
-    ):
-        """List products with GEO analytics summary and correct admin filtering"""
-
-        is_super_admin = user.get("is_super_admin", False)
-
-        # Base query initialization
-        query = (
-            select(
-                Product,
-                func.count(func.distinct(Chat.id)).label("total_chats"),
-                func.count(ChatSearchQuery.id).label("total_queries"),
-                func.coalesce(
-                    func.round(
-                        cast(func.avg(ChatSearchQuery.share_of_voice), Numeric), 2
-                    ),
-                    0,
-                ).label("avg_share_of_voice"),
-                func.coalesce(
-                    func.round(
-                        cast(func.avg(ChatSearchQuery.citation_rank), Numeric), 2
-                    ),
-                    0,
-                ).label("avg_citation_rank"),
-                func.coalesce(
-                    func.round(
-                        (
-                            cast(
-                                func.sum(
-                                    case(
-                                        (ChatSearchQuery.product_found.is_(True), 1),
-                                        else_=0,
-                                    )
-                                ),
-                                Numeric,
-                            )
-                            / func.nullif(func.count(ChatSearchQuery.id), 0)
-                        )
-                        * 100,
-                        2,
-                    ),
-                    0,
-                ).label("visibility_rate"),
-                func.coalesce(
-                    func.sum(
-                        func.coalesce(
-                            func.jsonb_array_length(
-                                ChatSearchQuery.competitors_mentioned
-                            ),
-                            0,
-                        )
-                    ),
-                    0,
-                ).label("competitor_mentions"),
-                func.coalesce(
-                    func.sum(
-                        func.coalesce(
-                            func.jsonb_array_length(ChatSearchQuery.citing_sources), 0
-                        )
-                    ),
-                    0,
-                ).label("citation_count"),
-                func.max(Chat.created_at).label("last_analysis"),
-            )
-            .outerjoin(
-                Chat,
-                or_(
-                    Chat.product_id == Product.id,
-                    (
-                        Chat.product_id.is_(None)
-                        & (func.lower(Chat.product_name) == func.lower(Product.name))
-                    ),
-                ),
-            )
-            .outerjoin(ChatSearchQuery, Chat.id == ChatSearchQuery.chat_id)
-            .options(
-                selectinload(Product.features),
-                selectinload(Product.faqs),
-                selectinload(Product.brand),
-            )
-            .group_by(Product.id)
-        )
-
-        count_query = select(func.count(Product.id))
-
-        # =========================================================
-        # FIXED FILTER PIPELINE
-        # =========================================================
-        filters = [Product.is_deleted.is_(False)]
-
-        if not is_super_admin:
-            filters.append(Product.tenant_id == tenant_id)
-        else:
-            if tenant_id:
-                filters.append(Product.tenant_id == tenant_id)
-
-        # =========================================================
-        # NEW: BRAND FILTER PARSING & APPLICATION
-        # =========================================================
-        if brand:
-            # 1. Split the string by commas and strip any accidental whitespace
-            brand_list = [b.strip() for b in brand.split(",") if b.strip()]
-
-            if brand_list:
-                # 2. Add the filter checking if Product.brand table name matches the list
-                # Note: We use .has() because Brand is likely a joined relationship.
-                # If you have a direct column like Product.brand_name, use Product.brand_name.in_(brand_list)
-                brand_filter = Product.brand.has(Brand.name.in_(brand_list))
-
-                filters.append(brand_filter)
-
-        query = query.where(*filters)
-        count_query = count_query.where(*filters)
-        # =========================================================
-
-        # Search Filter (Applies only to paginated list and count)
-        if search:
-            search_filter = Product.name.ilike(f"%{search}%")
-            query = query.where(search_filter)
-            count_query = count_query.where(search_filter)
-
-        # Ordering & Pagination Execution
-        query = query.order_by(Product.created_at.desc())
-        offset = (page - 1) * limit
-        query = query.offset(offset).limit(limit)
-
-        result = await db.execute(query)
-        rows = result.all()
-
-        total_result = await db.execute(count_query)
-        total = total_result.scalar() or 0
-
-        # =========================================================
-        # NEW: TENANT METRICS OVERVIEW QUERY
-        # =========================================================
-        # Note: We do NOT apply the 'search' filter here because we want
-        # overall tenant totals regardless of what the user is currently searching.
-        tenant_summary_query = (
-            select(
-                func.count(func.distinct(Product.id)).label("total_products"),
-                func.count(func.distinct(Product.brand_id)).label("brands_tracked"),
-                func.coalesce(
-                    func.round(
-                        (
-                            cast(
-                                func.sum(
-                                    case(
-                                        (ChatSearchQuery.product_found.is_(True), 1),
-                                        else_=0,
-                                    )
-                                ),
-                                Numeric,
-                            )
-                            / func.nullif(func.count(ChatSearchQuery.id), 0)
-                        )
-                        * 100,
-                        2,
-                    ),
-                    0,
-                ).label("avg_visibility_score"),
-                func.coalesce(
-                    func.round(
-                        cast(
-                            func.avg(
-                                func.coalesce(
-                                    func.jsonb_array_length(
-                                        ChatSearchQuery.competitors_mentioned
-                                    ),
-                                    0,
-                                )
-                            ),
-                            Numeric,
-                        ),
-                        2,
-                    ),
-                    0,
-                ).label("avg_mention_rate"),
-            )
-            .select_from(Product)
-            .outerjoin(
-                Chat,
-                or_(
-                    Chat.product_id == Product.id,
-                    (
-                        Chat.product_id.is_(None)
-                        & (func.lower(Chat.product_name) == func.lower(Product.name))
-                    ),
-                ),
-            )
-            .outerjoin(ChatSearchQuery, Chat.id == ChatSearchQuery.chat_id)
-            .where(*filters)  # Uses the base tenant/soft-delete filters
-        )
-
-        summary_result = await db.execute(tenant_summary_query)
-        summary_row = summary_result.one_or_none()
-
-        tenant_stats = {
-            "total_products": 0,
-            "avg_visibility_score": 0.0,
-            "avg_mention_rate": 0.0,
-            "brands_tracked": 0,
-        }
-
-        if summary_row:
-            tenant_stats = {
-                "total_products": int(summary_row.total_products or 0),
-                "avg_visibility_score": float(summary_row.avg_visibility_score or 0),
-                "avg_mention_rate": float(summary_row.avg_mention_rate or 0),
-                "brands_tracked": int(summary_row.brands_tracked or 0),
-            }
-        # =========================================================
-
-        products = []
-        for row in rows:
-            product = row.Product
-            product.analytics = {
-                "total_chats": int(row.total_chats or 0),
-                "total_queries": int(row.total_queries or 0),
-                "avg_share_of_voice": float(row.avg_share_of_voice or 0),
-                "avg_citation_rank": float(row.avg_citation_rank or 0),
-                "visibility_rate": float(row.visibility_rate or 0),
-                "competitor_mentions": int(row.competitor_mentions or 0),
-                "citation_count": int(row.citation_count or 0),
-                "last_analysis": row.last_analysis,
-            }
-            products.append(product)
-
-        return products, total, tenant_stats
-
     @staticmethod
     async def detail(
         db: AsyncSession,
@@ -1008,7 +719,7 @@ class ProductService:
                         "name": "Claude",
                         "score": engine_visibility_summary.get("claude", 0.0),
                         "color": "#f59e0b",
-                    }
+                    },
                 ],
                 "faqCount": calculated_faqs,
                 "reviewCount": total_reviews,
@@ -1192,9 +903,7 @@ class ProductService:
                     parent_chat = getattr(q, "_parent_chat", None)
 
                     # 2. Extract model choice from parent chat
-                    model_choice = (
-                        parent_chat.model_choice if parent_chat else ""
-                    )
+                    model_choice = parent_chat.model_choice if parent_chat else ""
 
                     # 3. Extract the competitor_analytics JSON list directly from the parent chat
                     chat_competitors = []
@@ -1241,3 +950,233 @@ class ProductService:
             response_payload["tabData"] = {"actions": ui_actions[:8]}
 
         return response_payload
+
+    @staticmethod
+    async def list_products(
+        db: AsyncSession,
+        user: dict,
+        tenant_id: Optional[int],
+        page: int = 1,
+        limit: int = 24,
+        search: str = None,
+        brand: str | None = None,
+    ):
+        """List products with GEO analytics summary and correct admin filtering.
+
+        Optimized Version: Consolidates mathematical aggregates down to the
+        database layer to eliminate heavy application loop overhead.
+        """
+        is_super_admin = user.get("is_super_admin", False)
+
+        # ------------------------------------------------------------------
+        # 1. Base Core Tenant Filters (Must mirror Dashboard exactly)
+        # ------------------------------------------------------------------
+        tenant_filters = [Product.is_deleted.is_(False)]
+        if not is_super_admin:
+            tenant_filters.append(Product.tenant_id == tenant_id)
+        elif tenant_id:
+            tenant_filters.append(Product.tenant_id == tenant_id)
+
+        # ------------------------------------------------------------------
+        # 2. Optimized Global Aggregate Metrics Query (Calculated at DB Layer)
+        # ------------------------------------------------------------------
+        # Instead of pulling thousands of raw rows into Python memory,
+        # let SQL calculate the global sums instantly.
+        global_stats_stmt = (
+            select(
+                func.count(ChatSearchQuery.id).label("total_queries"),
+                func.sum(cast(ChatSearchQuery.share_of_voice, Float)).label(
+                    "total_sov"
+                ),
+                func.sum(
+                    case((ChatSearchQuery.product_found.is_(True), 1), else_=0)
+                ).label("total_found"),
+                func.count(distinct(Product.id)).label("unique_products"),
+                func.count(distinct(Product.brand_id)).label("unique_brands"),
+            )
+            .join(Chat, ChatSearchQuery.chat_id == Chat.id)
+            .join(Product, Chat.product_id == Product.id)
+            .join(
+                ChatGEOAuditRecord,
+                (ChatGEOAuditRecord.tenant_id == Product.tenant_id)
+                & (cast(Chat.model_choice, String) == ChatGEOAuditRecord.model_used),
+            )
+            .where(*tenant_filters)
+        )
+
+        global_stats_result = await db.execute(global_stats_stmt)
+        stats_row = global_stats_result.first()
+
+        tenant_total_queries = stats_row.total_queries or 0
+        tenant_sov_accumulation = stats_row.total_sov or 0.0
+        tenant_found_count = stats_row.total_found or 0
+
+        avg_visibility_score = (
+            (tenant_sov_accumulation / tenant_total_queries)
+            if tenant_total_queries > 0
+            else 0.0
+        )
+        avg_mention_rate = (
+            (tenant_found_count / tenant_total_queries) * 100
+            if tenant_total_queries > 0
+            else 0.0
+        )
+
+        tenant_stats = {
+            "total_products": stats_row.unique_products or 0,
+            "avg_visibility_score": round(avg_visibility_score, 1),
+            "avg_mention_rate": round(avg_mention_rate, 1),
+            "brands_tracked": stats_row.unique_brands or 0,
+        }
+
+        # ------------------------------------------------------------------
+        # 3. Build Dynamic UI View Set (Search, Filters, Pagination)
+        # ------------------------------------------------------------------
+        view_filters = list(tenant_filters)
+
+        if brand:
+            brand_list = [b.strip() for b in brand.split(",") if b.strip()]
+            if brand_list:
+                view_filters.append(Product.brand.has(Brand.name.in_(brand_list)))
+
+        if search:
+            view_filters.append(Product.name.ilike(f"%{search}%"))
+
+        # Fetch total records matching active viewport filters
+        count_stmt = select(func.count(Product.id)).where(*view_filters)
+        total_result = await db.execute(count_stmt)
+        total = total_result.scalar() or 0
+
+        # Paginated fetch with optimized join relationship loads
+        paginated_query = (
+            select(Product)
+            .where(*view_filters)
+            .options(
+                selectinload(Product.features),
+                selectinload(Product.faqs),
+                selectinload(Product.brand),
+            )
+            .order_by(Product.created_at.desc())
+            .offset((page - 1) * limit)
+            .limit(limit)
+        )
+
+        paginated_result = await db.execute(paginated_query)
+        paginated_products = paginated_result.scalars().all()
+
+        if not paginated_products:
+            return [], total, tenant_stats
+
+        # ------------------------------------------------------------------
+        # 4. Target Specific Metrics for Only the Paginated Products
+        # ------------------------------------------------------------------
+        # Instead of grouping metrics for every product in the system, we only
+        # query metrics matching the subset array of ids returned by pagination.
+        paginated_product_ids = [p.id for p in paginated_products]
+
+        prod_metrics_stmt = (
+            select(
+                Product.id.label("product_id"),
+                ChatSearchQuery,
+                Chat.id.label("chat_id"),
+                Chat.created_at.label("chat_created_at"),
+            )
+            .join(Chat, ChatSearchQuery.chat_id == Chat.id)
+            .join(Product, Chat.product_id == Product.id)
+            .join(
+                ChatGEOAuditRecord,
+                (ChatGEOAuditRecord.tenant_id == Product.tenant_id)
+                & (cast(Chat.model_choice, String) == ChatGEOAuditRecord.model_used),
+            )
+            .where(Product.id.in_(paginated_product_ids))
+        )
+
+        prod_metrics_result = await db.execute(prod_metrics_stmt)
+        prod_results = prod_metrics_result.all()
+
+        product_metrics_map = defaultdict(list)
+        for r in prod_results:
+            product_metrics_map[r.product_id].append(
+                (r.ChatSearchQuery, r.chat_id, r.chat_created_at)
+            )
+
+        # ------------------------------------------------------------------
+        # 5. Map Inner Entity Metrics Onto Paginated Output Payload
+        # ------------------------------------------------------------------
+        products_payload = []
+        for product in paginated_products:
+            prod_rows = product_metrics_map.get(product.id, [])
+
+            prod_total_queries = len(prod_rows)
+            unique_chats = set()
+
+            prod_found_count = 0
+            rank_sum = 0
+            valid_rank_count = 0
+            citation_counter = 0
+            prod_sov_accumulation = 0.0
+            competitor_counter = 0
+            last_analysis_time = None
+
+            for q_row, chat_id, chat_created_at in prod_rows:
+                unique_chats.add(chat_id)
+
+                if chat_created_at:
+                    if (
+                        last_analysis_time is None
+                        or chat_created_at > last_analysis_time
+                    ):
+                        last_analysis_time = chat_created_at
+
+                if q_row.product_found is True:
+                    prod_found_count += 1
+
+                prod_sov_accumulation += float(q_row.share_of_voice or 0.0)
+
+                if q_row.citation_rank is not None:
+                    rank_sum += float(q_row.citation_rank)
+                    valid_rank_count += 1
+
+                sources = q_row.citing_sources or []
+                if isinstance(sources, str):
+                    try:
+                        sources = json.loads(sources)
+                    except:
+                        sources = []
+                citation_counter += len(sources)
+
+                competitors = q_row.competitors_mentioned or []
+                if isinstance(competitors, str):
+                    try:
+                        competitors = json.loads(competitors)
+                    except:
+                        competitors = []
+                competitor_counter += len(competitors)
+
+            product.product_brand_id = product.brand_id
+
+            product.analytics = {
+                "total_chats": len(unique_chats),
+                "total_queries": prod_total_queries,
+                "avg_share_of_voice": (
+                    round((prod_sov_accumulation / prod_total_queries), 2)
+                    if prod_total_queries > 0
+                    else 0.0
+                ),
+                "avg_citation_rank": (
+                    round((rank_sum / valid_rank_count), 2)
+                    if valid_rank_count > 0
+                    else 0.0
+                ),
+                "visibility_rate": (
+                    round((prod_found_count / prod_total_queries) * 100, 2)
+                    if prod_total_queries > 0
+                    else 0.0
+                ),
+                "competitor_mentions": competitor_counter,
+                "citation_count": citation_counter,
+                "last_analysis": last_analysis_time,
+            }
+            products_payload.append(product)
+
+        return products_payload, total, tenant_stats
