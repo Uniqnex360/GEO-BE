@@ -134,9 +134,9 @@ async def list_products(
         )
 
         return {
-            "data": products,
+            "data": products + products,
             "tenant_states": tenant_states,
-            "pagination": {"page": page, "limit": limit, "total": total},
+            "pagination": {"page": page, "limit": limit, "total": total * 2},
         }
 
     except Exception as e:

@@ -117,10 +117,16 @@ async def list_tenants(
     tenant_id: Optional[int] = Query(
         None, description="Super admins can filter by a specific tenant ID"
     ),
+    sort_by: Optional[str] = Query(
+        None, description="Field to sort by: 'name', 'industry', or 'products_count'"
+    ),
+    sort_order: str = Query(
+        "desc", regex="^(asc|desc)$", description="Sort order: 'asc' or 'desc'"
+    ),
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(require_super_admin),
 ):
-    """List projects/tenants with pagination and admin access controls"""
+    """List projects/tenants with pagination, sorting, and admin access controls"""
 
     try:
         is_super_admin = user.get("is_super_admin", False)
@@ -159,21 +165,35 @@ async def list_tenants(
         query = query.where(*filters)
         count_query = count_query.where(*filters)
 
-        # Search
+        # --- Search Filter ---
         if search:
             search_filter = Tenant.name.ilike(f"%{search}%")
             query = query.where(search_filter)
             count_query = count_query.where(search_filter)
 
-        # Pagination
-        offset = (page - 1) * limit
+        # Grouping is necessary before sorting or offset/limit because of outerjoin & count
+        query = query.group_by(Tenant.id)
 
-        query = (
-            query.group_by(Tenant.id)
-            .order_by(Tenant.created_at.desc())
-            .offset(offset)
-            .limit(limit)
-        )
+        # --- Sorting Logic ---
+        sort_options = {
+            "name": Tenant.name,
+            "industry": Tenant.industry,
+            "products_count": func.count(Product.id),
+        }
+
+        if sort_by in sort_options:
+            target_column = sort_options[sort_by]
+            order_expression = (
+                target_column.desc() if sort_order == "desc" else target_column.asc()
+            )
+            query = query.order_by(order_expression)
+        else:
+            # Fallback default sort
+            query = query.order_by(Tenant.created_at.desc())
+
+        # --- Pagination ---
+        offset = (page - 1) * limit
+        query = query.offset(offset).limit(limit)
 
         # Execute tenant query
         result = await db.execute(query)
@@ -208,7 +228,7 @@ async def list_tenants(
                     "platforms": getattr(
                         tenant,
                         "platforms",
-                        ["ChatGPT", "Claude"],
+                        ["ChatGPT", "Claude", "Gemini"],
                     ),
                 }
                 for tenant, products_count in rows
