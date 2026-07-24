@@ -109,6 +109,8 @@ async def list_products(
     page: int = Query(1, ge=1),
     limit: int = Query(24, ge=1),
     search: Optional[str] = None,
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(validate_jwt_token),
     tenant_id: Optional[int] = Query(
@@ -130,7 +132,9 @@ async def list_products(
             page=page,
             limit=limit,
             search=search,
-            brand=brand
+            brand=brand,
+            sort_by=sort_by,
+            sort_order=sort_order
         )
 
         return {
