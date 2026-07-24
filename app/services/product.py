@@ -1,9 +1,10 @@
 import statistics
 import json
+import time
 from collections import defaultdict
 from typing import Optional, Dict, Any, List
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, cast, String, Float, case, distinct
+from sqlalchemy import select, func, cast, String, Float, case, distinct, desc, asc
 from sqlalchemy.orm import selectinload
 from statistics import mean
 from fastapi import HTTPException, status
@@ -960,16 +961,20 @@ class ProductService:
         limit: int = 24,
         search: str = None,
         brand: str | None = None,
+        sort_by: str = "created_at",  # Supported: 'name', 'sku', 'brand', 'visibility', 'created_at'
+        sort_order: str = "desc",  # Supported: 'asc', 'desc'
     ):
-        """List products with GEO analytics summary and correct admin filtering.
+        """List products with GEO analytics summary and high-performance SQL sorting/pagination."""
+        start_time = time.perf_counter()
+        print(
+            f"\n--- [START] list_products | sort_by='{sort_by}' sort_order='{sort_order}' page={page} limit={limit} ---"
+        )
 
-        Optimized Version: Consolidates mathematical aggregates down to the
-        database layer to eliminate heavy application loop overhead.
-        """
         is_super_admin = user.get("is_super_admin", False)
+        direction = desc if sort_order.lower() == "desc" else asc
 
         # ------------------------------------------------------------------
-        # 1. Base Core Tenant Filters (Must mirror Dashboard exactly)
+        # 1. Base Core Tenant Filters
         # ------------------------------------------------------------------
         tenant_filters = [Product.is_deleted.is_(False)]
         if not is_super_admin:
@@ -978,10 +983,9 @@ class ProductService:
             tenant_filters.append(Product.tenant_id == tenant_id)
 
         # ------------------------------------------------------------------
-        # 2. Optimized Global Aggregate Metrics Query (Calculated at DB Layer)
+        # 2. Optimized Global Aggregate Metrics Query (DB Layer)
         # ------------------------------------------------------------------
-        # Instead of pulling thousands of raw rows into Python memory,
-        # let SQL calculate the global sums instantly.
+        t0 = time.perf_counter()
         global_stats_stmt = (
             select(
                 func.count(ChatSearchQuery.id).label("total_queries"),
@@ -1006,31 +1010,34 @@ class ProductService:
 
         global_stats_result = await db.execute(global_stats_stmt)
         stats_row = global_stats_result.first()
+        print(
+            f"⏱️ Step 2 (Global Stats SQL): {round((time.perf_counter() - t0) * 1000, 2)} ms"
+        )
 
-        tenant_total_queries = stats_row.total_queries or 0
-        tenant_sov_accumulation = stats_row.total_sov or 0.0
-        tenant_found_count = stats_row.total_found or 0
+        tenant_total_queries = stats_row.total_queries if stats_row else 0
+        tenant_sov_accumulation = stats_row.total_sov if stats_row else 0.0
+        tenant_found_count = stats_row.total_found if stats_row else 0
 
         avg_visibility_score = (
             (tenant_sov_accumulation / tenant_total_queries)
-            if tenant_total_queries > 0
+            if tenant_total_queries and tenant_total_queries > 0
             else 0.0
         )
         avg_mention_rate = (
             (tenant_found_count / tenant_total_queries) * 100
-            if tenant_total_queries > 0
+            if tenant_total_queries and tenant_total_queries > 0
             else 0.0
         )
 
         tenant_stats = {
-            "total_products": stats_row.unique_products or 0,
+            "total_products": (stats_row.unique_products if stats_row else 0) or 0,
             "avg_visibility_score": round(avg_visibility_score, 1),
             "avg_mention_rate": round(avg_mention_rate, 1),
-            "brands_tracked": stats_row.unique_brands or 0,
+            "brands_tracked": (stats_row.unique_brands if stats_row else 0) or 0,
         }
 
         # ------------------------------------------------------------------
-        # 3. Build Dynamic UI View Set (Search, Filters, Pagination)
+        # 3. Dynamic UI View Set Filters
         # ------------------------------------------------------------------
         view_filters = list(tenant_filters)
 
@@ -1042,38 +1049,136 @@ class ProductService:
         if search:
             view_filters.append(Product.name.ilike(f"%{search}%"))
 
-        # Fetch total records matching active viewport filters
+        # Fetch total records matching filters
+        t0 = time.perf_counter()
         count_stmt = select(func.count(Product.id)).where(*view_filters)
         total_result = await db.execute(count_stmt)
         total = total_result.scalar() or 0
+        print(
+            f"⏱️ Step 3 (Total Count SQL): {round((time.perf_counter() - t0) * 1000, 2)} ms | Total Records: {total}"
+        )
 
-        # Paginated fetch with optimized join relationship loads
-        paginated_query = (
+        # ------------------------------------------------------------------
+        # 4. Fast Database Sorting & Paginated Product ID Fetch
+        # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # 4. Fast Database Sorting & Paginated Product ID Fetch
+        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
+
+        if sort_by == "visibility":
+            # Compute Visibility Rate directly at DB level
+            vis_subquery = (
+                select(
+                    Product.id.label("prod_id"),
+                    (
+                        func.coalesce(
+                            (
+                                func.sum(
+                                    case(
+                                        (ChatSearchQuery.product_found.is_(True), 1.0),
+                                        else_=0.0,
+                                    )
+                                )
+                                / func.nullif(func.count(ChatSearchQuery.id), 0)
+                            )
+                            * 100.0,
+                            0.0,
+                        )
+                    ).label("calc_visibility_rate"),
+                )
+                .outerjoin(Chat, Chat.product_id == Product.id)
+                .outerjoin(ChatSearchQuery, ChatSearchQuery.chat_id == Chat.id)
+                .where(*view_filters)
+                .group_by(Product.id)
+                .subquery()
+            )
+
+            paginated_id_stmt = (
+                select(Product.id)
+                .outerjoin(vis_subquery, Product.id == vis_subquery.c.prod_id)
+                .where(*view_filters)
+                .order_by(
+                    direction(vis_subquery.c.calc_visibility_rate),
+                    desc(Product.created_at),
+                )
+                .offset((page - 1) * limit)
+                .limit(limit)
+            )
+
+        else:
+            # Direct Field DB Order (Name, SKU, Brand Name, Created At)
+            paginated_id_stmt = select(Product.id).where(*view_filters)
+
+            # CRITICAL FIX: Join Brand table explicitly if sorting by brand
+            if sort_by == "brand":
+                paginated_id_stmt = paginated_id_stmt.outerjoin(
+                    Brand, Product.brand_id == Brand.id
+                )
+
+            order_clauses = []
+            if sort_by == "name":
+                # CRITICAL FIX: Lowercase comparison ensures case-insensitive A-Z sorting
+                order_clauses.append(direction(func.lower(Product.name)))
+            elif sort_by == "sku":
+                order_clauses.append(direction(func.lower(Product.sku)))
+            elif sort_by == "brand":
+                order_clauses.append(direction(func.lower(Brand.name)))
+            else:
+                order_clauses.append(direction(Product.created_at))
+
+            # Secondary deterministic fallback ordering
+            order_clauses.append(desc(Product.created_at))
+
+            paginated_id_stmt = (
+                paginated_id_stmt.order_by(*order_clauses)
+                .offset((page - 1) * limit)
+                .limit(limit)
+            )
+
+        id_result = await db.execute(paginated_id_stmt)
+        # CRITICAL FIX: Flatten scalar output explicitly
+        ordered_product_ids = id_result.scalars().all()
+
+        print(
+            f"⏱️ Step 4 (Target Page IDs SQL): {round((time.perf_counter() - t0) * 1000, 2)} ms | IDs: {len(ordered_product_ids)}"
+        )
+
+        if not ordered_product_ids:
+            print(
+                f"--- [END] list_products completed in {round((time.perf_counter() - start_time) * 1000, 2)} ms ---"
+            )
+            return [], total, tenant_stats
+
+        # ------------------------------------------------------------------
+        # 5. Fetch Product Entities & Re-Enforce Order
+        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
+        products_fetch_stmt = (
             select(Product)
-            .where(*view_filters)
+            .where(Product.id.in_(ordered_product_ids))
             .options(
                 selectinload(Product.features),
                 selectinload(Product.faqs),
                 selectinload(Product.brand),
             )
-            .order_by(Product.created_at.desc())
-            .offset((page - 1) * limit)
-            .limit(limit)
+        )
+        products_result = await db.execute(products_fetch_stmt)
+        fetched_products = products_result.scalars().all()
+
+        # CRITICAL FIX: Strictly re-order fetched objects according to SQL ID order
+        product_by_id = {p.id: p for p in fetched_products}
+        ordered_products = [
+            product_by_id[pid] for pid in ordered_product_ids if pid in product_by_id
+        ]
+        print(
+            f"⏱️ Step 5 (Preload Product Objects): {round((time.perf_counter() - t0) * 1000, 2)} ms"
         )
 
-        paginated_result = await db.execute(paginated_query)
-        paginated_products = paginated_result.scalars().all()
-
-        if not paginated_products:
-            return [], total, tenant_stats
-
         # ------------------------------------------------------------------
-        # 4. Target Specific Metrics for Only the Paginated Products
+        # 5. Fetch Detail Metrics ONLY for the 24 Target Paginated Items
         # ------------------------------------------------------------------
-        # Instead of grouping metrics for every product in the system, we only
-        # query metrics matching the subset array of ids returned by pagination.
-        paginated_product_ids = [p.id for p in paginated_products]
-
+        t0 = time.perf_counter()
         prod_metrics_stmt = (
             select(
                 Product.id.label("product_id"),
@@ -1088,7 +1193,7 @@ class ProductService:
                 (ChatGEOAuditRecord.tenant_id == Product.tenant_id)
                 & (cast(Chat.model_choice, String) == ChatGEOAuditRecord.model_used),
             )
-            .where(Product.id.in_(paginated_product_ids))
+            .where(Product.id.in_(ordered_product_ids))
         )
 
         prod_metrics_result = await db.execute(prod_metrics_stmt)
@@ -1099,12 +1204,17 @@ class ProductService:
             product_metrics_map[r.product_id].append(
                 (r.ChatSearchQuery, r.chat_id, r.chat_created_at)
             )
+        print(
+            f"⏱️ Step 6 (Target Metrics SQL): {round((time.perf_counter() - t0) * 1000, 2)} ms | Rows Matched: {len(prod_results)}"
+        )
 
         # ------------------------------------------------------------------
-        # 5. Map Inner Entity Metrics Onto Paginated Output Payload
+        # 6. Map Metrics Payload in Preserved Order
         # ------------------------------------------------------------------
+        t0 = time.perf_counter()
         products_payload = []
-        for product in paginated_products:
+
+        for product in ordered_products:
             prod_rows = product_metrics_map.get(product.id, [])
 
             prod_total_queries = len(prod_rows)
@@ -1141,7 +1251,7 @@ class ProductService:
                 if isinstance(sources, str):
                     try:
                         sources = json.loads(sources)
-                    except:
+                    except Exception:
                         sources = []
                 citation_counter += len(sources)
 
@@ -1149,7 +1259,7 @@ class ProductService:
                 if isinstance(competitors, str):
                     try:
                         competitors = json.loads(competitors)
-                    except:
+                    except Exception:
                         competitors = []
                 competitor_counter += len(competitors)
 
@@ -1178,5 +1288,12 @@ class ProductService:
                 "last_analysis": last_analysis_time,
             }
             products_payload.append(product)
+
+        print(
+            f"⏱️ Step 7 (Python Payload Mapping): {round((time.perf_counter() - t0) * 1000, 2)} ms"
+        )
+        print(
+            f"--- [END] list_products total time: {round((time.perf_counter() - start_time) * 1000, 2)} ms ---\n"
+        )
 
         return products_payload, total, tenant_stats
