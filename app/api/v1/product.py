@@ -143,7 +143,7 @@ async def list_products(
 
     try:
 
-        products, total, tenant_states = await ProductService.list_products(
+        products, total, tenant_states, product_ids = await ProductService.list_products(
             db=db,
             user=user,
             tenant_id=active_tenant_id,
@@ -159,6 +159,7 @@ async def list_products(
             "data": products,
             "tenant_states": tenant_states,
             "pagination": {"page": page, "limit": limit, "total": total},
+            "product_ids": product_ids
         }
 
     except Exception as e:

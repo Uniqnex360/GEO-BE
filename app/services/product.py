@@ -867,27 +867,53 @@ class ProductService:
             }
 
         elif tab == "citation":
-            sources_set = set()
+            # 1. Map each source to its actual mention count and calculate real competitor citations
+            source_stats: Dict[str, Dict[str, Any]] = {}
+
             for q in all_queries:
-                if q.citing_sources:
-                    sources_set.update(q.citing_sources)
+                citing = q.citing_sources or []
+                competitors = q.competitors_mentioned or []
+
+                for source in citing:
+                    if source not in source_stats:
+                        source_stats[source] = {
+                            "you_count": 0,
+                            "competitor_count": 0,
+                        }
+                    # Track 'Your' product mentions for this source
+                    source_stats[source]["you_count"] += 1
+
+                    # Track Competitor mentions associated with this query/source
+                    source_stats[source]["competitor_count"] += len(competitors)
 
             ui_citations = []
-            for idx, source in enumerate(list(sources_set)):
-                mentions_count = sum(
-                    1
-                    for q in all_queries
-                    if q.citing_sources and source in q.citing_sources
+            for source, stats in source_stats.items():
+                # Strip domain safely
+                clean_source = (
+                    source.replace("https://", "")
+                    .replace("http://", "")
+                    .replace("www.", "")
+                    .split("/")[0]
                 )
+
+                you_count = stats["you_count"]
+                # Use actual count from queries, or default to 0 if no competitors mentioned
+                comp_count = stats["competitor_count"]
+                gap_count = you_count - comp_count
+
+                # If domain authority isn't stored in DB, derive a simple scale or pull from source data
+                # (Replace `get_domain_authority` with your model column if available)
+                calculated_authority = getattr(q, "source_authority", None) or min(
+                    100, 50 + (you_count * 5)
+                )
+
                 ui_citations.append(
                     {
-                        "source": source.replace("https://", "")
-                        .replace("www.", "")
-                        .split("/")[0],
-                        "authority": 85 if idx % 2 == 0 else 72,
-                        "you": mentions_count,
-                        "competitor": mentions_count + 2,
-                        "gap": -2,
+                        "source": clean_source,
+                        "authority": calculated_authority,
+                        "you": you_count,
+                        "competitor": comp_count,
+                        "gap": gap_count,
                     }
                 )
 
@@ -1073,6 +1099,17 @@ class ProductService:
             view_filters.append(Product.name.ilike(f"%{search}%"))
 
         # ------------------------------------------------------------------
+        # 3b. Fetch All Unpaginated Product IDs matching view filters
+        # ------------------------------------------------------------------
+        t0_ids = time.perf_counter()
+        all_ids_stmt = select(Product.id).where(*view_filters)
+        all_ids_result = await db.execute(all_ids_stmt)
+        all_product_ids = list(all_ids_result.scalars().all())
+        print(
+            f"⏱️ Step 3b (All Unpaginated IDs SQL): {round((time.perf_counter() - t0_ids) * 1000, 2)} ms | Total Matching IDs: {len(all_product_ids)}"
+        )
+
+        # ------------------------------------------------------------------
         # 4. Fast Database Sorting & Paginated Product ID Fetch
         # ------------------------------------------------------------------
         t0 = time.perf_counter()
@@ -1210,7 +1247,7 @@ class ProductService:
             print(
                 f"--- [END] list_products completed in {round((time.perf_counter() - start_time) * 1000, 2)} ms ---"
             )
-            return [], total, tenant_stats
+            return [], total, tenant_stats, all_product_ids
 
         # ------------------------------------------------------------------
         # 5. Fetch Product Entities & Re-Enforce Order
@@ -1430,4 +1467,4 @@ class ProductService:
             f"--- [END] list_products total time: {round((time.perf_counter() - start_time) * 1000, 2)} ms ---\n"
         )
 
-        return products_payload, total, tenant_stats
+        return products_payload, total, tenant_stats, all_product_ids
