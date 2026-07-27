@@ -4,7 +4,18 @@ import time
 from collections import defaultdict
 from typing import Optional, Dict, Any, List
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, cast, String, Float, case, distinct, desc, asc
+from sqlalchemy import (
+    exists,
+    select,
+    func,
+    cast,
+    String,
+    Float,
+    case,
+    distinct,
+    desc,
+    asc,
+)
 from sqlalchemy.orm import selectinload
 from statistics import mean
 from fastapi import HTTPException, status
@@ -977,6 +988,7 @@ class ProductService:
         # 1. Base Core Tenant Filters
         # ------------------------------------------------------------------
         tenant_filters = [Product.is_deleted.is_(False)]
+
         if not is_super_admin:
             tenant_filters.append(Product.tenant_id == tenant_id)
         elif tenant_id:
@@ -985,11 +997,19 @@ class ProductService:
         # ------------------------------------------------------------------
         # 2. Optimized Global Aggregate Metrics Query (DB Layer)
         # ------------------------------------------------------------------
-        # UNCHANGED logic/shape. Only difference: select_from(ChatSearchQuery)
-        # lets the planner start from the smallest/most selective table and
-        # avoids SQLAlchemy defaulting the FROM clause inference, which can
-        # occasionally produce a worse join order on some dialects.
         t0 = time.perf_counter()
+
+        # Step 2a: Count true total products and brands directly from Product table
+        prod_count_stmt = select(
+            func.count(distinct(Product.id)).label("unique_products"),
+            func.count(distinct(Product.brand_id)).label("unique_brands"),
+        ).where(*tenant_filters)
+
+        prod_count_res = (await db.execute(prod_count_stmt)).first()
+        total_tenant_products = prod_count_res.unique_products if prod_count_res else 0
+        total_tenant_brands = prod_count_res.unique_brands if prod_count_res else 0
+
+        # Step 2b: Calculate aggregated chat analytics using OUTER JOINs
         global_stats_stmt = (
             select(
                 func.count(ChatSearchQuery.id).label("total_queries"),
@@ -999,13 +1019,11 @@ class ProductService:
                 func.sum(
                     case((ChatSearchQuery.product_found.is_(True), 1), else_=0)
                 ).label("total_found"),
-                func.count(distinct(Product.id)).label("unique_products"),
-                func.count(distinct(Product.brand_id)).label("unique_brands"),
             )
-            .select_from(ChatSearchQuery)
-            .join(Chat, ChatSearchQuery.chat_id == Chat.id)
-            .join(Product, Chat.product_id == Product.id)
-            .join(
+            .select_from(Product)
+            .outerjoin(Chat, Chat.product_id == Product.id)
+            .outerjoin(ChatSearchQuery, ChatSearchQuery.chat_id == Chat.id)
+            .outerjoin(
                 ChatGEOAuditRecord,
                 (ChatGEOAuditRecord.tenant_id == Product.tenant_id)
                 & (cast(Chat.model_choice, String) == ChatGEOAuditRecord.model_used),
@@ -1035,10 +1053,10 @@ class ProductService:
         )
 
         tenant_stats = {
-            "total_products": (stats_row.unique_products if stats_row else 0) or 0,
+            "total_products": total_tenant_products,
             "avg_visibility_score": round(avg_visibility_score, 1),
             "avg_mention_rate": round(avg_mention_rate, 1),
-            "brands_tracked": (stats_row.unique_brands if stats_row else 0) or 0,
+            "brands_tracked": total_tenant_brands,
         }
 
         # ------------------------------------------------------------------
@@ -1056,8 +1074,6 @@ class ProductService:
 
         # ------------------------------------------------------------------
         # 4. Fast Database Sorting & Paginated Product ID Fetch
-        #    (count + page fetched in ONE round trip via a window function,
-        #     instead of a separate COUNT query + a separate SELECT query)
         # ------------------------------------------------------------------
         t0 = time.perf_counter()
         total_count_col = func.count().over().label("total_count_val")
@@ -1070,10 +1086,7 @@ class ProductService:
         }
 
         if sort_by in VISIBILITY_SORT_KEYS:
-            # Per-engine visibility rate, computed at DB level so the sort
-            # column matches exactly what Step 7 computes in Python for the
-            # displayed "visibility_rate" (avg of GPT/GEMINI/CLAUDE rates,
-            # only counting engines that actually have queries for that product).
+
             def _engine_rate_col(engine_code):
                 matched_total = func.sum(
                     case((Chat.model_choice == engine_code, 1), else_=0)
@@ -1117,7 +1130,6 @@ class ProductService:
             ]
 
             if VISIBILITY_SORT_KEYS[sort_by] is None:
-                # average of whichever engine rates are non-null
                 sum_rates_expr = (
                     func.coalesce(engine_rate_cols[0], 0.0)
                     + func.coalesce(engine_rate_cols[1], 0.0)
@@ -1153,10 +1165,8 @@ class ProductService:
             )
 
         else:
-            # Direct Field DB Order (Name, SKU, Brand Name, Created At)
             paginated_id_stmt = select(Product.id, total_count_col).where(*view_filters)
 
-            # CRITICAL FIX: Join Brand table explicitly if sorting by brand
             if sort_by == "brand":
                 paginated_id_stmt = paginated_id_stmt.outerjoin(
                     Brand, Product.brand_id == Brand.id
@@ -1164,7 +1174,6 @@ class ProductService:
 
             order_clauses = []
             if sort_by == "name":
-                # CRITICAL FIX: Lowercase comparison ensures case-insensitive A-Z sorting
                 order_clauses.append(direction(func.lower(Product.name)))
             elif sort_by == "sku":
                 order_clauses.append(direction(func.lower(Product.sku)))
@@ -1173,7 +1182,6 @@ class ProductService:
             else:
                 order_clauses.append(direction(Product.created_at))
 
-            # Secondary deterministic fallback ordering
             order_clauses.append(desc(Product.created_at))
 
             paginated_id_stmt = (
@@ -1185,15 +1193,11 @@ class ProductService:
         id_result = await db.execute(paginated_id_stmt)
         id_rows = id_result.all()
 
-        # CRITICAL FIX: Flatten scalar output explicitly
         ordered_product_ids = [row[0] for row in id_rows]
 
         if id_rows:
             total = id_rows[0].total_count_val
         else:
-            # Page beyond available results (or zero matches) — the window
-            # function has nothing to count from, so fall back to a direct
-            # COUNT just for this edge case instead of trusting a phantom 0.
             count_stmt = select(func.count(Product.id)).where(*view_filters)
             total_result = await db.execute(count_stmt)
             total = total_result.scalar() or 0
@@ -1224,7 +1228,6 @@ class ProductService:
         products_result = await db.execute(products_fetch_stmt)
         fetched_products = products_result.scalars().all()
 
-        # CRITICAL FIX: Strictly re-order fetched objects according to SQL ID order
         product_by_id = {p.id: p for p in fetched_products}
         ordered_products = [
             product_by_id[pid] for pid in ordered_product_ids if pid in product_by_id
@@ -1234,12 +1237,7 @@ class ProductService:
         )
 
         # ------------------------------------------------------------------
-        # 6. Fetch Detail Metrics ONLY for the 24 Target Paginated Items
-        #    (select only the columns actually used below, instead of the
-        #     full ChatSearchQuery entity — this is the biggest win: it
-        #     stops pulling every large/unused column, e.g. raw prompt/
-        #     response text, across the wire and instantiating full ORM
-        #     rows for data that's discarded a moment later)
+        # 6. Fetch Detail Metrics ONLY for the Target Paginated Items
         # ------------------------------------------------------------------
         t0 = time.perf_counter()
         prod_metrics_stmt = (
@@ -1277,10 +1275,6 @@ class ProductService:
         # ------------------------------------------------------------------
         # 7. Map Metrics Payload in Preserved Order
         # ------------------------------------------------------------------
-        # Chat.model_choice stores one of "GPT" / "GEMINI" / "CLAUDE" — map
-        # those to the friendly keys used in the analytics payload. Any
-        # unrecognized value falls back to its own lowercased name instead
-        # of being silently dropped, so a 4th engine added later still shows up.
         ENGINE_LABEL_MAP = {
             "GPT": "chatgpt",
             "GEMINI": "gemini",
@@ -1304,8 +1298,6 @@ class ProductService:
             competitor_counter = 0
             last_analysis_time = None
 
-            # Per-engine accumulators — same shape as the overall ones above,
-            # just bucketed by row.model_choice.
             engine_accum = defaultdict(
                 lambda: {
                     "unique_chats": set(),
@@ -1401,11 +1393,6 @@ class ProductService:
 
             product.product_brand_id = product.brand_id
 
-            # Every key present in by_engine had >=1 query for that engine
-            # (engine_accum is only populated lazily per row), so this is
-            # exactly "average of GPT/GEMINI/CLAUDE rates that have data" —
-            # the same formula used to build order_visibility_col in Step 4,
-            # so what's displayed always matches what's sorted.
             engine_rates_present = [
                 eng["visibility_rate"] for eng in by_engine.values()
             ]
