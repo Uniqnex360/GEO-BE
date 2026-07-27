@@ -258,7 +258,8 @@ class TenantDashboardService:
 
             return {
                 "visibility_score": round(avg_sov_percentage, 1),
-                "mention_rate": round((found_count / total_queries) * 100, 1),
+                "mention_rate": round((found_count / total_queries) * 10, 1),
+                # "mention_rate": round((found_count / total_queries) * 100, 1),
                 "avg_rank": (
                     round(rank_sum / valid_rank_count, 1)
                     if valid_rank_count > 0
@@ -379,8 +380,8 @@ class TenantDashboardService:
                 {
                     "label": "Mention Rate",
                     "value": current_metrics["mention_rate"],
-                    "suffix": "%",
-                    "format": "percentage",
+                    "suffix": "",
+                    "format": "decimal",
                     **calculate_trend_delta(
                         current_metrics["mention_rate"], prev_metrics["mention_rate"]
                     ),

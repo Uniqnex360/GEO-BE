@@ -643,7 +643,7 @@ class ProductService:
         # Calculate Mention Rate based on product discovery frequencies
         found_count = sum(1 for q in all_queries if q.product_found is True)
         mention_rate = (
-            round((found_count / total_queries) * 100, 1) if total_queries > 0 else 0.0
+            round((found_count / total_queries) * 10, 1) if total_queries > 0 else 0.0
         )
 
         total_reviews = (
@@ -985,6 +985,10 @@ class ProductService:
         # ------------------------------------------------------------------
         # 2. Optimized Global Aggregate Metrics Query (DB Layer)
         # ------------------------------------------------------------------
+        # UNCHANGED logic/shape. Only difference: select_from(ChatSearchQuery)
+        # lets the planner start from the smallest/most selective table and
+        # avoids SQLAlchemy defaulting the FROM clause inference, which can
+        # occasionally produce a worse join order on some dialects.
         t0 = time.perf_counter()
         global_stats_stmt = (
             select(
@@ -998,6 +1002,7 @@ class ProductService:
                 func.count(distinct(Product.id)).label("unique_products"),
                 func.count(distinct(Product.brand_id)).label("unique_brands"),
             )
+            .select_from(ChatSearchQuery)
             .join(Chat, ChatSearchQuery.chat_id == Chat.id)
             .join(Product, Chat.product_id == Product.id)
             .join(
@@ -1024,7 +1029,7 @@ class ProductService:
             else 0.0
         )
         avg_mention_rate = (
-            (tenant_found_count / tenant_total_queries) * 100
+            round((tenant_found_count / tenant_total_queries) * 10, 1)
             if tenant_total_queries and tenant_total_queries > 0
             else 0.0
         )
@@ -1049,43 +1054,54 @@ class ProductService:
         if search:
             view_filters.append(Product.name.ilike(f"%{search}%"))
 
-        # Fetch total records matching filters
-        t0 = time.perf_counter()
-        count_stmt = select(func.count(Product.id)).where(*view_filters)
-        total_result = await db.execute(count_stmt)
-        total = total_result.scalar() or 0
-        print(
-            f"⏱️ Step 3 (Total Count SQL): {round((time.perf_counter() - t0) * 1000, 2)} ms | Total Records: {total}"
-        )
-
         # ------------------------------------------------------------------
         # 4. Fast Database Sorting & Paginated Product ID Fetch
-        # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
-        # 4. Fast Database Sorting & Paginated Product ID Fetch
+        #    (count + page fetched in ONE round trip via a window function,
+        #     instead of a separate COUNT query + a separate SELECT query)
         # ------------------------------------------------------------------
         t0 = time.perf_counter()
+        total_count_col = func.count().over().label("total_count_val")
 
-        if sort_by == "visibility":
-            # Compute Visibility Rate directly at DB level
+        VISIBILITY_SORT_KEYS = {
+            "visibility": None,  # average across engines
+            "visibility_gpt": "GPT",
+            "visibility_gemini": "GEMINI",
+            "visibility_claude": "CLAUDE",
+        }
+
+        if sort_by in VISIBILITY_SORT_KEYS:
+            # Per-engine visibility rate, computed at DB level so the sort
+            # column matches exactly what Step 7 computes in Python for the
+            # displayed "visibility_rate" (avg of GPT/GEMINI/CLAUDE rates,
+            # only counting engines that actually have queries for that product).
+            def _engine_rate_col(engine_code):
+                matched_total = func.sum(
+                    case((Chat.model_choice == engine_code, 1), else_=0)
+                )
+                matched_found = func.sum(
+                    case(
+                        (
+                            (Chat.model_choice == engine_code)
+                            & (ChatSearchQuery.product_found.is_(True)),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                )
+                return case(
+                    (
+                        matched_total > 0,
+                        cast(matched_found, Float) / cast(matched_total, Float) * 100.0,
+                    ),
+                    else_=None,
+                )
+
             vis_subquery = (
                 select(
                     Product.id.label("prod_id"),
-                    (
-                        func.coalesce(
-                            (
-                                func.sum(
-                                    case(
-                                        (ChatSearchQuery.product_found.is_(True), 1.0),
-                                        else_=0.0,
-                                    )
-                                )
-                                / func.nullif(func.count(ChatSearchQuery.id), 0)
-                            )
-                            * 100.0,
-                            0.0,
-                        )
-                    ).label("calc_visibility_rate"),
+                    _engine_rate_col("GPT").label("gpt_rate"),
+                    _engine_rate_col("GEMINI").label("gemini_rate"),
+                    _engine_rate_col("CLAUDE").label("claude_rate"),
                 )
                 .outerjoin(Chat, Chat.product_id == Product.id)
                 .outerjoin(ChatSearchQuery, ChatSearchQuery.chat_id == Chat.id)
@@ -1094,12 +1110,42 @@ class ProductService:
                 .subquery()
             )
 
+            engine_rate_cols = [
+                vis_subquery.c.gpt_rate,
+                vis_subquery.c.gemini_rate,
+                vis_subquery.c.claude_rate,
+            ]
+
+            if VISIBILITY_SORT_KEYS[sort_by] is None:
+                # average of whichever engine rates are non-null
+                sum_rates_expr = (
+                    func.coalesce(engine_rate_cols[0], 0.0)
+                    + func.coalesce(engine_rate_cols[1], 0.0)
+                    + func.coalesce(engine_rate_cols[2], 0.0)
+                )
+                count_rates_expr = (
+                    case((engine_rate_cols[0].isnot(None), 1), else_=0)
+                    + case((engine_rate_cols[1].isnot(None), 1), else_=0)
+                    + case((engine_rate_cols[2].isnot(None), 1), else_=0)
+                )
+                order_visibility_col = func.coalesce(
+                    sum_rates_expr / func.nullif(count_rates_expr, 0), 0.0
+                )
+            else:
+                target_engine = VISIBILITY_SORT_KEYS[sort_by]
+                col_map = {
+                    "GPT": vis_subquery.c.gpt_rate,
+                    "GEMINI": vis_subquery.c.gemini_rate,
+                    "CLAUDE": vis_subquery.c.claude_rate,
+                }
+                order_visibility_col = func.coalesce(col_map[target_engine], 0.0)
+
             paginated_id_stmt = (
-                select(Product.id)
+                select(Product.id, total_count_col)
                 .outerjoin(vis_subquery, Product.id == vis_subquery.c.prod_id)
                 .where(*view_filters)
                 .order_by(
-                    direction(vis_subquery.c.calc_visibility_rate),
+                    direction(order_visibility_col),
                     desc(Product.created_at),
                 )
                 .offset((page - 1) * limit)
@@ -1108,7 +1154,7 @@ class ProductService:
 
         else:
             # Direct Field DB Order (Name, SKU, Brand Name, Created At)
-            paginated_id_stmt = select(Product.id).where(*view_filters)
+            paginated_id_stmt = select(Product.id, total_count_col).where(*view_filters)
 
             # CRITICAL FIX: Join Brand table explicitly if sorting by brand
             if sort_by == "brand":
@@ -1137,11 +1183,23 @@ class ProductService:
             )
 
         id_result = await db.execute(paginated_id_stmt)
+        id_rows = id_result.all()
+
         # CRITICAL FIX: Flatten scalar output explicitly
-        ordered_product_ids = id_result.scalars().all()
+        ordered_product_ids = [row[0] for row in id_rows]
+
+        if id_rows:
+            total = id_rows[0].total_count_val
+        else:
+            # Page beyond available results (or zero matches) — the window
+            # function has nothing to count from, so fall back to a direct
+            # COUNT just for this edge case instead of trusting a phantom 0.
+            count_stmt = select(func.count(Product.id)).where(*view_filters)
+            total_result = await db.execute(count_stmt)
+            total = total_result.scalar() or 0
 
         print(
-            f"⏱️ Step 4 (Target Page IDs SQL): {round((time.perf_counter() - t0) * 1000, 2)} ms | IDs: {len(ordered_product_ids)}"
+            f"⏱️ Step 3+4 (Count + Target Page IDs SQL, merged): {round((time.perf_counter() - t0) * 1000, 2)} ms | Total Records: {total} | IDs: {len(ordered_product_ids)}"
         )
 
         if not ordered_product_ids:
@@ -1176,15 +1234,25 @@ class ProductService:
         )
 
         # ------------------------------------------------------------------
-        # 5. Fetch Detail Metrics ONLY for the 24 Target Paginated Items
+        # 6. Fetch Detail Metrics ONLY for the 24 Target Paginated Items
+        #    (select only the columns actually used below, instead of the
+        #     full ChatSearchQuery entity — this is the biggest win: it
+        #     stops pulling every large/unused column, e.g. raw prompt/
+        #     response text, across the wire and instantiating full ORM
+        #     rows for data that's discarded a moment later)
         # ------------------------------------------------------------------
         t0 = time.perf_counter()
         prod_metrics_stmt = (
             select(
                 Product.id.label("product_id"),
-                ChatSearchQuery,
+                ChatSearchQuery.product_found.label("product_found"),
+                ChatSearchQuery.share_of_voice.label("share_of_voice"),
+                ChatSearchQuery.citation_rank.label("citation_rank"),
+                ChatSearchQuery.citing_sources.label("citing_sources"),
+                ChatSearchQuery.competitors_mentioned.label("competitors_mentioned"),
                 Chat.id.label("chat_id"),
                 Chat.created_at.label("chat_created_at"),
+                Chat.model_choice.label("model_choice"),
             )
             .join(Chat, ChatSearchQuery.chat_id == Chat.id)
             .join(Product, Chat.product_id == Product.id)
@@ -1201,16 +1269,24 @@ class ProductService:
 
         product_metrics_map = defaultdict(list)
         for r in prod_results:
-            product_metrics_map[r.product_id].append(
-                (r.ChatSearchQuery, r.chat_id, r.chat_created_at)
-            )
+            product_metrics_map[r.product_id].append(r)
         print(
             f"⏱️ Step 6 (Target Metrics SQL): {round((time.perf_counter() - t0) * 1000, 2)} ms | Rows Matched: {len(prod_results)}"
         )
 
         # ------------------------------------------------------------------
-        # 6. Map Metrics Payload in Preserved Order
+        # 7. Map Metrics Payload in Preserved Order
         # ------------------------------------------------------------------
+        # Chat.model_choice stores one of "GPT" / "GEMINI" / "CLAUDE" — map
+        # those to the friendly keys used in the analytics payload. Any
+        # unrecognized value falls back to its own lowercased name instead
+        # of being silently dropped, so a 4th engine added later still shows up.
+        ENGINE_LABEL_MAP = {
+            "GPT": "chatgpt",
+            "GEMINI": "gemini",
+            "CLAUDE": "anthropic",
+        }
+
         t0 = time.perf_counter()
         products_payload = []
 
@@ -1228,42 +1304,116 @@ class ProductService:
             competitor_counter = 0
             last_analysis_time = None
 
-            for q_row, chat_id, chat_created_at in prod_rows:
-                unique_chats.add(chat_id)
+            # Per-engine accumulators — same shape as the overall ones above,
+            # just bucketed by row.model_choice.
+            engine_accum = defaultdict(
+                lambda: {
+                    "unique_chats": set(),
+                    "total_queries": 0,
+                    "found_count": 0,
+                    "rank_sum": 0.0,
+                    "valid_rank_count": 0,
+                    "citation_counter": 0,
+                    "sov_accumulation": 0.0,
+                    "competitor_counter": 0,
+                    "last_analysis_time": None,
+                }
+            )
 
-                if chat_created_at:
+            for row in prod_rows:
+                unique_chats.add(row.chat_id)
+                engine_bucket = engine_accum[row.model_choice]
+                engine_bucket["unique_chats"].add(row.chat_id)
+                engine_bucket["total_queries"] += 1
+
+                if row.chat_created_at:
                     if (
                         last_analysis_time is None
-                        or chat_created_at > last_analysis_time
+                        or row.chat_created_at > last_analysis_time
                     ):
-                        last_analysis_time = chat_created_at
+                        last_analysis_time = row.chat_created_at
 
-                if q_row.product_found is True:
+                    if (
+                        engine_bucket["last_analysis_time"] is None
+                        or row.chat_created_at > engine_bucket["last_analysis_time"]
+                    ):
+                        engine_bucket["last_analysis_time"] = row.chat_created_at
+
+                if row.product_found is True:
                     prod_found_count += 1
+                    engine_bucket["found_count"] += 1
 
-                prod_sov_accumulation += float(q_row.share_of_voice or 0.0)
+                row_sov = float(row.share_of_voice or 0.0)
+                prod_sov_accumulation += row_sov
+                engine_bucket["sov_accumulation"] += row_sov
 
-                if q_row.citation_rank is not None:
-                    rank_sum += float(q_row.citation_rank)
+                if row.citation_rank is not None:
+                    row_rank = float(row.citation_rank)
+                    rank_sum += row_rank
                     valid_rank_count += 1
+                    engine_bucket["rank_sum"] += row_rank
+                    engine_bucket["valid_rank_count"] += 1
 
-                sources = q_row.citing_sources or []
+                sources = row.citing_sources or []
                 if isinstance(sources, str):
                     try:
                         sources = json.loads(sources)
                     except Exception:
                         sources = []
                 citation_counter += len(sources)
+                engine_bucket["citation_counter"] += len(sources)
 
-                competitors = q_row.competitors_mentioned or []
+                competitors = row.competitors_mentioned or []
                 if isinstance(competitors, str):
                     try:
                         competitors = json.loads(competitors)
                     except Exception:
                         competitors = []
                 competitor_counter += len(competitors)
+                engine_bucket["competitor_counter"] += len(competitors)
+
+            by_engine = {}
+            for raw_engine, bucket in engine_accum.items():
+                engine_key = ENGINE_LABEL_MAP.get(raw_engine, str(raw_engine).lower())
+                engine_total_queries = bucket["total_queries"]
+                by_engine[engine_key] = {
+                    "total_chats": len(bucket["unique_chats"]),
+                    "total_queries": engine_total_queries,
+                    "avg_share_of_voice": (
+                        round((bucket["sov_accumulation"] / engine_total_queries), 2)
+                        if engine_total_queries > 0
+                        else 0.0
+                    ),
+                    "avg_citation_rank": (
+                        round((bucket["rank_sum"] / bucket["valid_rank_count"]), 2)
+                        if bucket["valid_rank_count"] > 0
+                        else 0.0
+                    ),
+                    "visibility_rate": (
+                        round((bucket["found_count"] / engine_total_queries) * 100, 2)
+                        if engine_total_queries > 0
+                        else 0.0
+                    ),
+                    "competitor_mentions": bucket["competitor_counter"],
+                    "citation_count": bucket["citation_counter"],
+                    "last_analysis": bucket["last_analysis_time"],
+                }
 
             product.product_brand_id = product.brand_id
+
+            # Every key present in by_engine had >=1 query for that engine
+            # (engine_accum is only populated lazily per row), so this is
+            # exactly "average of GPT/GEMINI/CLAUDE rates that have data" —
+            # the same formula used to build order_visibility_col in Step 4,
+            # so what's displayed always matches what's sorted.
+            engine_rates_present = [
+                eng["visibility_rate"] for eng in by_engine.values()
+            ]
+            overall_visibility_rate = (
+                round(sum(engine_rates_present) / len(engine_rates_present), 2)
+                if engine_rates_present
+                else 0.0
+            )
 
             product.analytics = {
                 "total_chats": len(unique_chats),
@@ -1278,14 +1428,11 @@ class ProductService:
                     if valid_rank_count > 0
                     else 0.0
                 ),
-                "visibility_rate": (
-                    round((prod_found_count / prod_total_queries) * 100, 2)
-                    if prod_total_queries > 0
-                    else 0.0
-                ),
+                "visibility_rate": overall_visibility_rate,
                 "competitor_mentions": competitor_counter,
                 "citation_count": citation_counter,
                 "last_analysis": last_analysis_time,
+                "by_engine": by_engine,
             }
             products_payload.append(product)
 

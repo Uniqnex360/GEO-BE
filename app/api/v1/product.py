@@ -123,6 +123,15 @@ async def list_products(
     is_super_admin = user.get("is_super_admin", False)
     active_tenant_id = tenant_id if is_super_admin else user.get("tenant_id")
 
+    if sort_by == "analytics.visibility_rate":
+        sort_by = "visibility"
+    elif sort_by == "analytics.by_engine.chatgpt.visibility_rate":
+        sort_by = "visibility_gpt"
+    elif sort_by == "analytics.by_engine.gemini.visibility_rate":
+        sort_by = "visibility_gemini"
+    elif sort_by == "analytics.by_engine.anthropic.visibility_rate":
+        sort_by = "visibility_claude"
+
     try:
 
         products, total, tenant_states = await ProductService.list_products(
@@ -134,13 +143,13 @@ async def list_products(
             search=search,
             brand=brand,
             sort_by=sort_by,
-            sort_order=sort_order
+            sort_order=sort_order,
         )
 
         return {
-            "data": products + products,
+            "data": products,
             "tenant_states": tenant_states,
-            "pagination": {"page": page, "limit": limit, "total": total * 2},
+            "pagination": {"page": page, "limit": limit, "total": total},
         }
 
     except Exception as e:
