@@ -370,7 +370,7 @@ class TenantDashboardService:
                 {
                     "label": "Visibility Score",
                     "value": current_metrics["visibility_score"],
-                    "suffix": "/100",
+                    "suffix": "",
                     "format": "decimal",
                     **calculate_trend_delta(
                         current_metrics["visibility_score"],
