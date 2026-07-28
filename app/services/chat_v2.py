@@ -130,7 +130,7 @@ class GEOAuditField(BaseModel):
         default=0, description="The evaluated visibility compliance score."
     )
     tips: str = Field(
-        default="", description="Actionable optimization recommendation text."
+        default="", description="Actionable GEO optimization advice specifying exact fixes and missing elements."
     )
 
 
