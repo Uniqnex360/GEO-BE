@@ -556,19 +556,19 @@ class ProductService:
         V2 Detail endpoint tailored exactly to frontend dashboard specifications.
         Optimized to extract competitor listings from JSON fields and map model choices
         to dynamic recommendation actions.
+
+        Note: All performance, visibility, and impact metrics are normalized to a 0-10 scale.
         """
         is_super_admin = user.get("is_super_admin", False)
 
         # ------------------------------------------------------------------
         # 1. Unified Eager-Load Query Execution (Optimized by Tab Type)
         # ------------------------------------------------------------------
-        # We explicitly eager-load Product -> Chat -> ChatSearchQuery
         load_options = [
             selectinload(Product.brand),
             selectinload(Product.chats).selectinload(Chat.search_queries),
         ]
 
-        # Only load heavy relationship arrays if requested by the visibility layout
         if tab == "visibility":
             load_options.append(selectinload(Product.features))
             load_options.append(selectinload(Product.faqs))
@@ -599,8 +599,6 @@ class ProductService:
         all_chats: List[Chat] = product.chats or []
         all_queries: List[ChatSearchQuery] = []
 
-        # We loop and save a dynamic reference back to the parent Chat
-        # so we can access chat.model_choice later without lazy-load issues.
         for chat in all_chats:
             for q in chat.search_queries or []:
                 q._parent_chat = chat
@@ -609,7 +607,7 @@ class ProductService:
         total_queries = len(all_queries)
 
         # ------------------------------------------------------------------
-        # 3. Dynamic Platform Breakdown Engine Analysis (ADAPTED TO DB COLS)
+        # 3. Dynamic Platform Breakdown Engine Analysis (SCALE 0 - 10)
         # ------------------------------------------------------------------
         engine_scores = {
             "chatgpt": 0.0,
@@ -618,7 +616,6 @@ class ProductService:
         }
         engine_counts = {"chatgpt": 0, "gemini": 0, "claude": 0}
 
-        # Mapper translates database keys into frontend dashboard keys
         platform_mapper = {
             "openai": "chatgpt",
             "google": "gemini",
@@ -630,8 +627,6 @@ class ProductService:
             breakdown = q.platform_breakdown or {}
             for platform, values in breakdown.items():
                 norm_platform = platform.lower()
-
-                # Dynamic translation from DB keys to payload keys
                 mapped_engine = platform_mapper.get(norm_platform, norm_platform)
 
                 if mapped_engine in engine_scores:
@@ -641,17 +636,18 @@ class ProductService:
         engine_visibility_summary = {}
         for engine in engine_scores.keys():
             count = engine_counts[engine]
+            # Computed directly on a 0-10 scale
             engine_visibility_summary[engine] = (
-                round((engine_scores[engine] / count) * 10, 1) if count > 0 else 0.0
+                round(engine_scores[engine] / count, 1) if count > 0 else 0.0
             )
 
-        # Determine Global AI Visibility Baseline
+        # Determine Global AI Visibility Baseline (0 to 10)
         valid_scores = [v for v in engine_visibility_summary.values() if v > 0]
         ai_visibility_score = (
-            round(statistics.mean(valid_scores)) if valid_scores else 0
+            round(statistics.mean(valid_scores), 1) if valid_scores else 0.0
         )
 
-        # Calculate Mention Rate based on product discovery frequencies
+        # Calculate Mention Rate (Scaled to 0 to 10)
         found_count = sum(1 for q in all_queries if q.product_found is True)
         mention_rate = (
             round((found_count / total_queries) * 10, 1) if total_queries > 0 else 0.0
@@ -683,8 +679,8 @@ class ProductService:
                 "sku": product.sku or "N/A",
                 "mpn": product.mpn or "N/A",
                 "globalScores": {
-                    "visibilityScore": ai_visibility_score,
-                    "mentionRate": mention_rate,
+                    "visibilityScore": ai_visibility_score,  # 0 - 10
+                    "mentionRate": mention_rate,  # 0 - 10
                     "reviewsCount": total_reviews,
                 },
                 "engineBreakdown": [
@@ -706,10 +702,9 @@ class ProductService:
         }
 
         # ------------------------------------------------------------------
-        # 5. Dynamic Tab Processing Matrix (Computes ONLY requested slice)
+        # 5. Dynamic Tab Processing Matrix
         # ------------------------------------------------------------------
         if tab == "visibility":
-            # If relationship was fetched, use it to ensure absolute real-time accuracy
             calculated_faqs = (
                 len(product.faqs or [])
                 if hasattr(product, "faqs") and product.faqs is not None
@@ -741,7 +736,6 @@ class ProductService:
         elif tab == "competitor":
             competitors_set = set()
 
-            # A. First check and parse from product.competitor_analytics JSON field
             if (
                 hasattr(product, "competitor_analytics")
                 and product.competitor_analytics
@@ -754,7 +748,6 @@ class ProductService:
                         ):
                             competitors_set.add(comp_entry["competitor_name"])
 
-            # B. Fallback to query-level mentions if JSON field is empty
             if not competitors_set:
                 for q in all_queries:
                     if q.competitors_mentioned:
@@ -765,19 +758,39 @@ class ProductService:
                 ui_competitors.append(
                     {
                         "name": comp,
-                        "chatGPT": max(
-                            0.0,
-                            round(engine_visibility_summary.get("chatgpt", 0.0) * 0.9),
+                        "chatGPT": min(
+                            10.0,
+                            max(
+                                0.0,
+                                round(
+                                    engine_visibility_summary.get("chatgpt", 0.0) * 0.9,
+                                    1,
+                                ),
+                            ),
                         ),
-                        "gemini": max(
-                            0.0,
-                            round(engine_visibility_summary.get("gemini", 0.0) * 1.1),
+                        "gemini": min(
+                            10.0,
+                            max(
+                                0.0,
+                                round(
+                                    engine_visibility_summary.get("gemini", 0.0) * 1.1,
+                                    1,
+                                ),
+                            ),
                         ),
-                        "claude": max(
-                            0.0,
-                            round(engine_visibility_summary.get("claude", 0.0) * 0.95),
+                        "claude": min(
+                            10.0,
+                            max(
+                                0.0,
+                                round(
+                                    engine_visibility_summary.get("claude", 0.0) * 0.95,
+                                    1,
+                                ),
+                            ),
                         ),
-                        "avg": max(0.0, round(ai_visibility_score * 0.95)),
+                        "avg": min(
+                            10.0, max(0.0, round(ai_visibility_score * 0.95, 1))
+                        ),
                         "active": False,
                     }
                 )
@@ -794,35 +807,36 @@ class ProductService:
                 },
             )
 
+            # Content gaps scaled to 0-10 format
             schema_gaps = []
             if not product.sku:
                 schema_gaps.append(
                     {
                         "title": "Missing Structural SKU Schema Identification",
-                        "you": 0,
-                        "top": 100,
+                        "you": 0.0,
+                        "top": 10.0,
                         "status": "High",
-                        "gain": "+15 points",
+                        "gain": "+1.5 points",
                     }
                 )
             if not product.mpn:
                 schema_gaps.append(
                     {
                         "title": "Missing MPN Global Identification Tags",
-                        "you": 0,
-                        "top": 90,
+                        "you": 0.0,
+                        "top": 9.0,
                         "status": "Medium",
-                        "gain": "+8 points",
+                        "gain": "+0.8 points",
                     }
                 )
             if total_reviews < 50:
                 schema_gaps.append(
                     {
                         "title": "Review Multi-platform Citations Deficit",
-                        "you": 35,
-                        "top": 85,
+                        "you": 3.5,
+                        "top": 8.5,
                         "status": "High",
-                        "gain": "+22 points",
+                        "gain": "+2.2 points",
                     }
                 )
 
@@ -830,35 +844,36 @@ class ProductService:
                 schema_gaps.append(
                     {
                         "title": "FAQ Context Synchronization Coverage",
-                        "you": 75,
-                        "top": 95,
+                        "you": 7.5,
+                        "top": 9.5,
                         "status": "Low",
-                        "gain": "+5 points",
+                        "gain": "+0.5 points",
                     }
                 )
 
+            # Radar data scaled to 0-10 format
             response_payload["tabData"] = {
                 "competitors": ui_competitors,
                 "radarData": [
                     {
                         "subject": "Visibility Index",
                         "You": ai_visibility_score,
-                        "Competitor": round(ai_visibility_score * 0.9),
+                        "Competitor": round(ai_visibility_score * 0.9, 1),
                     },
                     {
                         "subject": "Citation Share",
-                        "You": min(100, int(mention_rate)),
-                        "Competitor": 65,
+                        "You": min(10.0, round(mention_rate, 1)),
+                        "Competitor": 6.5,
                     },
                     {
                         "subject": "Reviews Count",
-                        "You": min(100, total_reviews),
-                        "Competitor": 75,
+                        "You": min(10.0, round(total_reviews / 10, 1)),
+                        "Competitor": 7.5,
                     },
                     {
                         "subject": "FAQ Coverage",
-                        "You": min(100, total_faqs * 5),
-                        "Competitor": 80,
+                        "You": min(10.0, round((total_faqs * 5) / 10, 1)),
+                        "Competitor": 8.0,
                     },
                 ],
                 "radarSummaryText": f"Currently outperforming {len(competitors_set)} competitor tracking profiles.",
@@ -867,7 +882,6 @@ class ProductService:
             }
 
         elif tab == "citation":
-            # 1. Map each source to its actual mention count and calculate real competitor citations
             source_stats: Dict[str, Dict[str, Any]] = {}
 
             for q in all_queries:
@@ -880,15 +894,11 @@ class ProductService:
                             "you_count": 0,
                             "competitor_count": 0,
                         }
-                    # Track 'Your' product mentions for this source
                     source_stats[source]["you_count"] += 1
-
-                    # Track Competitor mentions associated with this query/source
                     source_stats[source]["competitor_count"] += len(competitors)
 
             ui_citations = []
             for source, stats in source_stats.items():
-                # Strip domain safely
                 clean_source = (
                     source.replace("https://", "")
                     .replace("http://", "")
@@ -897,20 +907,20 @@ class ProductService:
                 )
 
                 you_count = stats["you_count"]
-                # Use actual count from queries, or default to 0 if no competitors mentioned
                 comp_count = stats["competitor_count"]
                 gap_count = you_count - comp_count
 
-                # If domain authority isn't stored in DB, derive a simple scale or pull from source data
-                # (Replace `get_domain_authority` with your model column if available)
-                calculated_authority = getattr(q, "source_authority", None) or min(
-                    100, 50 + (you_count * 5)
-                )
+                # Scale authority calculation down to 0-10 scale
+                calculated_authority = getattr(q, "source_authority", None)
+                if calculated_authority is not None:
+                    calculated_authority = round(calculated_authority / 10.0, 1)
+                else:
+                    calculated_authority = min(10.0, round(5.0 + (you_count * 0.5), 1))
 
                 ui_citations.append(
                     {
                         "source": clean_source,
-                        "authority": calculated_authority,
+                        "authority": calculated_authority,  # Scale: 0.0 - 10.0
                         "you": you_count,
                         "competitor": comp_count,
                         "gap": gap_count,
@@ -924,7 +934,7 @@ class ProductService:
                     else [
                         {
                             "source": "No Citations Tracked",
-                            "authority": 0,
+                            "authority": 0.0,
                             "you": 0,
                             "competitor": 0,
                             "gap": 0,
@@ -937,13 +947,9 @@ class ProductService:
             ui_actions = []
             for q in all_queries:
                 if q.query_optimization_tips and q.query_optimization_tips.strip():
-                    # 1. Resolve parent Chat safely
                     parent_chat = getattr(q, "_parent_chat", None)
-
-                    # 2. Extract model choice from parent chat
                     model_choice = parent_chat.model_choice if parent_chat else ""
 
-                    # 3. Extract the competitor_analytics JSON list directly from the parent chat
                     chat_competitors = []
                     if (
                         parent_chat
@@ -968,8 +974,10 @@ class ProductService:
                             "query_optimization_tag": q.query_optimization_tag,
                             "title": q.query_optimization_tips.strip(),
                             "model": model_choice,
-                            "competitors": chat_competitors,  # Structured JSON list from Chat model
-                            "impact": 85 if q.product_found is False else 60,
+                            "competitors": chat_competitors,
+                            "impact": (
+                                8.5 if q.product_found is False else 6.0
+                            ),  # Scale: 0.0 - 10.0
                         }
                     )
 
@@ -981,7 +989,7 @@ class ProductService:
                         "title": "Inject missing merchant schema markup and structural FAQs to expand engine crawl vectors.",
                         "model": "Unknown Model",
                         "competitors": [],
-                        "impact": 90,
+                        "impact": 9.0,  # Scale: 0.0 - 10.0
                     }
                 )
 
@@ -1277,6 +1285,7 @@ class ProductService:
         # 6. Fetch Detail Metrics ONLY for the Target Paginated Items
         # ------------------------------------------------------------------
         t0 = time.perf_counter()
+        # CHANGED: `.outerjoin(ChatGEOAuditRecord, ...)` to align matching behavior
         prod_metrics_stmt = (
             select(
                 Product.id.label("product_id"),
@@ -1291,7 +1300,7 @@ class ProductService:
             )
             .join(Chat, ChatSearchQuery.chat_id == Chat.id)
             .join(Product, Chat.product_id == Product.id)
-            .join(
+            .outerjoin(
                 ChatGEOAuditRecord,
                 (ChatGEOAuditRecord.tenant_id == Product.tenant_id)
                 & (cast(Chat.model_choice, String) == ChatGEOAuditRecord.model_used),
@@ -1418,6 +1427,14 @@ class ProductService:
                         if bucket["valid_rank_count"] > 0
                         else 0.0
                     ),
+                    # FIXED: use *10 (0-10 scale) to stay consistent with the
+                    # engine_visibility_summary scale in product_detail_v2 and
+                    # with the *10.0 scale used by _engine_rate_col() above
+                    # for sorting. Previously this used *100, which produced
+                    # a 0-100 value here while the detail endpoint and the
+                    # sort column both used 0-10 — causing the engine-wise
+                    # visibility numbers to differ between the list and
+                    # detail views for the same underlying data.
                     "visibility_rate": (
                         round((bucket["found_count"] / engine_total_queries) * 10, 2)
                         if engine_total_queries > 0
