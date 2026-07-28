@@ -1141,7 +1141,7 @@ class ProductService:
                 return case(
                     (
                         matched_total > 0,
-                        cast(matched_found, Float) / cast(matched_total, Float) * 100.0,
+                        cast(matched_found, Float) / cast(matched_total, Float) * 10.0,
                     ),
                     else_=None,
                 )
@@ -1419,7 +1419,7 @@ class ProductService:
                         else 0.0
                     ),
                     "visibility_rate": (
-                        round((bucket["found_count"] / engine_total_queries) * 100, 2)
+                        round((bucket["found_count"] / engine_total_queries) * 10, 2)
                         if engine_total_queries > 0
                         else 0.0
                     ),
