@@ -201,8 +201,14 @@ class BrandService:
         sort_by: Optional[str] = "created_at",
         sort_order: Optional[str] = "desc",
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        List brands with aggregated GEO visibility and mention rates.
+        Aligned with list_products calculation logic (0.0 to 10.0 scale based on product_found rate).
+        """
 
-        # 1. Permission check
+        # ------------------------------------------------------------------
+        # 1. Permission Check
+        # ------------------------------------------------------------------
         is_super_admin = user.get("is_super_admin", False)
         if not is_super_admin and user.get("tenant_id") != tenant_id:
             raise HTTPException(
@@ -210,26 +216,35 @@ class BrandService:
                 detail="Access denied: You do not have permissions for this tenant's data.",
             )
 
-        # 2. Aggregation Calculations
+        # ------------------------------------------------------------------
+        # 2. Metric Aggregations (Aligned with list_products logic)
+        # ------------------------------------------------------------------
+        # Convert product_found boolean to numeric float (1.0 or 0.0)
         found_numeric = case((ChatSearchQuery.product_found.is_(True), 1.0), else_=0.0)
 
-        mention_rate_expr = func.round(
-            cast(func.coalesce(func.avg(found_numeric) * 100.0, 0.0), Numeric), 1
-        )
-
+        # Visibility / Mention Rate: Scale 0.0 - 10.0
+        # Formula: (total_found_queries / total_queries) * 10.0
         visibility_expr = func.round(
             cast(
                 func.coalesce(
-                    func.avg(cast(ChatSearchQuery.share_of_voice, Numeric)), 0.0
+                    (
+                        func.sum(found_numeric)
+                        / func.nullif(func.count(ChatSearchQuery.id), 0)
+                    )
+                    * 10.0,
+                    0.0,
                 ),
                 Numeric,
             ),
             1,
         )
 
+        mention_rate_expr = visibility_expr
         products_count_expr = func.count(func.distinct(Product.id))
 
+        # ------------------------------------------------------------------
         # 3. Create Aggregation Subquery
+        # ------------------------------------------------------------------
         agg_subquery = (
             select(
                 Brand.id.label("brand_id"),
@@ -247,7 +262,9 @@ class BrandService:
             .group_by(Brand.id)
         ).subquery("agg")
 
-        # 4. Outer Query joining Brand with calculated metrics
+        # ------------------------------------------------------------------
+        # 4. Main Query: Join Brand with Calculated Aggregates
+        # ------------------------------------------------------------------
         stmt = select(
             Brand,
             agg_subquery.c.visibility_score,
@@ -255,7 +272,9 @@ class BrandService:
             agg_subquery.c.products_count,
         ).join(agg_subquery, Brand.id == agg_subquery.c.brand_id)
 
-        # 5. Search Filter
+        # ------------------------------------------------------------------
+        # 5. Apply Search Filter
+        # ------------------------------------------------------------------
         if search and search.strip():
             clean_search = f"%{search.strip()}%"
             stmt = stmt.where(
@@ -265,15 +284,14 @@ class BrandService:
                 )
             )
 
-        # 6. Clean Outer Sorting
+        # ------------------------------------------------------------------
+        # 6. Apply Dynamic Outer Sorting
+        # ------------------------------------------------------------------
         is_desc = (sort_order or "").lower() == "desc"
-
-        print("sorty by", sort_by)
 
         if sort_by == "name":
             sort_col = func.lower(Brand.name)
         elif sort_by == "country":
-            # Safe extraction for array/json country
             sort_col = func.lower(func.coalesce(Brand.countries[0], ""))
         elif sort_by == "industry":
             sort_col = func.lower(func.coalesce(Brand.industry, ""))
@@ -286,13 +304,14 @@ class BrandService:
         else:
             sort_col = Brand.created_at
 
-        # Apply order with nulls_last
         if is_desc:
             stmt = stmt.order_by(sort_col.desc().nulls_last())
         else:
             stmt = stmt.order_by(sort_col.asc().nulls_last())
 
-        # 7. Total Count Query
+        # ------------------------------------------------------------------
+        # 7. Total Count Query for Pagination
+        # ------------------------------------------------------------------
         count_query = select(func.count(func.distinct(Brand.id))).where(
             Brand.tenant_id == tenant_id, Brand.is_deleted.is_(False)
         )
@@ -308,17 +327,20 @@ class BrandService:
         total_result = await db.execute(count_query)
         total = total_result.scalar() or 0
 
-        # 8. Pagination & Execution
+        # ------------------------------------------------------------------
+        # 8. Pagination Execution
+        # ------------------------------------------------------------------
         offset = (page - 1) * limit
         stmt = stmt.offset(offset).limit(limit)
 
         result = await db.execute(stmt)
         rows = result.all()
 
-        # 9. Format Output
+        # ------------------------------------------------------------------
+        # 9. Format Output Payload
+        # ------------------------------------------------------------------
         brand_list = []
         for brand, visibility_score, mention_rate, products_count in rows:
-            # Resolve country string or list cleanly
             country_val = "-"
             if hasattr(brand, "countries") and brand.countries:
                 if isinstance(brand.countries, list):

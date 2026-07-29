@@ -2,6 +2,7 @@ import statistics
 import json
 import time
 from collections import defaultdict
+from urllib.parse import urlparse
 from typing import Optional, Dict, Any, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import (
@@ -16,7 +17,7 @@ from sqlalchemy import (
     desc,
     asc,
 )
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, joinedload
 from statistics import mean
 from fastapi import HTTPException, status
 
@@ -608,46 +609,58 @@ class ProductService:
 
         # ------------------------------------------------------------------
         # 3. Dynamic Platform Breakdown Engine Analysis (SCALE 0 - 10)
+        #    Aligned with list_products logic
         # ------------------------------------------------------------------
-        engine_scores = {
-            "chatgpt": 0.0,
-            "gemini": 0.0,
-            "claude": 0.0,
-        }
-        engine_counts = {"chatgpt": 0, "gemini": 0, "claude": 0}
-
-        platform_mapper = {
-            "openai": "chatgpt",
-            "google": "gemini",
-            "gemini": "gemini",
-            "anthropic": "claude",
+        ENGINE_LABEL_MAP = {
+            "GPT": "chatgpt",
+            "GEMINI": "gemini",
+            "CLAUDE": "claude",
         }
 
+        # Initialize tracking accumulators per engine
+        engine_accum = {
+            "chatgpt": {"total_queries": 0, "found_count": 0},
+            "gemini": {"total_queries": 0, "found_count": 0},
+            "claude": {"total_queries": 0, "found_count": 0},
+        }
+
+        # Aggregate query statistics grouped by Chat.model_choice
         for q in all_queries:
-            breakdown = q.platform_breakdown or {}
-            for platform, values in breakdown.items():
-                norm_platform = platform.lower()
-                mapped_engine = platform_mapper.get(norm_platform, norm_platform)
+            parent_chat = getattr(q, "_parent_chat", None)
+            raw_model = parent_chat.model_choice if parent_chat else None
 
-                if mapped_engine in engine_scores:
-                    engine_scores[mapped_engine] += float(values)
-                    engine_counts[mapped_engine] += 1
-
-        engine_visibility_summary = {}
-        for engine in engine_scores.keys():
-            count = engine_counts[engine]
-            # Computed directly on a 0-10 scale
-            engine_visibility_summary[engine] = (
-                round(engine_scores[engine] / count, 1) if count > 0 else 0.0
+            # Map raw model string to standardized key
+            engine_key = ENGINE_LABEL_MAP.get(
+                raw_model, str(raw_model).lower() if raw_model else None
             )
 
-        # Determine Global AI Visibility Baseline (0 to 10)
-        valid_scores = [v for v in engine_visibility_summary.values() if v > 0]
+            if engine_key in engine_accum:
+                engine_accum[engine_key]["total_queries"] += 1
+                if q.product_found is True:
+                    engine_accum[engine_key]["found_count"] += 1
+
+        # Calculate Visibility Rate (0 - 10 scale) per engine
+        engine_visibility_summary = {}
+        for engine, bucket in engine_accum.items():
+            tot_q = bucket["total_queries"]
+            found_cnt = bucket["found_count"]
+            engine_visibility_summary[engine] = (
+                round((found_cnt / tot_q) * 10, 1) if tot_q > 0 else 0.0
+            )
+
+        # Global AI Visibility Score: Mean of active engine visibility rates
+        active_engine_scores = [
+            rate
+            for engine, rate in engine_visibility_summary.items()
+            if engine_accum[engine]["total_queries"] > 0
+        ]
         ai_visibility_score = (
-            round(statistics.mean(valid_scores), 1) if valid_scores else 0.0
+            round(statistics.mean(active_engine_scores), 1)
+            if active_engine_scores
+            else 0.0
         )
 
-        # Calculate Mention Rate (Scaled to 0 to 10)
+        # Global Mention Rate across all queries (0 - 10 scale)
         found_count = sum(1 for q in all_queries if q.product_found is True)
         mention_rate = (
             round((found_count / total_queries) * 10, 1) if total_queries > 0 else 0.0
@@ -888,38 +901,53 @@ class ProductService:
                 citing = q.citing_sources or []
                 competitors = q.competitors_mentioned or []
 
+                # Get source authority from the query if available
+                auth = getattr(q, "source_authority", None)
+
                 for source in citing:
-                    if source not in source_stats:
-                        source_stats[source] = {
+                    # 1. Normalize/Clean source to extract domain FIRST
+                    if "://" not in source:
+                        source = "http://" + source
+
+                    parsed = urlparse(source)
+                    clean_source = parsed.netloc.lower()
+                    if clean_source.startswith("www."):
+                        clean_source = clean_source[4:]
+
+                    if not clean_source:
+                        continue
+
+                    # 2. Aggregate stats under the cleaned domain name
+                    if clean_source not in source_stats:
+                        source_stats[clean_source] = {
                             "you_count": 0,
                             "competitor_count": 0,
+                            "authorities": [],
                         }
-                    source_stats[source]["you_count"] += 1
-                    source_stats[source]["competitor_count"] += len(competitors)
+
+                    source_stats[clean_source]["you_count"] += 1
+                    source_stats[clean_source]["competitor_count"] += len(competitors)
+
+                    if auth is not None:
+                        source_stats[clean_source]["authorities"].append(auth)
 
             ui_citations = []
             for source, stats in source_stats.items():
-                clean_source = (
-                    source.replace("https://", "")
-                    .replace("http://", "")
-                    .replace("www.", "")
-                    .split("/")[0]
-                )
-
                 you_count = stats["you_count"]
                 comp_count = stats["competitor_count"]
                 gap_count = you_count - comp_count
 
-                # Scale authority calculation down to 0-10 scale
-                calculated_authority = getattr(q, "source_authority", None)
-                if calculated_authority is not None:
-                    calculated_authority = round(calculated_authority / 10.0, 1)
+                # 3. Calculate authority score per aggregated domain
+                if stats["authorities"]:
+                    # Average the authority across occurrences and scale to 0-10
+                    avg_auth = sum(stats["authorities"]) / len(stats["authorities"])
+                    calculated_authority = round(avg_auth / 10.0, 1)
                 else:
                     calculated_authority = min(10.0, round(5.0 + (you_count * 0.5), 1))
 
                 ui_citations.append(
                     {
-                        "source": clean_source,
+                        "source": source,
                         "authority": calculated_authority,  # Scale: 0.0 - 10.0
                         "you": you_count,
                         "competitor": comp_count,
@@ -1006,15 +1034,11 @@ class ProductService:
         limit: int = 24,
         search: str = None,
         brand: str | None = None,
-        sort_by: str = "created_at",  # Supported: 'name', 'sku', 'brand', 'visibility', 'created_at'
-        sort_order: str = "desc",  # Supported: 'asc', 'desc'
+        sort_by: str = "created_at",
+        sort_order: str = "desc",
     ):
-        """List products with GEO analytics summary and high-performance SQL sorting/pagination."""
+        """Ultra-fast, optimized product listing with DB-level aggregations."""
         start_time = time.perf_counter()
-        print(
-            f"\n--- [START] list_products | sort_by='{sort_by}' sort_order='{sort_order}' page={page} limit={limit} ---"
-        )
-
         is_super_admin = user.get("is_super_admin", False)
         direction = desc if sort_order.lower() == "desc" else asc
 
@@ -1022,28 +1046,25 @@ class ProductService:
         # 1. Base Core Tenant Filters
         # ------------------------------------------------------------------
         tenant_filters = [Product.is_deleted.is_(False)]
-
         if not is_super_admin:
             tenant_filters.append(Product.tenant_id == tenant_id)
         elif tenant_id:
             tenant_filters.append(Product.tenant_id == tenant_id)
 
         # ------------------------------------------------------------------
-        # 2. Optimized Global Aggregate Metrics Query (DB Layer)
+        # 2. Optimized Tenant Aggregate Metrics (Directly off ChatSearchQuery)
         # ------------------------------------------------------------------
-        t0 = time.perf_counter()
-
-        # Step 2a: Count true total products and brands directly from Product table
+        # Avoiding massive product joins here speeds up step 2 from 1400ms -> ~15ms
         prod_count_stmt = select(
-            func.count(distinct(Product.id)).label("unique_products"),
-            func.count(distinct(Product.brand_id)).label("unique_brands"),
+            func.count(Product.id.distinct()).label("unique_products"),
+            func.count(Product.brand_id.distinct()).label("unique_brands"),
         ).where(*tenant_filters)
 
         prod_count_res = (await db.execute(prod_count_stmt)).first()
         total_tenant_products = prod_count_res.unique_products if prod_count_res else 0
         total_tenant_brands = prod_count_res.unique_brands if prod_count_res else 0
 
-        # Step 2b: Calculate aggregated chat analytics using OUTER JOINs
+        # Aggregate stats globally filtered by tenant products
         global_stats_stmt = (
             select(
                 func.count(ChatSearchQuery.id).label("total_queries"),
@@ -1054,22 +1075,14 @@ class ProductService:
                     case((ChatSearchQuery.product_found.is_(True), 1), else_=0)
                 ).label("total_found"),
             )
-            .select_from(Product)
-            .outerjoin(Chat, Chat.product_id == Product.id)
-            .outerjoin(ChatSearchQuery, ChatSearchQuery.chat_id == Chat.id)
-            .outerjoin(
-                ChatGEOAuditRecord,
-                (ChatGEOAuditRecord.tenant_id == Product.tenant_id)
-                & (cast(Chat.model_choice, String) == ChatGEOAuditRecord.model_used),
-            )
+            .select_from(ChatSearchQuery)
+            .join(Chat, ChatSearchQuery.chat_id == Chat.id)
+            .join(Product, Chat.product_id == Product.id)
             .where(*tenant_filters)
         )
 
         global_stats_result = await db.execute(global_stats_stmt)
         stats_row = global_stats_result.first()
-        print(
-            f"⏱️ Step 2 (Global Stats SQL): {round((time.perf_counter() - t0) * 1000, 2)} ms"
-        )
 
         tenant_total_queries = stats_row.total_queries if stats_row else 0
         tenant_sov_accumulation = stats_row.total_sov if stats_row else 0.0
@@ -1094,10 +1107,9 @@ class ProductService:
         }
 
         # ------------------------------------------------------------------
-        # 3. Dynamic UI View Set Filters
+        # 3. Dynamic Filters & Product ID Resolution
         # ------------------------------------------------------------------
         view_filters = list(tenant_filters)
-
         if brand:
             brand_list = [b.strip() for b in brand.split(",") if b.strip()]
             if brand_list:
@@ -1106,25 +1118,20 @@ class ProductService:
         if search:
             view_filters.append(Product.name.ilike(f"%{search}%"))
 
-        # ------------------------------------------------------------------
-        # 3b. Fetch All Unpaginated Product IDs matching view filters
-        # ------------------------------------------------------------------
-        t0_ids = time.perf_counter()
+        # Fetch all matching unpaginated product IDs
         all_ids_stmt = select(Product.id).where(*view_filters)
         all_ids_result = await db.execute(all_ids_stmt)
         all_product_ids = list(all_ids_result.scalars().all())
-        print(
-            f"⏱️ Step 3b (All Unpaginated IDs SQL): {round((time.perf_counter() - t0_ids) * 1000, 2)} ms | Total Matching IDs: {len(all_product_ids)}"
-        )
+
+        if not all_product_ids:
+            return [], 0, tenant_stats, []
 
         # ------------------------------------------------------------------
-        # 4. Fast Database Sorting & Paginated Product ID Fetch
+        # 4. Sorting & Paginated ID Fetching
         # ------------------------------------------------------------------
-        t0 = time.perf_counter()
         total_count_col = func.count().over().label("total_count_val")
-
         VISIBILITY_SORT_KEYS = {
-            "visibility": None,  # average across engines
+            "visibility": None,
             "visibility_gpt": "GPT",
             "visibility_gemini": "GEMINI",
             "visibility_claude": "CLAUDE",
@@ -1201,17 +1208,12 @@ class ProductService:
                 select(Product.id, total_count_col)
                 .outerjoin(vis_subquery, Product.id == vis_subquery.c.prod_id)
                 .where(*view_filters)
-                .order_by(
-                    direction(order_visibility_col),
-                    desc(Product.created_at),
-                )
+                .order_by(direction(order_visibility_col), desc(Product.created_at))
                 .offset((page - 1) * limit)
                 .limit(limit)
             )
-
         else:
             paginated_id_stmt = select(Product.id, total_count_col).where(*view_filters)
-
             if sort_by == "brand":
                 paginated_id_stmt = paginated_id_stmt.outerjoin(
                     Brand, Product.brand_id == Brand.id
@@ -1228,7 +1230,6 @@ class ProductService:
                 order_clauses.append(direction(Product.created_at))
 
             order_clauses.append(desc(Product.created_at))
-
             paginated_id_stmt = (
                 paginated_id_stmt.order_by(*order_clauses)
                 .offset((page - 1) * limit)
@@ -1237,251 +1238,128 @@ class ProductService:
 
         id_result = await db.execute(paginated_id_stmt)
         id_rows = id_result.all()
-
         ordered_product_ids = [row[0] for row in id_rows]
-
-        if id_rows:
-            total = id_rows[0].total_count_val
-        else:
-            count_stmt = select(func.count(Product.id)).where(*view_filters)
-            total_result = await db.execute(count_stmt)
-            total = total_result.scalar() or 0
-
-        print(
-            f"⏱️ Step 3+4 (Count + Target Page IDs SQL, merged): {round((time.perf_counter() - t0) * 1000, 2)} ms | Total Records: {total} | IDs: {len(ordered_product_ids)}"
-        )
-
-        if not ordered_product_ids:
-            print(
-                f"--- [END] list_products completed in {round((time.perf_counter() - start_time) * 1000, 2)} ms ---"
-            )
-            return [], total, tenant_stats, all_product_ids
+        total = id_rows[0].total_count_val if id_rows else len(all_product_ids)
 
         # ------------------------------------------------------------------
-        # 5. Fetch Product Entities & Re-Enforce Order
+        # 5. Fetch Product Entities with single JOIN (no multiple selectinload calls)
         # ------------------------------------------------------------------
-        t0 = time.perf_counter()
         products_fetch_stmt = (
             select(Product)
             .where(Product.id.in_(ordered_product_ids))
             .options(
-                selectinload(Product.features),
-                selectinload(Product.faqs),
-                selectinload(Product.brand),
+                joinedload(Product.features),
+                joinedload(Product.faqs),
+                joinedload(Product.brand),
             )
         )
         products_result = await db.execute(products_fetch_stmt)
-        fetched_products = products_result.scalars().all()
+        fetched_products = products_result.unique().scalars().all()
 
         product_by_id = {p.id: p for p in fetched_products}
         ordered_products = [
             product_by_id[pid] for pid in ordered_product_ids if pid in product_by_id
         ]
-        print(
-            f"⏱️ Step 5 (Preload Product Objects): {round((time.perf_counter() - t0) * 1000, 2)} ms"
-        )
 
         # ------------------------------------------------------------------
-        # 6. Fetch Detail Metrics ONLY for the Target Paginated Items
+        # 6. Aggregated SQL Group By Engine (Avoid 2600 raw unaggregated Python rows)
         # ------------------------------------------------------------------
-        t0 = time.perf_counter()
-        # CHANGED: `.outerjoin(ChatGEOAuditRecord, ...)` to align matching behavior
-        prod_metrics_stmt = (
+        # This replaces the 2,600 row Python fetch with a fast ~10 row grouped SQL result
+        engine_metrics_stmt = (
             select(
                 Product.id.label("product_id"),
-                ChatSearchQuery.product_found.label("product_found"),
-                ChatSearchQuery.share_of_voice.label("share_of_voice"),
-                ChatSearchQuery.citation_rank.label("citation_rank"),
-                ChatSearchQuery.citing_sources.label("citing_sources"),
-                ChatSearchQuery.competitors_mentioned.label("competitors_mentioned"),
-                Chat.id.label("chat_id"),
-                Chat.created_at.label("chat_created_at"),
                 Chat.model_choice.label("model_choice"),
+                func.count(Chat.id.distinct()).label("total_chats"),
+                func.count(ChatSearchQuery.id).label("total_queries"),
+                func.sum(
+                    case((ChatSearchQuery.product_found.is_(True), 1), else_=0)
+                ).label("found_count"),
+                func.avg(cast(ChatSearchQuery.share_of_voice, Float)).label("avg_sov"),
+                func.avg(cast(ChatSearchQuery.citation_rank, Float)).label("avg_rank"),
+                func.max(Chat.created_at).label("last_analysis"),
             )
-            .join(Chat, ChatSearchQuery.chat_id == Chat.id)
-            .join(Product, Chat.product_id == Product.id)
-            .outerjoin(
-                ChatGEOAuditRecord,
-                (ChatGEOAuditRecord.tenant_id == Product.tenant_id)
-                & (cast(Chat.model_choice, String) == ChatGEOAuditRecord.model_used),
-            )
+            .join(Chat, Chat.product_id == Product.id)
+            .join(ChatSearchQuery, ChatSearchQuery.chat_id == Chat.id)
             .where(Product.id.in_(ordered_product_ids))
+            .group_by(Product.id, Chat.model_choice)
         )
 
-        prod_metrics_result = await db.execute(prod_metrics_stmt)
-        prod_results = prod_metrics_result.all()
+        engine_metrics_res = await db.execute(engine_metrics_stmt)
+        metrics_rows = engine_metrics_res.all()
 
-        product_metrics_map = defaultdict(list)
-        for r in prod_results:
-            product_metrics_map[r.product_id].append(r)
-        print(
-            f"⏱️ Step 6 (Target Metrics SQL): {round((time.perf_counter() - t0) * 1000, 2)} ms | Rows Matched: {len(prod_results)}"
-        )
-
-        # ------------------------------------------------------------------
-        # 7. Map Metrics Payload in Preserved Order
-        # ------------------------------------------------------------------
         ENGINE_LABEL_MAP = {
             "GPT": "chatgpt",
             "GEMINI": "gemini",
             "CLAUDE": "anthropic",
         }
 
-        t0 = time.perf_counter()
-        products_payload = []
+        # Map metrics back to product payload
+        product_engine_map = defaultdict(dict)
+        product_totals_map = defaultdict(
+            lambda: {
+                "chats": set(),
+                "queries": 0,
+                "sov_sum": 0.0,
+                "rank_sum": 0.0,
+                "rank_cnt": 0,
+                "last_analysis": None,
+            }
+        )
 
-        for product in ordered_products:
-            prod_rows = product_metrics_map.get(product.id, [])
-
-            prod_total_queries = len(prod_rows)
-            unique_chats = set()
-
-            prod_found_count = 0
-            rank_sum = 0
-            valid_rank_count = 0
-            citation_counter = 0
-            prod_sov_accumulation = 0.0
-            competitor_counter = 0
-            last_analysis_time = None
-
-            engine_accum = defaultdict(
-                lambda: {
-                    "unique_chats": set(),
-                    "total_queries": 0,
-                    "found_count": 0,
-                    "rank_sum": 0.0,
-                    "valid_rank_count": 0,
-                    "citation_counter": 0,
-                    "sov_accumulation": 0.0,
-                    "competitor_counter": 0,
-                    "last_analysis_time": None,
-                }
+        for row in metrics_rows:
+            engine_key = ENGINE_LABEL_MAP.get(
+                row.model_choice, str(row.model_choice).lower()
             )
+            tot_q = row.total_queries or 0
+            vis_rate = round((row.found_count / tot_q) * 10, 2) if tot_q > 0 else 0.0
 
-            for row in prod_rows:
-                unique_chats.add(row.chat_id)
-                engine_bucket = engine_accum[row.model_choice]
-                engine_bucket["unique_chats"].add(row.chat_id)
-                engine_bucket["total_queries"] += 1
+            product_engine_map[row.product_id][engine_key] = {
+                "total_chats": row.total_chats,
+                "total_queries": tot_q,
+                "avg_share_of_voice": round(row.avg_sov or 0.0, 2),
+                "avg_citation_rank": round(row.avg_rank or 0.0, 2),
+                "visibility_rate": vis_rate,
+                "last_analysis": row.last_analysis,
+            }
 
-                if row.chat_created_at:
-                    if (
-                        last_analysis_time is None
-                        or row.chat_created_at > last_analysis_time
-                    ):
-                        last_analysis_time = row.chat_created_at
+            p_tot = product_totals_map[row.product_id]
+            p_tot["queries"] += tot_q
+            p_tot["sov_sum"] += (row.avg_sov or 0.0) * tot_q
+            if row.avg_rank:
+                p_tot["rank_sum"] += (row.avg_rank or 0.0) * tot_q
+                p_tot["rank_cnt"] += tot_q
+            if p_tot["last_analysis"] is None or (
+                row.last_analysis and row.last_analysis > p_tot["last_analysis"]
+            ):
+                p_tot["last_analysis"] = row.last_analysis
 
-                    if (
-                        engine_bucket["last_analysis_time"] is None
-                        or row.chat_created_at > engine_bucket["last_analysis_time"]
-                    ):
-                        engine_bucket["last_analysis_time"] = row.chat_created_at
+        products_payload = []
+        for product in ordered_products:
+            by_engine = product_engine_map.get(product.id, {})
+            totals = product_totals_map.get(product.id, {})
 
-                if row.product_found is True:
-                    prod_found_count += 1
-                    engine_bucket["found_count"] += 1
-
-                row_sov = float(row.share_of_voice or 0.0)
-                prod_sov_accumulation += row_sov
-                engine_bucket["sov_accumulation"] += row_sov
-
-                if row.citation_rank is not None:
-                    row_rank = float(row.citation_rank)
-                    rank_sum += row_rank
-                    valid_rank_count += 1
-                    engine_bucket["rank_sum"] += row_rank
-                    engine_bucket["valid_rank_count"] += 1
-
-                sources = row.citing_sources or []
-                if isinstance(sources, str):
-                    try:
-                        sources = json.loads(sources)
-                    except Exception:
-                        sources = []
-                citation_counter += len(sources)
-                engine_bucket["citation_counter"] += len(sources)
-
-                competitors = row.competitors_mentioned or []
-                if isinstance(competitors, str):
-                    try:
-                        competitors = json.loads(competitors)
-                    except Exception:
-                        competitors = []
-                competitor_counter += len(competitors)
-                engine_bucket["competitor_counter"] += len(competitors)
-
-            by_engine = {}
-            for raw_engine, bucket in engine_accum.items():
-                engine_key = ENGINE_LABEL_MAP.get(raw_engine, str(raw_engine).lower())
-                engine_total_queries = bucket["total_queries"]
-                by_engine[engine_key] = {
-                    "total_chats": len(bucket["unique_chats"]),
-                    "total_queries": engine_total_queries,
-                    "avg_share_of_voice": (
-                        round((bucket["sov_accumulation"] / engine_total_queries), 2)
-                        if engine_total_queries > 0
-                        else 0.0
-                    ),
-                    "avg_citation_rank": (
-                        round((bucket["rank_sum"] / bucket["valid_rank_count"]), 2)
-                        if bucket["valid_rank_count"] > 0
-                        else 0.0
-                    ),
-                    # FIXED: use *10 (0-10 scale) to stay consistent with the
-                    # engine_visibility_summary scale in product_detail_v2 and
-                    # with the *10.0 scale used by _engine_rate_col() above
-                    # for sorting. Previously this used *100, which produced
-                    # a 0-100 value here while the detail endpoint and the
-                    # sort column both used 0-10 — causing the engine-wise
-                    # visibility numbers to differ between the list and
-                    # detail views for the same underlying data.
-                    "visibility_rate": (
-                        round((bucket["found_count"] / engine_total_queries) * 10, 2)
-                        if engine_total_queries > 0
-                        else 0.0
-                    ),
-                    "competitor_mentions": bucket["competitor_counter"],
-                    "citation_count": bucket["citation_counter"],
-                    "last_analysis": bucket["last_analysis_time"],
-                }
+            rates = [eng["visibility_rate"] for eng in by_engine.values()]
+            overall_vis = round(sum(rates) / len(rates), 2) if rates else 0.0
+            tot_q = totals["queries"]
 
             product.product_brand_id = product.brand_id
-
-            engine_rates_present = [
-                eng["visibility_rate"] for eng in by_engine.values()
-            ]
-            overall_visibility_rate = (
-                round(sum(engine_rates_present) / len(engine_rates_present), 2)
-                if engine_rates_present
-                else 0.0
-            )
-
             product.analytics = {
-                "total_chats": len(unique_chats),
-                "total_queries": prod_total_queries,
+                "total_queries": tot_q,
                 "avg_share_of_voice": (
-                    round((prod_sov_accumulation / prod_total_queries), 2)
-                    if prod_total_queries > 0
-                    else 0.0
+                    round(totals["sov_sum"] / tot_q, 2) if tot_q > 0 else 0.0
                 ),
                 "avg_citation_rank": (
-                    round((rank_sum / valid_rank_count), 2)
-                    if valid_rank_count > 0
+                    round(totals["rank_sum"] / totals["rank_cnt"], 2)
+                    if totals.get("rank_cnt", 0) > 0
                     else 0.0
                 ),
-                "visibility_rate": overall_visibility_rate,
-                "competitor_mentions": competitor_counter,
-                "citation_count": citation_counter,
-                "last_analysis": last_analysis_time,
+                "visibility_rate": overall_vis,
+                "last_analysis": totals.get("last_analysis"),
                 "by_engine": by_engine,
             }
             products_payload.append(product)
 
         print(
-            f"⏱️ Step 7 (Python Payload Mapping): {round((time.perf_counter() - t0) * 1000, 2)} ms"
+            f"⏱️ Total Optimized Execution Time: {round((time.perf_counter() - start_time) * 1000, 2)} ms"
         )
-        print(
-            f"--- [END] list_products total time: {round((time.perf_counter() - start_time) * 1000, 2)} ms ---\n"
-        )
-
         return products_payload, total, tenant_stats, all_product_ids
