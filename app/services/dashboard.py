@@ -142,10 +142,11 @@ class TenantDashboardService:
                     "avg_rank": 0.0,
                     "share_of_voice": 0.0,
                     "total_citations": 0,
+                    "unique_competitors": 0,
                     "engine_breakdown": {
-                        "google": 0,
-                        "openai": 0,
-                        "anthropic": 0,
+                        "google": 0.0,
+                        "openai": 0.0,
+                        "anthropic": 0.0,
                     },
                     "citation_categories": {
                         "Blogs": 0,
@@ -153,6 +154,13 @@ class TenantDashboardService:
                         "News": 0,
                         "Marketplaces": 0,
                         "Forums": 0,
+                    },
+                    "citation_percentages": {
+                        "Blogs": 0.0,
+                        "Review Sites": 0.0,
+                        "News": 0.0,
+                        "Marketplaces": 0.0,
+                        "Forums": 0.0,
                     },
                     "competitor_share": defaultdict(int),
                 }
@@ -166,11 +174,11 @@ class TenantDashboardService:
                 "Forums": 0,
             }
             competitor_mention_map = defaultdict(int)
+            unique_sources_set = set()
 
             found_count = 0
             rank_sum = 0
             valid_rank_count = 0
-            citation_counter = 0
             sov_accumulation = 0.0
 
             for q_row, chat_row, product_row, geo_row in period_data_rows:
@@ -183,70 +191,88 @@ class TenantDashboardService:
                     rank_sum += float(q_row.citation_rank)
                     valid_rank_count += 1
 
+                # Safe platform_breakdown parsing
                 breakdown = q_row.platform_breakdown or {}
                 if isinstance(breakdown, str):
                     try:
-                        breakdown = json.loads(breakdown)
+                        breakdown = json.loads(breakdown) or {}
                     except Exception:
                         breakdown = {}
 
-                for engine, hit_count in breakdown.items():
-                    engine_score_lists[engine.lower()].append(float(hit_count))
+                if isinstance(breakdown, dict):
+                    for engine, hit_count in breakdown.items():
+                        if engine and hit_count is not None:
+                            engine_score_lists[engine.lower()].append(float(hit_count))
 
+                # Safe citing_sources parsing (Tracking UNIQUE URLs)
                 sources = q_row.citing_sources or []
                 if isinstance(sources, str):
                     try:
-                        sources = json.loads(sources)
+                        sources = json.loads(sources) or []
                     except Exception:
                         sources = []
 
-                for url in sources:
-                    citation_counter += 1
-                    url_lower = url.lower()
-                    if "blog" in url_lower or "wp-" in url_lower:
-                        citation_distribution["Blogs"] += 1
-                    elif any(
-                        w in url_lower
-                        for w in [
-                            "review",
-                            "guru",
-                            "advisor",
-                            "trustpilot",
-                            "runrepeat",
-                        ]
-                    ):
-                        citation_distribution["Review Sites"] += 1
-                    elif any(
-                        w in url_lower
-                        for w in ["news", "times", "post", "magazine", "runnersworld"]
-                    ):
-                        citation_distribution["News"] += 1
-                    elif any(
-                        w in url_lower
-                        for w in [
-                            "amazon",
-                            "shop",
-                            "dickssportinggoods",
-                            "ebay",
-                            "marketplace",
-                            "fleetfeet",
-                        ]
-                    ):
-                        citation_distribution["Marketplaces"] += 1
-                    else:
-                        citation_distribution["Forums"] += 1
+                if isinstance(sources, list):
+                    for url in sources:
+                        if not url or not isinstance(url, str):
+                            continue
 
+                        # Process each URL only if it hasn't been seen in this period yet
+                        if url not in unique_sources_set:
+                            unique_sources_set.add(url)
+                            url_lower = url.lower()
+                            if "blog" in url_lower or "wp-" in url_lower:
+                                citation_distribution["Blogs"] += 1
+                            elif any(
+                                w in url_lower
+                                for w in [
+                                    "review",
+                                    "guru",
+                                    "advisor",
+                                    "trustpilot",
+                                    "runrepeat",
+                                ]
+                            ):
+                                citation_distribution["Review Sites"] += 1
+                            elif any(
+                                w in url_lower
+                                for w in [
+                                    "news",
+                                    "times",
+                                    "post",
+                                    "magazine",
+                                    "runnersworld",
+                                ]
+                            ):
+                                citation_distribution["News"] += 1
+                            elif any(
+                                w in url_lower
+                                for w in [
+                                    "amazon",
+                                    "shop",
+                                    "dickssportinggoods",
+                                    "ebay",
+                                    "marketplace",
+                                    "fleetfeet",
+                                ]
+                            ):
+                                citation_distribution["Marketplaces"] += 1
+                            else:
+                                citation_distribution["Forums"] += 1
+
+                # Safe competitors_mentioned parsing
                 competitors = q_row.competitors_mentioned or []
                 if isinstance(competitors, str):
                     try:
-                        competitors = json.loads(competitors)
+                        competitors = json.loads(competitors) or []
                     except Exception:
                         competitors = []
 
-                for comp_name in competitors:
-                    competitor_mention_map[comp_name] += 1
+                if isinstance(competitors, list):
+                    for comp_name in competitors:
+                        if comp_name:
+                            competitor_mention_map[comp_name] += 1
 
-            # FIX: Removed the '* 100' multiplier since the value is already scaled to a percentage point scale
             avg_sov_percentage = (
                 (sov_accumulation / total_queries) if total_queries > 0 else 0.0
             )
@@ -256,22 +282,24 @@ class TenantDashboardService:
                 for eng, scores in engine_score_lists.items()
             }
 
+            total_unique_citations = len(unique_sources_set)
+
             return {
                 "visibility_score": round(avg_sov_percentage, 1),
                 "mention_rate": round((found_count / total_queries) * 10, 1),
-                # "mention_rate": round((found_count / total_queries) * 100, 1),
                 "avg_rank": (
                     round(rank_sum / valid_rank_count, 1)
                     if valid_rank_count > 0
                     else 0.0
                 ),
                 "share_of_voice": round(avg_sov_percentage, 1),
-                "total_citations": citation_counter,
+                "total_citations": total_unique_citations,
+                "unique_competitors": len(competitor_mention_map),
                 "engine_breakdown": engine_averages,
                 "citation_percentages": {
                     k: (
-                        round((v / citation_counter) * 100, 1)
-                        if citation_counter > 0
+                        round((v / total_unique_citations) * 100, 1)
+                        if total_unique_citations > 0
                         else 0.0
                     )
                     for k, v in citation_distribution.items()
@@ -312,7 +340,6 @@ class TenantDashboardService:
             date_key = (
                 q_row.created_at.strftime("%b %d") if q_row.created_at else "Active"
             )
-            # FIX: Removed the '* 100' multiplier here as well to maintain uniformity
             daily_timeline_map[date_key].append(float(q_row.share_of_voice or 0.0))
 
         visibility_trend_chart = (
@@ -398,13 +425,13 @@ class TenantDashboardService:
                     ),
                 },
                 {
-                    "label": "Share of Voice",
-                    "value": current_metrics["share_of_voice"],
-                    "suffix": "%",
-                    "format": "percentage",
+                    "label": "Competitors Mentioned",
+                    "value": current_metrics["unique_competitors"],
+                    "suffix": "",
+                    "format": "number",
                     **calculate_trend_delta(
-                        current_metrics["share_of_voice"],
-                        prev_metrics["share_of_voice"],
+                        current_metrics["unique_competitors"],
+                        prev_metrics["unique_competitors"],
                     ),
                 },
                 {
@@ -440,23 +467,20 @@ class TenantDashboardService:
                 "visibilityByAIEngine": [
                     {
                         "name": "Gemini (Google)",
-                        "score": current_metrics["engine_breakdown"].get("google", 0.0),
+                        "score": current_metrics["engine_breakdown"].get("google")
+                        or 0.0,
                         "color": "#3b82f6",
                     },
                     {
                         "name": "ChatGPT (OpenAI)",
-                        "score": (
-                            current_metrics["engine_breakdown"].get("google", 0.0)
-                            if current_metrics["engine_breakdown"].get("openai") is None
-                            else current_metrics["engine_breakdown"].get("openai", 0.0)
-                        ),
+                        "score": current_metrics["engine_breakdown"].get("openai")
+                        or 0.0,
                         "color": "#10b981",
                     },
                     {
                         "name": "Claude (Anthropic)",
-                        "score": current_metrics["engine_breakdown"].get(
-                            "anthropic", 0.0
-                        ),
+                        "score": current_metrics["engine_breakdown"].get("anthropic")
+                        or 0.0,
                         "color": "#f59e0b",
                     },
                 ],
