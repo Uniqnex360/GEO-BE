@@ -1025,6 +1025,31 @@ class ProductService:
 
             response_payload["tabData"] = {"actions": ui_actions[:8]}
 
+        elif tab == "tips":
+            chat_list = []
+            for chat in all_chats:
+
+
+
+                chat_list.append(
+                    {
+                        "chat_id": chat.id,
+                        "tenant_id": getattr(chat, "tenant_id", None),
+                        "product_id": getattr(chat, "product_id", None),
+                        "model_choice": str(chat.model_choice),
+                        "created_at": chat.created_at,
+                        "updated_at": getattr(chat, "updated_at", None),
+                        "final_optimization_report": getattr(
+                            chat, "final_optimization_report", ""
+                        ),
+                    }
+                )
+
+            response_payload["tabData"] = {
+                "total_chats": len(chat_list),
+                "chats": chat_list,
+            }
+
         return response_payload
 
     @staticmethod
