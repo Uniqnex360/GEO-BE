@@ -96,6 +96,7 @@ class ChatSearchQuery(BaseModel):
         String, nullable=True, default=None
     )
     query_optimization_tips: Mapped[str] = mapped_column(String, nullable=False)
+    solution: Mapped[str] = mapped_column(String, nullable=True)
 
     # Inverse relation mapping
     chat: Mapped["Chat"] = relationship("Chat", back_populates="search_queries")

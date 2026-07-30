@@ -974,7 +974,6 @@ class ProductService:
         elif tab == "recommendations":
             ui_actions = []
             for q in all_queries:
-                print("q", q)
                 if q.query_optimization_tips and q.query_optimization_tips.strip():
                     parent_chat = getattr(q, "_parent_chat", None)
                     model_choice = parent_chat.model_choice if parent_chat else ""
@@ -1002,6 +1001,7 @@ class ProductService:
                             ),
                             "query_optimization_tag": q.query_optimization_tag,
                             "title": q.query_optimization_tips.strip(),
+                            "solution": q.solution,
                             "model": model_choice,
                             # "competitors": chat_competitors,
                             "impact": (
