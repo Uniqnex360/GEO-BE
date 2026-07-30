@@ -974,7 +974,6 @@ class ProductService:
         elif tab == "recommendations":
             ui_actions = []
             for q in all_queries:
-                print("q", q)
                 if q.query_optimization_tips and q.query_optimization_tips.strip():
                     parent_chat = getattr(q, "_parent_chat", None)
                     model_choice = parent_chat.model_choice if parent_chat else ""
@@ -1002,6 +1001,7 @@ class ProductService:
                             ),
                             "query_optimization_tag": q.query_optimization_tag,
                             "title": q.query_optimization_tips.strip(),
+                            "solution": q.solution,
                             "model": model_choice,
                             # "competitors": chat_competitors,
                             "impact": (
@@ -1024,6 +1024,31 @@ class ProductService:
                 )
 
             response_payload["tabData"] = {"actions": ui_actions[:8]}
+
+        elif tab == "tips":
+            chat_list = []
+            for chat in all_chats:
+
+
+
+                chat_list.append(
+                    {
+                        "chat_id": chat.id,
+                        "tenant_id": getattr(chat, "tenant_id", None),
+                        "product_id": getattr(chat, "product_id", None),
+                        "model_choice": str(chat.model_choice),
+                        "created_at": chat.created_at,
+                        "updated_at": getattr(chat, "updated_at", None),
+                        "final_optimization_report": getattr(
+                            chat, "final_optimization_report", ""
+                        ),
+                    }
+                )
+
+            response_payload["tabData"] = {
+                "total_chats": len(chat_list),
+                "chats": chat_list,
+            }
 
         return response_payload
 

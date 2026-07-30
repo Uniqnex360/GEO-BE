@@ -230,19 +230,21 @@ class ChatQueryBase(BaseModel):
     )
 
     # UPDATED description: now demands finished, pasteable content + exact placement,
-    # not a directive to "add" or "highlight" something.
+
     optimization_tips_for_better_result: str = Field(
         description=(
-            "Query-specific optimization tip. Format: '<WHERE (field/section/position)>: <WHAT TO DO> -> "
-            '"<exact copy-pasteable text>"\'. Never stop at naming the fix - always supply the literal finished '
-            "content. "
-            "If the product's price or positioning looks out of line with what buyers for this query typically "
-            "expect (for example, a $200 pen), name the specific cheaper competitor product from "
-            "competitor_products/competitors_mentioned and write the exact comparison line to use, e.g. "
-            "'Description, closing paragraph: add a value comparison -> \"For a lower-cost option, see the "
-            "<Competitor> <Product> at <price>.\"' "
-            "BAD (never do this): 'Highlight that it ships to Ireland.' / 'Add local testimonials.' - these name "
-            "the fix but give nothing the reader can paste in."
+            "Strategic SEO suggestion explaining WHERE and WHAT to optimize. "
+            "Identifies the target field/section and the high-level fix required "
+            "(e.g., adjusting price positioning, adding local relevance, or tweaking title structure). "
+            "BAD: Do not supply the finished copy here—keep this focused purely on the strategy/location."
+        )
+    )
+
+    copy_pasteable_solution: str = Field(
+        description=(
+            "The exact, finished, copy-pasteable text or example title implementing the suggestion. "
+            "Never stop at naming the fix—always supply the literal text ready for deployment. "
+            "Example: 'For a lower-cost option, see the Pilot G2 at $2.50.' or 'Premium Fountain Pen - Smooth Writing Ergonomic Executive Pen'."
         )
     )
 
@@ -563,6 +565,7 @@ def _build_search_query_records(
             ],
             query_optimization_tag=query.optimization_tag,
             query_optimization_tips=query.optimization_tips_for_better_result,
+            solution=query.copy_pasteable_solution,
         )
         for query in queries
     ]
