@@ -1090,20 +1090,16 @@ class ProductService:
         tenant_sov_accumulation = stats_row.total_sov if stats_row else 0.0
         tenant_found_count = stats_row.total_found if stats_row else 0
 
-        avg_visibility_score = (
-            (tenant_sov_accumulation / tenant_total_queries)
-            if tenant_total_queries and tenant_total_queries > 0
-            else 0.0
-        )
         avg_mention_rate = (
             round((tenant_found_count / tenant_total_queries) * 10, 1)
             if tenant_total_queries and tenant_total_queries > 0
             else 0.0
         )
 
+        # Placeholder - will be recalculated after product payload processing
         tenant_stats = {
             "total_products": total_tenant_products,
-            "avg_visibility_score": round(avg_visibility_score, 1),
+            "avg_visibility_score": 0.0,
             "avg_mention_rate": round(avg_mention_rate, 1),
             "brands_tracked": total_tenant_brands,
         }
@@ -1189,14 +1185,8 @@ class ProductService:
                     + func.coalesce(engine_rate_cols[1], 0.0)
                     + func.coalesce(engine_rate_cols[2], 0.0)
                 )
-                count_rates_expr = (
-                    case((engine_rate_cols[0].isnot(None), 1), else_=0)
-                    + case((engine_rate_cols[1].isnot(None), 1), else_=0)
-                    + case((engine_rate_cols[2].isnot(None), 1), else_=0)
-                )
-                order_visibility_col = func.coalesce(
-                    sum_rates_expr / func.nullif(count_rates_expr, 0), 0.0
-                )
+                # Strictly divide by 3 to match the overall visibility logic
+                order_visibility_col = sum_rates_expr / 3.0
             else:
                 target_engine = VISIBILITY_SORT_KEYS[sort_by]
                 col_map = {
@@ -1244,7 +1234,7 @@ class ProductService:
         total = id_rows[0].total_count_val if id_rows else len(all_product_ids)
 
         # ------------------------------------------------------------------
-        # 5. Fetch Product Entities with single JOIN (no multiple selectinload calls)
+        # 5. Fetch Product Entities with single JOIN
         # ------------------------------------------------------------------
         products_fetch_stmt = (
             select(Product)
@@ -1264,9 +1254,8 @@ class ProductService:
         ]
 
         # ------------------------------------------------------------------
-        # 6. Aggregated SQL Group By Engine (Avoid 2600 raw unaggregated Python rows)
+        # 6. Aggregated SQL Group By Engine
         # ------------------------------------------------------------------
-        # This replaces the 2,600 row Python fetch with a fast ~10 row grouped SQL result
         engine_metrics_stmt = (
             select(
                 Product.id.label("product_id"),
@@ -1336,12 +1325,17 @@ class ProductService:
                 p_tot["last_analysis"] = row.last_analysis
 
         products_payload = []
+        all_vis_scores = []
+
         for product in ordered_products:
             by_engine = product_engine_map.get(product.id, {})
             totals = product_totals_map.get(product.id, {})
 
+            # Sum available engine scores and divide strictly by 3
             rates = [eng["visibility_rate"] for eng in by_engine.values()]
-            overall_vis = round(sum(rates) / len(rates), 2) if rates else 0.0
+            overall_vis = round(sum(rates) / 3.0, 2)
+            all_vis_scores.append(overall_vis)
+
             tot_q = totals["queries"]
 
             product.product_brand_id = product.brand_id
@@ -1360,6 +1354,12 @@ class ProductService:
                 "by_engine": by_engine,
             }
             products_payload.append(product)
+
+        # Sync top card average visibility score with the product visibility averages
+        if all_vis_scores:
+            tenant_stats["avg_visibility_score"] = round(
+                sum(all_vis_scores) / len(all_vis_scores), 1
+            )
 
         print(
             f"⏱️ Total Optimized Execution Time: {round((time.perf_counter() - start_time) * 1000, 2)} ms"
