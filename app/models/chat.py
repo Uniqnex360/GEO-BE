@@ -89,7 +89,12 @@ class ChatSearchQuery(BaseModel):
     competitors_mentioned: Mapped[List[str]] = mapped_column(
         JSONB, nullable=False, default=list
     )
-    query_optimization_tag: Mapped[str] = mapped_column(String, nullable=True, default=None)
+    competitor_products: Mapped[List[Dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    query_optimization_tag: Mapped[str] = mapped_column(
+        String, nullable=True, default=None
+    )
     query_optimization_tips: Mapped[str] = mapped_column(String, nullable=False)
 
     # Inverse relation mapping
