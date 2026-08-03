@@ -7,6 +7,8 @@ from sqlalchemy import (
     distinct,
     Numeric,
     cast,
+    Integer,
+    String,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,95 +33,70 @@ class CompetitorService:
 
         filters = []
 
-        if not is_super_admin:
-            filters.append(Chat.tenant_id == tenant_id)
+        # ----------------------------------------------------------
+        # Fix: Ensure tenant_id is explicitly an integer parameter
+        # or safely casted to match DB schema types.
+        # ----------------------------------------------------------
+        if tenant_id is not None:
+            try:
+                clean_tenant_id = int(tenant_id)
+            except (ValueError, TypeError):
+                clean_tenant_id = tenant_id
 
-            if hasattr(Chat, "is_deleted"):
-                filters.append(Chat.is_deleted == False)
+            if not is_super_admin or tenant_id:
+                # If product.tenant_id in DB is INTEGER:
+                filters.append(Product.tenant_id == clean_tenant_id)
 
+                if hasattr(Chat, "tenant_id"):
+                    filters.append(Chat.tenant_id == clean_tenant_id)
+
+        # Soft delete checks
+        if hasattr(Chat, "is_deleted"):
+            filters.append(Chat.is_deleted == False)
+        if hasattr(Product, "is_deleted"):
+            filters.append(Product.is_deleted == False)
+
+        # Optional search query filter
         if search:
             filters.append(Chat.product_name.ilike(f"%{search}%"))
 
-        ##########################################################
-        # Shared base query
-        ##########################################################
-
-        base_query = (
-            select(
-                Chat.id,
-                Chat.product_name,
-                Brand.name.label("brand_name"),
-                ChatSearchQuery.share_of_voice,
-                ChatSearchQuery.citation_rank,
-                ChatSearchQuery.total_websites_found,
-                Chat.created_at,
-            )
-            .join(
-                ChatSearchQuery,
-                Chat.id == ChatSearchQuery.chat_id,
-            )
-            .join(
-                Product,
-                Product.id == Chat.product_id,
-            )
-            .join(
-                Brand,
-                Brand.id == Product.brand_id,
-            )
-            .where(and_(*filters))
-        )
-
-        ##########################################################
-        # Summary metrics
-        ##########################################################
-
+        # ----------------------------------------------------------
+        # 1. Summary metrics
+        # ----------------------------------------------------------
         summary_query = (
             select(
                 func.avg(ChatSearchQuery.share_of_voice).label("overall_sov"),
                 func.sum(
                     case(
-                        (
-                            ChatSearchQuery.citation_rank <= 3,
-                            1,
-                        ),
+                        (ChatSearchQuery.citation_rank <= 3, 1),
                         else_=0,
                     )
                 ).label("wins"),
                 func.sum(
                     case(
-                        (
-                            ChatSearchQuery.citation_rank > 3,
-                            1,
-                        ),
+                        (ChatSearchQuery.citation_rank > 3, 1),
                         else_=0,
                     )
                 ).label("losses"),
                 func.sum(
                     case(
-                        (
-                            ChatSearchQuery.share_of_voice < 20,
-                            1,
-                        ),
+                        (ChatSearchQuery.share_of_voice < 20, 1),
                         else_=0,
                     )
                 ).label("gap_queries"),
             )
             .select_from(ChatSearchQuery)
-            .join(
-                Chat,
-                Chat.id == ChatSearchQuery.chat_id,
-            )
+            .join(Chat, Chat.id == ChatSearchQuery.chat_id)
+            .join(Product, Product.id == Chat.product_id)
             .where(and_(*filters))
         )
 
         summary_result = await db.execute(summary_query)
+        summary = summary_result.mappings().first() or {}
 
-        summary = summary_result.mappings().first()
-
-        ##########################################################
-        # Brand SOV Bar Chart
-        ##########################################################
-
+        # ----------------------------------------------------------
+        # 2. Brand SOV Bar Chart
+        # ----------------------------------------------------------
         brand_bar_query = (
             select(
                 Brand.name.label("brand"),
@@ -128,37 +105,26 @@ class CompetitorService:
                 ).label("sov"),
             )
             .select_from(ChatSearchQuery)
-            .join(
-                Chat,
-                Chat.id == ChatSearchQuery.chat_id,
-            )
-            .join(
-                Product,
-                Product.id == Chat.product_id,
-            )
-            .join(
-                Brand,
-                Brand.id == Product.brand_id,
-            )
+            .join(Chat, Chat.id == ChatSearchQuery.chat_id)
+            .join(Product, Product.id == Chat.product_id)
+            .join(Brand, Brand.id == Product.brand_id)
             .where(and_(*filters))
             .group_by(Brand.name)
             .order_by(func.avg(ChatSearchQuery.share_of_voice).desc())
         )
 
         brand_bar_result = await db.execute(brand_bar_query)
-
         brand_bar_chart = [
             {
                 "brand": r.brand,
                 "share_of_voice": float(r.sov or 0),
             }
-            for r in brand_bar_result
+            for r in brand_bar_result.all()
         ]
 
-        ##########################################################
-        # Visibility Trend
-        ##########################################################
-
+        # ----------------------------------------------------------
+        # 3. Visibility Trend
+        # ----------------------------------------------------------
         month_expr = func.date_trunc("month", Chat.created_at)
 
         trend_query = (
@@ -170,31 +136,19 @@ class CompetitorService:
                 ).label("visibility"),
             )
             .select_from(ChatSearchQuery)
-            .join(
-                Chat,
-                Chat.id == ChatSearchQuery.chat_id,
-            )
-            .join(
-                Product,
-                Product.id == Chat.product_id,
-            )
-            .join(
-                Brand,
-                Brand.id == Product.brand_id,
-            )
+            .join(Chat, Chat.id == ChatSearchQuery.chat_id)
+            .join(Product, Product.id == Chat.product_id)
+            .join(Brand, Brand.id == Product.brand_id)
             .where(and_(*filters))
             .group_by(Brand.name, month_expr)
             .order_by(Brand.name, month_expr)
         )
 
         trend_result = await db.execute(trend_query)
-
         visibility_trend = {}
 
-        for row in trend_result:
-
+        for row in trend_result.all():
             visibility_trend.setdefault(row.brand, [])
-
             visibility_trend[row.brand].append(
                 {
                     "month": row.month,
@@ -202,10 +156,9 @@ class CompetitorService:
                 }
             )
 
-        ##########################################################
-        # Competitor Leaderboard
-        ##########################################################
-
+        # ----------------------------------------------------------
+        # 4. Competitor Leaderboard
+        # ----------------------------------------------------------
         leaderboard_query = (
             select(
                 Brand.name.label("brand"),
@@ -217,19 +170,13 @@ class CompetitorService:
                 ).label("avg_position"),
                 func.sum(
                     case(
-                        (
-                            ChatSearchQuery.citation_rank <= 3,
-                            1,
-                        ),
+                        (ChatSearchQuery.citation_rank <= 3, 1),
                         else_=0,
                     )
                 ).label("wins"),
                 func.sum(
                     case(
-                        (
-                            ChatSearchQuery.citation_rank > 3,
-                            1,
-                        ),
+                        (ChatSearchQuery.citation_rank > 3, 1),
                         else_=0,
                     )
                 ).label("losses"),
@@ -237,18 +184,9 @@ class CompetitorService:
                 func.sum(ChatSearchQuery.total_websites_found).label("citations"),
             )
             .select_from(ChatSearchQuery)
-            .join(
-                Chat,
-                Chat.id == ChatSearchQuery.chat_id,
-            )
-            .join(
-                Product,
-                Product.id == Chat.product_id,
-            )
-            .join(
-                Brand,
-                Brand.id == Product.brand_id,
-            )
+            .join(Chat, Chat.id == ChatSearchQuery.chat_id)
+            .join(Product, Product.id == Chat.product_id)
+            .join(Brand, Brand.id == Product.brand_id)
             .where(and_(*filters))
             .group_by(Brand.name)
             .order_by(func.avg(ChatSearchQuery.share_of_voice).desc())
@@ -257,38 +195,33 @@ class CompetitorService:
         )
 
         leaderboard_result = await db.execute(leaderboard_query)
+        leaderboard = [
+            {
+                "brand_name": row.brand,
+                "sov_visibility": float(row.sov or 0),
+                "avg_position": float(row.avg_position or 0),
+                "wins": row.wins or 0,
+                "losses": row.losses or 0,
+                "products": row.products or 0,
+                "citations": row.citations or 0,
+            }
+            for row in leaderboard_result.all()
+        ]
 
-        leaderboard = []
-
-        for row in leaderboard_result:
-
-            leaderboard.append(
-                {
-                    "brand_name": row.brand,
-                    "sov_visibility": float(row.sov or 0),
-                    "avg_position": float(row.avg_position or 0),
-                    "wins": row.wins or 0,
-                    "losses": row.losses or 0,
-                    "products": row.products or 0,
-                    "citations": row.citations or 0,
-                }
-            )
-
-        ##########################################################
-        # Final API response
-        ##########################################################
-
+        # ----------------------------------------------------------
+        # 5. Final Output Schema
+        # ----------------------------------------------------------
         return {
             "summary": {
                 "share_of_voice": float(
                     round(
-                        summary.overall_sov or 0,
+                        summary.get("overall_sov") or 0,
                         2,
                     )
                 ),
-                "query_wins": summary.wins or 0,
-                "query_losses": summary.losses or 0,
-                "gap_queries": summary.gap_queries or 0,
+                "query_wins": summary.get("wins") or 0,
+                "query_losses": summary.get("losses") or 0,
+                "gap_queries": summary.get("gap_queries") or 0,
             },
             "brand_sov_bar_chart": brand_bar_chart,
             "visibility_trend": visibility_trend,
