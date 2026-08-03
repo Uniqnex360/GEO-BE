@@ -530,6 +530,7 @@ async def _create_new_product(
         tenant_id=tenant_id,
         brand_id=brand_record.id,
         name=product_name,
+        product_url=payload.product_url,
         brand_name=brand_name,
         model_choice=LLMModels.GPT,
         sku=payload.sku,
