@@ -245,21 +245,24 @@ class ChatQueryBase(BaseModel):
     )
 
     # UPDATED description: now demands finished, pasteable content + exact placement,
-
     optimization_tips_for_better_result: str = Field(
         description=(
             "Strategic GEO suggestion explaining WHERE and WHAT to optimize. "
             "Identifies the target field/section and the high-level fix required "
-            "(e.g., adjusting price positioning, adding local relevance, or tweaking title structure). "
+            "(e.g., adjusting price positioning, adding local relevance, tweaking title structure, "
+            "or recommending a new FAQ section if none exists on the product page). "
             "BAD: Do not supply the finished copy here—keep this focused purely on the strategy/location."
         )
     )
 
     copy_pasteable_solution: str = Field(
         description=(
-            "The exact, finished, copy-pasteable text or example title implementing the suggestion. "
+            "The exact, finished, copy-pasteable text, example title, or full FAQ section implementing the suggestion. "
             "Never stop at naming the fix—always supply the literal text ready for deployment. "
-            "Example: 'For a lower-cost option, see the Pilot G2 at $2.50.' or 'Premium Fountain Pen - Smooth Writing Ergonomic Executive Pen'."
+            "IF THE PRODUCT PAGE LACKS AN FAQ SECTION: Create and supply a complete, production-ready Q&A block here "
+            "addressing common consumer query gaps. "
+            "Examples: 'For a lower-cost option, see the Pilot G2 at $2.50.' or "
+            "'Q: Is this pen refillable? A: Yes, it accepts standard G2 gel refills.'"
         )
     )
 
@@ -530,6 +533,7 @@ async def _create_new_product(
         tenant_id=tenant_id,
         brand_id=brand_record.id,
         name=product_name,
+        product_url=payload.product_url,
         brand_name=brand_name,
         model_choice=LLMModels.GPT,
         sku=payload.sku,
@@ -663,12 +667,7 @@ def _build_audit_record(
 
 
 def _resolve_identifier(payload: GEOAuditRequest) -> str:
-    return (
-        payload.product_name
-        or payload.sku
-        or payload.product_url
-        or ""
-    )
+    return payload.product_name or payload.sku or payload.product_url or ""
 
 
 # ======================================================================
@@ -748,7 +747,9 @@ async def run_geo_audit_stream(
 
                 search_keyword = f"{identifier} competitors buy online"
 
-                structured = await _run_single_model_audit(model_name, user_prompt, search_keyword)
+                structured = await _run_single_model_audit(
+                    model_name, user_prompt, search_keyword
+                )
 
                 if structured:
                     structured.model_used = model_name

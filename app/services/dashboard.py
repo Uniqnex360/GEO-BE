@@ -2,7 +2,7 @@ import json
 import statistics
 
 from typing import Dict, Any
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from collections import defaultdict
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,9 +27,7 @@ class TenantDashboardService:
         user: dict,
     ) -> Dict[str, Any]:
         """
-        Calculates and returns the overall dashboard metrics for a specific tenant.
-        Explicitly joins and aggregates data from 4 tables:
-        Product, Chat, ChatSearchQuery, and GeoAudit.
+        Calculates and returns ALL TIME dashboard metrics for a specific tenant.
         """
         is_super_admin = user.get("is_super_admin", False)
 
@@ -103,13 +101,10 @@ class TenantDashboardService:
         total_successful_audits = set()
 
         # ------------------------------------------------------------------
-        # 2. Time Horizon Segmentation
+        # 2. All Time Data Collection (No Date Filtering/Segmentation)
         # ------------------------------------------------------------------
-        now = datetime.now(timezone.utc)
-        midpoint_date = now - timedelta(days=15)
-
         current_period_rows = []
-        previous_period_rows = []
+        previous_period_rows = []  # Remains empty for All-Time mode
 
         for q_row, chat_row, product_row, geo_row in rows:
             unique_product_ids.add(product_row.id)
@@ -120,15 +115,8 @@ class TenantDashboardService:
             else:
                 unique_countries.add("US")
 
-            q_date = (
-                q_row.created_at.replace(tzinfo=timezone.utc)
-                if q_row.created_at
-                else now
-            )
-            if q_date >= midpoint_date:
-                current_period_rows.append((q_row, chat_row, product_row, geo_row))
-            else:
-                previous_period_rows.append((q_row, chat_row, product_row, geo_row))
+            # Push all rows directly into current period for All-Time calculation
+            current_period_rows.append((q_row, chat_row, product_row, geo_row))
 
         # ------------------------------------------------------------------
         # 3. DRY Metric Aggregator Engine
@@ -217,7 +205,6 @@ class TenantDashboardService:
                         if not url or not isinstance(url, str):
                             continue
 
-                        # Process each URL only if it hasn't been seen in this period yet
                         if url not in unique_sources_set:
                             unique_sources_set.add(url)
                             url_lower = url.lower()
@@ -316,6 +303,7 @@ class TenantDashboardService:
         def calculate_trend_delta(
             current_val: float, prev_val: float, lower_is_better: bool = False
         ) -> Dict[str, str]:
+            # For All-Time dashboard mode, default to neutral 0.0% trend
             if not prev_val or prev_val == 0.0:
                 return {"trend": "0.0%", "trendType": "neutral"}
 
@@ -333,7 +321,7 @@ class TenantDashboardService:
             }
 
         # ------------------------------------------------------------------
-        # 5. Build Dynamic Timeseries Chart
+        # 5. Build Dynamic Timeseries Chart (Entire Timeline)
         # ------------------------------------------------------------------
         daily_timeline_map = defaultdict(list)
         for q_row, _, _, _ in current_period_rows:
