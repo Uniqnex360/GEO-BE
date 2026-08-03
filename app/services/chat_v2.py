@@ -12,6 +12,8 @@ Given a product identifier (name / SKU / MPN / UPC / URL), this module:
 """
 
 import json
+import os
+import serpapi
 from typing import AsyncGenerator, Optional
 from datetime import datetime, timedelta
 
@@ -41,6 +43,14 @@ You are a GEO expert. Use tools to analyze visibility parameters and map competi
 CRITICAL SCHEMA DIRECTION:
 Every dictionary field within the 'product_details' object MUST be structured as a JSON object containing EXACTLY these keys: "value", "score", and "tips".
 Output only valid JSON conforming perfectly to the schema definition.
+
+CRITICAL URL RULES:
+- NEVER invent, guess, or construct product URLs.
+- Only return a product_url if it was explicitly found in a trusted source during the search.
+- The product_url must be the exact canonical product page URL from the retailer or manufacturer's website.
+- Do NOT generate URLs from product names or slugs.
+- If no verified product URL is available, return an empty string "".
+- A 404 URL is worse than an empty URL.
 """
 
 
@@ -121,7 +131,12 @@ class CompetitorProductLink(BaseModel):
     competitor_name: str = Field(description="Name of the competitor/brand.")
     product_name: str = Field(description="Name of the competitor's product.")
     product_url: str = Field(
-        description="Direct URL to the competitor's product page, so the user can open it."
+        description=(
+            "Exact verified canonical URL of the competitor product page. "
+            "Never fabricate, infer, rewrite, or guess the URL. "
+            "Only use a URL explicitly returned by a trusted search result. "
+            'If unavailable, return "".'
+        )
     )
     price: Optional[str] = Field(
         None,
@@ -233,7 +248,7 @@ class ChatQueryBase(BaseModel):
 
     optimization_tips_for_better_result: str = Field(
         description=(
-            "Strategic SEO suggestion explaining WHERE and WHAT to optimize. "
+            "Strategic GEO suggestion explaining WHERE and WHAT to optimize. "
             "Identifies the target field/section and the high-level fix required "
             "(e.g., adjusting price positioning, adding local relevance, or tweaking title structure). "
             "BAD: Do not supply the finished copy here—keep this focused purely on the strategy/location."
@@ -284,8 +299,55 @@ class UnifiedGEOResponse(BaseModel):
 
 @tool
 def geo_web_search(query: str) -> str:
-    """Searches the web for general product metadata, listings, share of voice metrics, and competitive platform references."""
-    return f"[Web Results for search query: '{query}'] - 2 FAQs, 10 customer reviews found."
+    """Searches the web via SerpApi for live product metadata, verified competitor URLs, pricing, and organic search listings."""
+    api_key = os.getenv("SERPAPI_KEY") or os.getenv("SERPAPI_API_KEY")
+    if not api_key:
+        return "Error: SERPAPI_KEY environment variable is missing."
+
+    try:
+        # Initialize official SerpApi client
+        client = serpapi.Client(api_key=api_key)
+        results = client.search(
+            {
+                "engine": "google",
+                "q": query,
+                "num": 5,
+                "hl": "en",
+                "gl": "us",
+            }
+        )
+
+        organic_results = results.get("organic_results", [])
+        if not organic_results:
+            return f"No organic web results discovered for query: '{query}'."
+
+        formatted_output = []
+        for index, item in enumerate(organic_results, start=1):
+            title = item.get("title", "")
+            # Verified canonical URL from Google Search
+            link = item.get("link", "")
+            snippet = item.get("snippet", "")
+
+            # Extract pricing from rich snippets if available
+            rich_extensions = (
+                item.get("rich_snippet", {})
+                .get("top", {})
+                .get("detected_extensions", {})
+            )
+            price = rich_extensions.get("price") or item.get("price", "N/A")
+
+            formatted_output.append(
+                f"Result #{index}:\n"
+                f"- Title: {title}\n"
+                f"- Verified URL: {link}\n"
+                f"- Price: {price}\n"
+                f"- Summary: {snippet}\n"
+            )
+
+        return "\n".join(formatted_output)
+
+    except Exception as err:
+        return f"SerpApi Search Failed: {str(err)}"
 
 
 @tool
@@ -497,15 +559,29 @@ def _build_chat_model(model_name: str):
 
 
 async def _run_single_model_audit(
-    model_name: str, user_prompt: str
+    model_name: str, user_prompt: str, search_keyword: str
 ) -> Optional[UnifiedGEOResponse]:
+
+    # 1. Fetch live organic search data using SerpApi tool
+    live_search_data = geo_web_search.invoke({"query": search_keyword})
+
+    # 2. Inject live verified links directly into the user prompt
+    augmented_prompt = f"""{user_prompt}
+
+VERIFIED SERPAPI LIVE SEARCH RESULTS:
+{live_search_data}
+
+CRITICAL URL CONSTRAINT:
+When populating 'competitor_products' or 'citing_sources', you MUST ONLY copy exact URLs from the 'Verified URL' fields above.
+NEVER fabricate, edit, or invent URLs. If a URL is not present in the search results above, leave 'product_url' as an empty string "".
+"""
+
+    # 3. Request structured extraction from the LLM
     llm = _build_chat_model(model_name)
     structured_llm = llm.with_structured_output(UnifiedGEOResponse)
-    # NOTE: previously GEO_SYSTEM_PROMPT was defined but never actually sent to the
-    # model. Wiring it in here as the system message so the schema/formatting rules
-    # it describes are actually enforced.
+
     return await structured_llm.ainvoke(
-        [("system", GEO_SYSTEM_PROMPT), ("human", user_prompt)]
+        [("system", GEO_SYSTEM_PROMPT), ("human", augmented_prompt)]
     )
 
 
@@ -591,7 +667,7 @@ def _resolve_identifier(payload: GEOAuditRequest) -> str:
         payload.product_name
         or payload.sku
         or payload.product_url
-        or "Unknown Meta Query"
+        or ""
     )
 
 
@@ -670,7 +746,9 @@ async def run_geo_audit_stream(
                     progress_start + 20,
                 )
 
-                structured = await _run_single_model_audit(model_name, user_prompt)
+                search_keyword = f"{identifier} competitors buy online"
+
+                structured = await _run_single_model_audit(model_name, user_prompt, search_keyword)
 
                 if structured:
                     structured.model_used = model_name
