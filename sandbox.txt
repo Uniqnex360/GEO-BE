@@ -1,0 +1,732 @@
+"""
+AI Brand Visibility Analyzer
+=============================
+Measures how visible a brand is across AI assistants / LLM platforms, across
+eight weighted dimensions:
+
+    Mention (20%) | Citation (20%) | Share of Voice (15%) | Product Coverage (15%)
+    Category Coverage (10%) | Knowledge Graph (10%) | Authority (5%) | Sentiment (5%)
+
+Design goals
+------------
+- Fully dynamic, zero hardcoded content: no fixed brand/category/competitor
+  lists, no fixed "trusted domain" list, no fixed query templates, no fixed
+  recommendation text. Every one of those is inferred at runtime by the LLM
+  from the brand's own context (name, website, country, industry) or from
+  live SerpAPI search results, so the tool works the same way for a
+  mobility-aids brand, a fintech brand, or a SaaS brand without code changes.
+- DRY: every "ask the model / ask the web" pattern goes through one of two
+  helpers (`_ask_llm_text` / `_ask_llm_structured`) and one SerpAPI helper
+  (`_search`).
+- Every finding is returned twice: as structured JSON (BrandVisibilityReport)
+  and as a raw_responses payload so the underlying LLM/search output can be
+  audited.
+
+What's still a constant (by design, not content)
+-------------------------------------------------
+Only the scoring *formula* is fixed, because it comes directly from the
+spec: dimension weights (`Weights`) and the sentiment->numeric scale used to
+average sentiment. These are business rules, not brand/domain data, so they
+stay as named constants rather than being re-derived by an LLM call on every
+run.
+
+Install
+-------
+    # base (always required)
+    pip install langchain langchain-community google-search-results pydantic --break-system-packages
+
+    # plus whichever LLM provider(s) you want to use:
+    pip install langchain-openai --break-system-packages          # BVA_LLM_PROVIDER=openai (default)
+    pip install langchain-anthropic --break-system-packages       # BVA_LLM_PROVIDER=anthropic
+    pip install langchain-google-genai --break-system-packages    # BVA_LLM_PROVIDER=google
+
+Environment
+-----------
+    BVA_LLM_PROVIDER  - "openai" (default) | "anthropic" | "google". Switch
+                        providers with no code changes — see build_llm().
+    BVA_LLM_MODEL     - optional model override for the chosen provider.
+    OPENAI_API_KEY    - required if BVA_LLM_PROVIDER=openai
+    ANTHROPIC_API_KEY - required if BVA_LLM_PROVIDER=anthropic
+    GOOGLE_API_KEY    - required if BVA_LLM_PROVIDER=google
+    SERPAPI_KEY   - always required; real web search for citation/
+                        authority/product-coverage checks against the live web.
+
+Usage
+-----
+    python brand_visibility_analyzer.py
+    (edit the `if __name__ == "__main__"` block, or import BrandVisibilityAnalyzer)
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from collections import Counter
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+from dotenv import load_dotenv
+
+from pydantic import BaseModel, Field, field_validator
+
+from langchain_community.utilities import SerpAPIWrapper
+from langchain_core.prompts import ChatPromptTemplate
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# 1. CONFIG (scoring formula only — no brand/domain content lives here)
+# ---------------------------------------------------------------------------
+
+
+class Weights:
+    """Weighted contribution of each dimension to the overall score (sums to 1.0)."""
+
+    MENTION = 0.20
+    CITATION = 0.20
+    SHARE_OF_VOICE = 0.15
+    PRODUCT_COVERAGE = 0.15
+    CATEGORY_COVERAGE = 0.10
+    KNOWLEDGE_GRAPH = 0.10
+    AUTHORITY = 0.05
+    SENTIMENT = 0.05
+
+
+SENTIMENT_SCALE = {"positive": 100, "mixed": 60, "neutral": 50, "negative": 0}
+RECOMMENDATION_THRESHOLD = (
+    70.0  # dimensions scoring below this (0-100) get recommendations
+)
+
+# LLM provider is swappable via env vars — no code changes needed to move
+# between OpenAI, Anthropic, and Gemini. Each provider needs its own package
+# installed (see PROVIDER_FACTORIES below) and its own API key env var.
+LLM_PROVIDER = os.environ.get(
+    "BVA_LLM_PROVIDER", "openai"
+).lower()  # openai | anthropic | google
+LLM_MODEL = os.environ.get(
+    "BVA_LLM_MODEL",
+    {
+        "openai": "gpt-4o-mini",
+        "anthropic": "claude-sonnet-4-6",
+        "google": "gemini-2.5-flash",
+    }.get(os.environ.get("BVA_LLM_PROVIDER", "openai").lower(), "gpt-4o-mini"),
+)
+
+
+def build_llm(provider: str = LLM_PROVIDER, model_name: str = LLM_MODEL):
+    """Provider-agnostic LLM factory.
+
+    All three providers support `.with_structured_output(PydanticModel)` in
+    recent LangChain versions, so nothing downstream needs to know or care
+    which provider is active — every `_ask_llm_structured` / `_ask_llm_text`
+    call in the analyzer works unchanged regardless of provider.
+
+    Switch providers with:
+        export BVA_LLM_PROVIDER=anthropic   # or "google", or "openai"
+        export BVA_LLM_MODEL=claude-sonnet-4-6   # optional override
+    """
+    if provider == "openai":
+        from langchain_openai import ChatOpenAI  # pip install langchain-openai
+
+        return ChatOpenAI(model=model_name, temperature=0)
+
+    if provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic  # pip install langchain-anthropic
+
+        return ChatAnthropic(model=model_name, temperature=0)
+
+    if provider == "google":
+        from langchain_google_genai import (
+            ChatGoogleGenerativeAI,
+        )  # pip install langchain-google-genai
+
+        return ChatGoogleGenerativeAI(model=model_name, temperature=0)
+
+    raise ValueError(
+        f"Unknown BVA_LLM_PROVIDER '{provider}'. Use 'openai', 'anthropic', or 'google'."
+    )
+
+
+REQUIRED_KEY_BY_PROVIDER = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "google": "GOOGLE_API_KEY",
+}
+
+
+# ---------------------------------------------------------------------------
+# 2. PYDANTIC MODELS
+# ---------------------------------------------------------------------------
+
+
+class BrandInput(BaseModel):
+    """User-supplied input describing the brand to analyze."""
+
+    brand_name: str
+    country: str
+    website: str
+    extra_context: Optional[str] = ""
+
+    @field_validator("website")
+    @classmethod
+    def _normalize_website(cls, v: str) -> str:
+        v = v.strip()
+        if not v.startswith("http"):
+            v = "https://" + v
+        return v.rstrip("/")
+
+    @property
+    def domain(self) -> str:
+        return urlparse(self.website).netloc.replace("www.", "")
+
+
+class BrandProfile(BaseModel):
+    """LLM-inferred profile driving every downstream dynamic query."""
+
+    industry: str
+    product_categories: List[str] = Field(min_length=3, max_length=8)
+    competitors: List[str] = Field(min_length=2, max_length=6)
+
+
+class GeneratedQueries(BaseModel):
+    """LLM-generated realistic AI-assistant prompts for this brand's space.
+
+    Replaces any fixed 'Best {category} brands' style template list — the
+    model decides realistic phrasing, mix of comparison/recommendation/trust
+    style questions, based on the brand's own industry and country.
+    """
+
+    queries: List[str] = Field(min_length=8, max_length=30)
+
+
+class MentionJudgement(BaseModel):
+    """Structured LLM judgement of a single simulated AI-platform answer."""
+
+    mentioned: bool
+    rank: Optional[int] = Field(
+        default=None, description="Position in a ranked list, else null"
+    )
+    cited_official_site: bool = False
+    sentiment: str = Field(
+        default="neutral", description="positive | neutral | negative | mixed"
+    )
+
+
+class PromptResult(BaseModel):
+    prompt: str
+    raw_response: str
+    mentioned: bool
+    rank: Optional[int] = None
+    cited_official_site: bool = False
+    sentiment: str = "neutral"
+
+
+class KnowledgeGraphJudgement(BaseModel):
+    richness_score: float = Field(ge=0, le=100)
+    covers_history: bool
+    covers_products: bool
+    covers_industry: bool
+    covers_country: bool
+
+
+class DomainTrustJudgement(BaseModel):
+    """LLM classification of which searched domains count as authoritative.
+
+    No static 'trusted domain' list: the model is shown the actual domains
+    returned by SerpAPI for this brand/industry/country and decides which
+    are authoritative sources (e.g. government, academic, recognized news,
+    established industry publications, encyclopedic references) in that
+    specific context.
+    """
+
+    trusted_domains: List[str] = Field(default_factory=list)
+
+
+class CatalogSizeEstimate(BaseModel):
+    """LLM estimate of total catalog size from live search snippets.
+
+    Replaces any fixed multiplier/heuristic — the model reasons over the
+    actual SerpAPI result titles/snippets for this brand's site.
+    """
+
+    total_products_estimated: int = Field(ge=1)
+    reasoning: str = ""
+
+
+class RecommendationSet(BaseModel):
+    recommendations: List[str] = Field(default_factory=list, max_length=10)
+
+
+class DimensionScore(BaseModel):
+    name: str
+    raw_value: float  # 0-100 metric before weighting
+    weight: float
+    weighted_score: float
+
+
+class BrandVisibilityReport(BaseModel):
+    brand: str
+    country: str
+    website: str
+    industry: str
+    overall_score: float
+    sentiment: str
+    dimensions: List[DimensionScore]
+    recommendations: List[str]
+    raw_responses: Dict[str, Any]
+
+    def to_json(self) -> str:
+        return self.model_dump_json(indent=2)
+
+
+# ---------------------------------------------------------------------------
+# 3. ANALYZER
+# ---------------------------------------------------------------------------
+
+
+class BrandVisibilityAnalyzer:
+    """Runs the full 8-dimension brand visibility pipeline for one brand."""
+
+    def __init__(
+        self,
+        brand_input: BrandInput,
+        provider: str = LLM_PROVIDER,
+        model_name: str = LLM_MODEL,
+    ) -> None:
+        self.input = brand_input
+        self.llm = build_llm(provider, model_name)
+        self.search = SerpAPIWrapper(serpapi_api_key=os.environ["SERPAPI_KEY"])
+        self._raw: Dict[str, Any] = {}  # accumulates every raw LLM/search payload
+
+    # -- generic DRY helpers -------------------------------------------------
+
+    def _ask_llm_text(self, system: str, user: str) -> str:
+        """Free-text LLM call. Used to *simulate* what an AI platform would answer."""
+        prompt = ChatPromptTemplate.from_messages([("system", system), ("human", user)])
+        chain = prompt | self.llm
+        return chain.invoke({}).content
+
+    def _ask_llm_structured(
+        self, model_cls: type[BaseModel], system: str, user: str
+    ) -> BaseModel:
+        """Structured LLM call. Used to *judge/classify/estimate* against a Pydantic schema."""
+        prompt = ChatPromptTemplate.from_messages([("system", system), ("human", user)])
+        chain = prompt | self.llm.with_structured_output(model_cls)
+        return chain.invoke({})
+
+    def _search(self, query: str) -> Dict[str, Any]:
+        """SerpAPI search wrapped for uniform raw-result capture."""
+        try:
+            return self.search.results(query)
+        except Exception as exc:  # network/quota issues shouldn't crash the whole run
+            return {"error": str(exc), "query": query}
+
+    @staticmethod
+    def _pct(numerator: float, denominator: float) -> float:
+        return round((numerator / denominator) * 100, 2) if denominator else 0.0
+
+    # -- step 0: brand profile inference -------------------------------------
+
+    def _infer_brand_profile(self) -> BrandProfile:
+        system = (
+            "You are a market research analyst. Infer a concise, realistic profile "
+            "for the given brand using only the details provided."
+        )
+        user = (
+            f"Brand: {self.input.brand_name}\n"
+            f"Country: {self.input.country}\n"
+            f"Website: {self.input.website}\n"
+            f"Extra context: {self.input.extra_context or 'none'}\n\n"
+            "Return: the brand's industry, 3-8 product/service categories it "
+            "competes in, and 2-6 realistic named competitor brands."
+        )
+        profile = self._ask_llm_structured(BrandProfile, system, user)
+        self._raw["brand_profile"] = profile.model_dump()
+        return profile  # type: ignore[return-value]
+
+    # -- step 1: dynamic prompt generation (no fixed templates) -------------
+
+    def _generate_prompts(self, profile: BrandProfile) -> List[str]:
+        system = (
+            "You generate realistic questions that real customers or an AI shopping "
+            "assistant would naturally ask, covering recommendation, comparison, and "
+            "trust-style phrasing (e.g. 'best', 'top', 'trusted', 'which brand should I')."
+        )
+        user = (
+            f"Industry: {profile.industry}\n"
+            f"Country: {self.input.country}\n"
+            f"Product/service categories: {', '.join(profile.product_categories)}\n\n"
+            "Generate 8-20 varied, naturally-phrased prompts across these categories and "
+            "this country. Do not mention any specific brand name in the prompts — these "
+            "should be the kind of open questions a shopper would ask before knowing which "
+            "brand to pick."
+        )
+        generated: GeneratedQueries = self._ask_llm_structured(GeneratedQueries, system, user)  # type: ignore[assignment]
+        self._raw["generated_prompts"] = generated.queries
+        return generated.queries
+
+    # -- step 2: mention + citation + sentiment (one pass over prompts) -----
+
+    def _run_prompt_battery(self, prompts: List[str]) -> List[PromptResult]:
+        results: List[PromptResult] = []
+        for prompt in prompts:
+            raw_answer = self._ask_llm_text(
+                system="You are an AI assistant answering a shopping/recommendation question "
+                "as helpfully and realistically as possible, naming real brands where relevant.",
+                user=prompt,
+            )
+            judgement: MentionJudgement = self._ask_llm_structured(  # type: ignore[assignment]
+                MentionJudgement,
+                system="You are auditing an AI answer for brand visibility.",
+                user=(
+                    f"Brand to check: {self.input.brand_name} (official site: {self.input.domain})\n\n"
+                    f"AI answer:\n{raw_answer}\n\n"
+                    "Judge whether the brand is mentioned, its rank/position if the answer is a "
+                    "list, whether the brand's official website/domain is cited, and overall "
+                    "sentiment toward the brand in this answer."
+                ),
+            )
+            results.append(
+                PromptResult(
+                    prompt=prompt,
+                    raw_response=raw_answer,
+                    mentioned=judgement.mentioned,
+                    rank=judgement.rank,
+                    cited_official_site=judgement.cited_official_site,
+                    sentiment=judgement.sentiment,
+                )
+            )
+        self._raw["prompt_battery"] = [r.model_dump() for r in results]
+        return results
+
+    @staticmethod
+    def _mention_score(results: List[PromptResult]) -> float:
+        if not results:
+            return 0.0
+        mentioned = sum(1 for r in results if r.mentioned)
+        return BrandVisibilityAnalyzer._pct(mentioned, len(results))
+
+    @staticmethod
+    def _citation_score(results: List[PromptResult]) -> float:
+        mentioned = [r for r in results if r.mentioned]
+        if not mentioned:
+            return 0.0
+        cited = sum(1 for r in mentioned if r.cited_official_site)
+        return BrandVisibilityAnalyzer._pct(cited, len(mentioned))
+
+    @staticmethod
+    def _sentiment_score(results: List[PromptResult]) -> tuple[float, str]:
+        mentioned = [r for r in results if r.mentioned]
+        if not mentioned:
+            return 0.0, "neutral"
+        scores = [SENTIMENT_SCALE.get(r.sentiment.lower(), 50) for r in mentioned]
+        avg = round(sum(scores) / len(scores), 2)
+        majority = Counter(r.sentiment.lower() for r in mentioned).most_common(1)[0][0]
+        return avg, majority
+
+    # -- step 3: share of voice (competitors come from the inferred profile) --
+
+    def _share_of_voice(self, profile: BrandProfile) -> Dict[str, Any]:
+        all_brands = [self.input.brand_name] + profile.competitors
+        category_str = ", ".join(profile.product_categories[:3])
+        raw_answer = self._ask_llm_text(
+            system="You are an AI assistant comparing brands for a shopping query. "
+            "Mention multiple relevant real brands by name, naturally, as you normally would.",
+            user=f"What are the best brands for {category_str} in {self.input.country}? "
+            f"Compare options among: {', '.join(all_brands)}.",
+        )
+        counts = {
+            b: len(re.findall(re.escape(b), raw_answer, flags=re.IGNORECASE))
+            for b in all_brands
+        }
+        total = sum(counts.values())
+        brand_mentions = counts.get(self.input.brand_name, 0)
+        share_pct = self._pct(brand_mentions, total)
+        payload = {
+            "raw_response": raw_answer,
+            "mention_counts": counts,
+            "total_mentions": total,
+            "brand_mentions": brand_mentions,
+            "share_pct": share_pct,
+        }
+        self._raw["share_of_voice"] = payload
+        return payload
+
+    # -- step 4: product coverage (catalog size is LLM-estimated, not a fixed multiplier) --
+
+    def _product_coverage(self, profile: BrandProfile) -> Dict[str, Any]:
+        site_results = self._search(f"site:{self.input.domain} product")
+        organic = (
+            site_results.get("organic_results", [])
+            if isinstance(site_results, dict)
+            else []
+        )
+        snippets = "\n".join(
+            f"- {r.get('title', '')}: {r.get('snippet', '')}" for r in organic[:10]
+        )
+
+        catalog_estimate: CatalogSizeEstimate = self._ask_llm_structured(  # type: ignore[assignment]
+            CatalogSizeEstimate,
+            system="You estimate the likely total product catalog size of a company from "
+            "partial search-result evidence and general knowledge of similar companies.",
+            user=(
+                f"Brand: {self.input.brand_name} ({self.input.website})\n"
+                f"Industry: {profile.industry}\n"
+                f"Categories: {', '.join(profile.product_categories)}\n"
+                f"Sample of indexed pages found via search:\n{snippets or 'none found'}\n\n"
+                "Estimate the total number of distinct products this brand likely sells."
+            ),
+        )
+
+        recommended_answer = self._ask_llm_text(
+            system="You are an AI shopping assistant. List specific product names you would "
+            "recommend from this brand, one per line, no extra commentary.",
+            user=f"List products from {self.input.brand_name} ({self.input.website}) relevant to: "
+            f"{', '.join(profile.product_categories)}.",
+        )
+        recommended_products = [
+            line.strip("- ").strip()
+            for line in recommended_answer.splitlines()
+            if line.strip()
+        ]
+        coverage_pct = min(
+            self._pct(
+                len(recommended_products), catalog_estimate.total_products_estimated
+            ),
+            100.0,
+        )
+        payload = {
+            "site_search_raw": site_results,
+            "catalog_estimate_reasoning": catalog_estimate.reasoning,
+            "total_products_estimated": catalog_estimate.total_products_estimated,
+            "recommended_products_raw": recommended_answer,
+            "products_recommended_by_ai": len(recommended_products),
+            "coverage_pct": coverage_pct,
+        }
+        self._raw["product_coverage"] = payload
+        return payload
+
+    # -- step 5: category coverage -------------------------------------------
+
+    def _category_coverage(
+        self, profile: BrandProfile, prompt_results: List[PromptResult]
+    ) -> Dict[str, Any]:
+        # Reuse the prompt battery: a category counts as "visible" if any prompt
+        # built from it resulted in a mention.
+        visible = set()
+        for category in profile.product_categories:
+            for result in prompt_results:
+                if category.lower() in result.prompt.lower() and result.mentioned:
+                    visible.add(category)
+                    break
+        coverage_pct = self._pct(len(visible), len(profile.product_categories))
+        payload = {
+            "categories_checked": profile.product_categories,
+            "categories_visible": sorted(visible),
+            "coverage_pct": coverage_pct,
+        }
+        self._raw["category_coverage"] = payload
+        return payload
+
+    # -- step 6: knowledge graph score ---------------------------------------
+
+    def _knowledge_graph_score(self) -> Dict[str, Any]:
+        raw_answer = self._ask_llm_text(
+            system="You are an AI assistant answering a factual question about a company.",
+            user=f"Who is {self.input.brand_name}? Describe their history, expertise, "
+            f"product categories, and country of operation.",
+        )
+        judgement: KnowledgeGraphJudgement = self._ask_llm_structured(  # type: ignore[assignment]
+            KnowledgeGraphJudgement,
+            system="You are scoring how rich and accurate an AI's company description is.",
+            user=(
+                f"Brand: {self.input.brand_name}, expected country: {self.input.country}\n\n"
+                f"AI answer:\n{raw_answer}\n\n"
+                "Score richness 0-100 and flag whether history, products, industry, and "
+                "country are each covered."
+            ),
+        )
+        payload = {"raw_response": raw_answer, **judgement.model_dump()}
+        self._raw["knowledge_graph"] = payload
+        return payload
+
+    # -- step 7: authority score (trust is judged per-run, not a static domain list) --
+
+    def _authority_score(self) -> Dict[str, Any]:
+        results = self._search(
+            f'"{self.input.brand_name}" review OR mentioned OR profile'
+        )
+        organic = (
+            results.get("organic_results", []) if isinstance(results, dict) else []
+        )
+        domains = sorted(
+            {
+                urlparse(item.get("link", "")).netloc
+                for item in organic
+                if item.get("link")
+            }
+        )
+
+        trust_judgement: DomainTrustJudgement = self._ask_llm_structured(  # type: ignore[assignment]
+            DomainTrustJudgement,
+            system="You classify which web domains count as authoritative/trustworthy "
+            "sources (e.g. government, academic, recognized news outlets, established "
+            "industry publications, encyclopedic references) for a given brand's industry "
+            "and country. Judge each domain on its own merits — do not assume any fixed list.",
+            user=(
+                f"Brand: {self.input.brand_name} (site: {self.input.domain}), "
+                f"country: {self.input.country}\n"
+                f"Domains found referencing this brand: {', '.join(domains) or 'none'}\n\n"
+                "Return the subset of these domains that are genuinely authoritative sources."
+            ),
+        )
+        payload = {
+            "raw_search": results,
+            "domains_found": domains,
+            "trusted_domains": trust_judgement.trusted_domains,
+            "trusted_citation_count": len(trust_judgement.trusted_domains),
+            "results_checked": len(organic),
+        }
+        self._raw["authority"] = payload
+        return payload
+
+    # -- recommendations (LLM-generated, tailored to the brand, not a static library) --
+
+    def _build_recommendations(
+        self, profile: BrandProfile, dimensions: List[DimensionScore]
+    ) -> List[str]:
+        weak_dimensions = [
+            d for d in dimensions if d.raw_value < RECOMMENDATION_THRESHOLD
+        ]
+        if not weak_dimensions:
+            return []
+        system = (
+            "You are an AI-search/answer-engine optimization consultant. Given a brand's "
+            "weak visibility dimensions, propose specific, actionable recommendations."
+        )
+        weak_summary = "\n".join(
+            f"- {d.name}: {d.raw_value}/100" for d in weak_dimensions
+        )
+        user = (
+            f"Brand: {self.input.brand_name}\n"
+            f"Industry: {profile.industry}\n"
+            f"Categories: {', '.join(profile.product_categories)}\n\n"
+            f"Underperforming dimensions:\n{weak_summary}\n\n"
+            "Propose up to 10 concise, specific recommendations (content, schema, PR, "
+            "review-generation, or site-structure actions) that would most directly "
+            "improve these specific weak dimensions for this specific brand."
+        )
+        rec_set: RecommendationSet = self._ask_llm_structured(RecommendationSet, system, user)  # type: ignore[assignment]
+        return rec_set.recommendations
+
+    # -- orchestration -----------------------------------------------------
+
+    def analyze(self) -> BrandVisibilityReport:
+        profile = self._infer_brand_profile()
+        prompts = self._generate_prompts(profile)
+        prompt_results = self._run_prompt_battery(prompts)
+
+        mention_val = self._mention_score(prompt_results)
+        citation_val = self._citation_score(prompt_results)
+        sentiment_val, sentiment_label = self._sentiment_score(prompt_results)
+        sov = self._share_of_voice(profile)
+        product_cov = self._product_coverage(profile)
+        category_cov = self._category_coverage(profile, prompt_results)
+        knowledge = self._knowledge_graph_score()
+        authority = self._authority_score()
+
+        # authority: cap trusted citation count into a 0-100 scale (5+ trusted hits = 100)
+        authority_val = min(self._pct(authority["trusted_citation_count"], 5), 100.0)
+
+        raw_dimension_values = {
+            "mention": mention_val,
+            "citation": citation_val,
+            "share_of_voice": sov["share_pct"],
+            "product_coverage": product_cov["coverage_pct"],
+            "category_coverage": category_cov["coverage_pct"],
+            "knowledge_graph": knowledge["richness_score"],
+            "authority": authority_val,
+            "sentiment": sentiment_val,
+        }
+        weight_map = {
+            "mention": Weights.MENTION,
+            "citation": Weights.CITATION,
+            "share_of_voice": Weights.SHARE_OF_VOICE,
+            "product_coverage": Weights.PRODUCT_COVERAGE,
+            "category_coverage": Weights.CATEGORY_COVERAGE,
+            "knowledge_graph": Weights.KNOWLEDGE_GRAPH,
+            "authority": Weights.AUTHORITY,
+            "sentiment": Weights.SENTIMENT,
+        }
+
+        dimensions = [
+            DimensionScore(
+                name=name,
+                raw_value=value,
+                weight=weight_map[name],
+                weighted_score=round(value * weight_map[name], 2),
+            )
+            for name, value in raw_dimension_values.items()
+        ]
+        overall_score = round(sum(d.weighted_score for d in dimensions), 2)
+
+        report = BrandVisibilityReport(
+            brand=self.input.brand_name,
+            country=self.input.country,
+            website=self.input.website,
+            industry=profile.industry,
+            overall_score=overall_score,
+            sentiment=sentiment_label,
+            dimensions=dimensions,
+            recommendations=self._build_recommendations(profile, dimensions),
+            raw_responses=self._raw,
+        )
+        return report
+
+
+# ---------------------------------------------------------------------------
+# 4. ENTRYPOINT
+# ---------------------------------------------------------------------------
+
+
+def run(
+    brand_name: str,
+    country: str,
+    website: str,
+    extra_context: str = "",
+    provider: str = LLM_PROVIDER,
+    model_name: str = LLM_MODEL,
+) -> BrandVisibilityReport:
+    """Convenience function: build BrandInput, run analysis, return the report."""
+    brand_input = BrandInput(
+        brand_name=brand_name,
+        country=country,
+        website=website,
+        extra_context=extra_context,
+    )
+    analyzer = BrandVisibilityAnalyzer(
+        brand_input, provider=provider, model_name=model_name
+    )
+    return analyzer.analyze()
+
+
+if __name__ == "__main__":
+    required_llm_key = REQUIRED_KEY_BY_PROVIDER.get(LLM_PROVIDER)
+    if required_llm_key is None:
+        raise SystemExit(
+            f"Unknown BVA_LLM_PROVIDER '{LLM_PROVIDER}'. Use 'openai', 'anthropic', or 'google'."
+        )
+    for key in (required_llm_key, "SERPAPI_KEY"):
+        if not os.environ.get(key):
+            raise SystemExit(f"Missing required environment variable: {key}")
+
+    report = run(
+        brand_name="NRS Healthcare",
+        country="United Kingdom",
+        website="nrs-uk.co.uk",
+        extra_context="Manufacturer and supplier of mobility and daily living aids.",
+    )
+
+    with open("result.json", "w", encoding="utf-8") as f:
+        f.write(report.to_json())
+
+    print("Saved report to result.json")
