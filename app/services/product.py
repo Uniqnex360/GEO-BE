@@ -1081,7 +1081,6 @@ class ProductService:
         # ------------------------------------------------------------------
         # 2. Optimized Tenant Aggregate Metrics (Directly off ChatSearchQuery)
         # ------------------------------------------------------------------
-        # Avoiding massive product joins here speeds up step 2 from 1400ms -> ~15ms
         prod_count_stmt = select(
             func.count(Product.id.distinct()).label("unique_products"),
             func.count(Product.brand_id.distinct()).label("unique_brands"),
@@ -1091,7 +1090,6 @@ class ProductService:
         total_tenant_products = prod_count_res.unique_products if prod_count_res else 0
         total_tenant_brands = prod_count_res.unique_brands if prod_count_res else 0
 
-        # Aggregate stats globally filtered by tenant products
         global_stats_stmt = (
             select(
                 func.count(ChatSearchQuery.id).label("total_queries"),
@@ -1121,7 +1119,6 @@ class ProductService:
             else 0.0
         )
 
-        # Placeholder - will be recalculated after product payload processing
         tenant_stats = {
             "total_products": total_tenant_products,
             "avg_visibility_score": 0.0,
@@ -1141,7 +1138,6 @@ class ProductService:
         if search:
             view_filters.append(Product.name.ilike(f"%{search}%"))
 
-        # Fetch all matching unpaginated product IDs
         all_ids_stmt = select(Product.id).where(*view_filters)
         all_ids_result = await db.execute(all_ids_stmt)
         all_product_ids = list(all_ids_result.scalars().all())
@@ -1210,7 +1206,6 @@ class ProductService:
                     + func.coalesce(engine_rate_cols[1], 0.0)
                     + func.coalesce(engine_rate_cols[2], 0.0)
                 )
-                # Strictly divide by 3 to match the overall visibility logic
                 order_visibility_col = sum_rates_expr / 3.0
             else:
                 target_engine = VISIBILITY_SORT_KEYS[sort_by]
@@ -1309,7 +1304,6 @@ class ProductService:
             "CLAUDE": "anthropic",
         }
 
-        # Map metrics back to product payload
         product_engine_map = defaultdict(dict)
         product_totals_map = defaultdict(
             lambda: {
@@ -1354,9 +1348,12 @@ class ProductService:
 
         for product in ordered_products:
             by_engine = product_engine_map.get(product.id, {})
-            totals = product_totals_map.get(product.id, {})
+            # FIX: use the defaultdict's own indexing (not .get(..., {}))
+            # so products with no chat/query rows still get the full
+            # default shape (queries, sov_sum, rank_sum, rank_cnt, last_analysis)
+            # instead of a bare {} that has no "queries" key -> KeyError: 'queries'
+            totals = product_totals_map[product.id]
 
-            # Sum available engine scores and divide strictly by 3
             rates = [eng["visibility_rate"] for eng in by_engine.values()]
             overall_vis = round(sum(rates) / 3.0, 2)
             all_vis_scores.append(overall_vis)
@@ -1380,7 +1377,6 @@ class ProductService:
             }
             products_payload.append(product)
 
-        # Sync top card average visibility score with the product visibility averages
         if all_vis_scores:
             tenant_stats["avg_visibility_score"] = round(
                 sum(all_vis_scores) / len(all_vis_scores), 1
