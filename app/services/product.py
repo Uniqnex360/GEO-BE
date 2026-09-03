@@ -676,12 +676,21 @@ class ProductService:
         # ------------------------------------------------------------------
         response_payload = {
             "productInfo": {
+                "id": product.id,
                 "icon": (
                     "📺"
                     if product.category and "tv" in product.category.lower()
                     else "📦"
                 ),
                 "title": product.name,
+                "product_name_ai": product.product_name_ai,
+                "current_ai_features": product.current_ai_features,
+                "features_ai": product.features_ai,
+                "long_description": product.long_description,
+                "description_ai": product.description_ai,
+                "ai_title_rewrite_count": product.ai_title_rewrite_count,
+                "ai_features_rewrite_count": product.ai_features_rewrite_count,
+                "ai_description_rewrite_count": product.ai_description_rewrite_count,
                 "brand": (
                     product.brand.name
                     if product.brand
@@ -1028,8 +1037,6 @@ class ProductService:
         elif tab == "tips":
             chat_list = []
             for chat in all_chats:
-
-
 
                 chat_list.append(
                     {

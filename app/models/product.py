@@ -1,5 +1,5 @@
-from typing import Optional
-from sqlalchemy.dialects.postgresql import JSONB
+from typing import Optional, List
+from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 from sqlalchemy import ForeignKey, String, Text, Float, Integer, Enum as SQLEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -42,15 +42,18 @@ class Product(BaseModel):
 
     __tablename__ = "products"
 
-    # foreign keys
+    # Foreign keys
     tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), nullable=False)
     brand_id: Mapped[int] = mapped_column(ForeignKey("brands.id"), nullable=False)
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=True)
     last_updated_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=True)
     deleted_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=True)
 
-    # product fields - Altered to JSONB to store {value, score, tips}
+    # Product fields with default JSONB dicts
     name: Mapped[dict] = mapped_column(String, nullable=False)
+    product_name_ai: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
     brand_name: Mapped[str] = mapped_column(String(255), nullable=False)
     manufacturer: Mapped[str] = mapped_column(String(255), nullable=True)
     model_number: Mapped[str] = mapped_column(String(255), nullable=True)
@@ -71,11 +74,33 @@ class Product(BaseModel):
     gtin: Mapped[str] = mapped_column(String(255), nullable=True)
     ean: Mapped[str] = mapped_column(String(255), nullable=True)
 
+    # Default ARRAY lists
+    features_ai: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    current_ai_features: Mapped[List[str]] = mapped_column(
+        ARRAY(String), nullable=False, default=list, server_default="{}"
+    )
     product_url: Mapped[str] = mapped_column(Text, nullable=True)
     texonomy: Mapped[str] = mapped_column(Text, nullable=True)
     short_description: Mapped[str] = mapped_column(Text, nullable=True)
     long_description: Mapped[str] = mapped_column(Text, nullable=True)
+
+    description_ai: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
     specifications: Mapped[str] = mapped_column(Text, nullable=True)
+
+    # Integer rewrite counters
+    ai_title_rewrite_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    ai_features_rewrite_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    ai_description_rewrite_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
     # analysis specific fields to catch JSON details
     description_analysis: Mapped[dict] = mapped_column(JSONB, nullable=True)
