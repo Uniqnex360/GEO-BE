@@ -15,12 +15,10 @@ from app.models import Product
 
 router = APIRouter()
 
-# OpenAI Async Client Setup
 client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 MAX_REWRITE_COUNT = 3
 
-# Prompt Rules & System Prompts
 DO_NOT_INVENT_SPECS_RULE = "- Do not invent specifications."
 NO_NAME_IN_BODY_RULE = (
     "- Do not mention the product name, model number, or product code anywhere "
@@ -73,10 +71,10 @@ Return only the rewritten title.
 REWRITE_FEATURES_PROMPT = (
     """
 You are a senior ecommerce content editor.
-Rewrite the following product features.
+Rewrite or extract clear product features from the following context.
 Requested improvement:
 {selected_option}
-Original Features:
+Source Context:
 {original}
 Goals:
 - Improve readability.
@@ -124,7 +122,6 @@ Return only the rewritten description.
 )
 
 
-# Parsing Helpers
 def parse_title(text: str) -> str:
     return text.strip().strip('"').strip("'")
 
@@ -151,7 +148,6 @@ REWRITE_SPECS = {
     "description": {"prompt": REWRITE_DESCRIPTION_PROMPT, "parse": parse_description},
 }
 
-# Maps each field to your exact Product model JSONB columns and rewrite counters
 FIELD_COLUMN_MAP = {
     "title": {
         "versions_column": "product_name_ai",
@@ -170,21 +166,52 @@ FIELD_COLUMN_MAP = {
 
 def get_fallback_original(product_obj: Any, field: str) -> Optional[Any]:
     """
-    Retrieves current fallback text directly from the Product table
-    if no previous version or 'current' was passed in the request body.
+    Retrieves fallback text directly from the Product table if no prior version
+    was passed in the request body, cascading down to available fields.
     """
+    title_text = getattr(product_obj, "name", None) or getattr(
+        product_obj, "title", None
+    )
+    desc_text = getattr(product_obj, "long_description", None) or getattr(
+        product_obj, "short_description", None
+    )
+    features_text = getattr(product_obj, "current_ai_features", None)
+
     if field == "title":
-        return getattr(product_obj, "name", None)
-    if field == "description":
-        return getattr(product_obj, "long_description", None) or getattr(
-            product_obj, "short_description", None
+        # Title Priority: Existing Title -> Existing Description -> Existing Features
+        return (
+            title_text
+            or desc_text
+            or (
+                features_text[0]
+                if isinstance(features_text, list) and features_text
+                else None
+            )
         )
+
+    if field == "description":
+        # Description Priority: Existing Description -> Existing Title -> Existing Features
+        if desc_text:
+            return desc_text
+        if title_text:
+            return title_text
+        if features_text and isinstance(features_text, list):
+            return "\n".join(f"- {f}" for f in features_text)
+        return None
+
     if field == "features":
-        return getattr(product_obj, "current_ai_features", None)
+        # Features Priority: Existing Features -> Existing Description -> Existing Title
+        if features_text:
+            return features_text
+        if desc_text:
+            return desc_text
+        if title_text:
+            return title_text
+        return None
+
     return None
 
 
-# Async Helpers
 async def call_openai(
     prompt: str,
     system_prompt: str = REWRITE_SYSTEM_PROMPT,
@@ -224,13 +251,7 @@ async def append_ai_history(
     pass
 
 
-# Request Schemas
 class FieldVersions(RootModel[Dict[str, Union[str, List[str]]]]):
-    """
-    Accepts arbitrary key-value mapping:
-    { "current": "...", "v1": "...", "v2": "..." }
-    """
-
     pass
 
 
@@ -269,9 +290,8 @@ async def regenerate_ai_contents(
     for field, spec in REWRITE_SPECS.items():
         payload_versions = field_requests.get(field)
         if payload_versions is None:
-            continue  # Field not requested
+            continue
 
-        # 1. Determine next available version slot (v1 -> v2 -> v3)
         target_version = None
         for i in range(1, MAX_REWRITE_COUNT + 1):
             v_key = f"v{i}"
@@ -285,8 +305,7 @@ async def regenerate_ai_contents(
                 detail=f"Maximum allowed rewrite count ({MAX_REWRITE_COUNT}) reached for '{field}'.",
             )
 
-        # 2. Derive base context text ('original') for OpenAI prompt
-        # Priority: highest existing 'v' version -> 'current' -> DB Fallback
+        # 1. Look for existing version iterations (v3 -> v2 -> v1)
         original = None
         existing_v_indices = sorted(
             [
@@ -303,16 +322,28 @@ async def regenerate_ai_contents(
                 original = val
                 break
 
+        # 2. Check 'current' field in request body
         if not original:
             original = payload_versions.get("current")
 
+        # 3. Fallback to DB attributes (includes Feature -> Title / Description fallback)
         if not original:
             original = get_fallback_original(product_obj, field)
+
+        # 4. Special Fallback Handling for Features when original is still null/empty
+        if field == "features" and (not original or len(original) == 0):
+            # Fallback to Title
+            original = (
+                getattr(product_obj, "name", None)
+                or getattr(product_obj, "title", None)
+                or getattr(product_obj, "long_description", None)
+                or getattr(product_obj, "short_description", None)
+            )
 
         if not original:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Field '{field}' requires a 'current' value or prior version to generate content from.",
+                detail=f"Could not generate '{field}'. Missing product details in payload and database.",
             )
 
         # Format features list if provided as a List[str]
@@ -323,15 +354,9 @@ async def regenerate_ai_contents(
         versions_column = columns["versions_column"]
         counter_column = columns["counter_column"]
 
-        # Fetch current stored JSONB dictionary from Product model
         db_versions_raw = getattr(product_obj, versions_column, None)
+        db_versions = dict(db_versions_raw) if isinstance(db_versions_raw, dict) else {}
 
-        if isinstance(db_versions_raw, dict):
-            db_versions = dict(db_versions_raw)
-        else:
-            db_versions = {}
-
-        # Cache check: return existing if already saved in DB
         if target_version in db_versions:
             result[field] = {
                 "version": target_version,
@@ -340,7 +365,6 @@ async def regenerate_ai_contents(
             }
             continue
 
-        # Generate rewrite via OpenAI
         prompt = spec["prompt"].format(
             selected_option=payload.option, original=original
         )
@@ -360,12 +384,10 @@ async def regenerate_ai_contents(
 
         parsed_value = spec["parse"](raw)
 
-        # 3. Append new version to existing dict and mark JSONB column as modified
         db_versions[target_version] = parsed_value
         setattr(product_obj, versions_column, db_versions)
         flag_modified(product_obj, versions_column)
 
-        # Update counter column on the Product table
         current_count = getattr(product_obj, counter_column, 0) or 0
         setattr(product_obj, counter_column, min(current_count + 1, MAX_REWRITE_COUNT))
 
