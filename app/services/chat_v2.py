@@ -13,7 +13,7 @@ Given a product identifier (name / SKU / MPN / UPC / URL), this module:
 
 import json
 import os
-import serpapi
+from serpapi import GoogleSearch
 from typing import AsyncGenerator, Optional
 from datetime import datetime, timedelta
 
@@ -308,30 +308,41 @@ def geo_web_search(query: str) -> str:
         return "Error: SERPAPI_KEY environment variable is missing."
 
     try:
-        # Initialize official SerpApi client
-        client = serpapi.Client(api_key=api_key)
-        results = client.search(
+        search = GoogleSearch(
             {
                 "engine": "google",
                 "q": query,
                 "num": 5,
                 "hl": "en",
                 "gl": "us",
+                "api_key": api_key,
             }
         )
+        results = search.get_dict()
+
+        if "error" in results:
+            print(
+                "geo_web_search: SerpApi returned error for query=%r: %s",
+                query,
+                results["error"],
+            )
+            return f"SerpApi Search Failed: {results['error']}"
 
         organic_results = results.get("organic_results", [])
         if not organic_results:
+            print(
+                "geo_web_search: no organic_results for query=%r, raw keys=%s",
+                query,
+                list(results.keys()),
+            )
             return f"No organic web results discovered for query: '{query}'."
 
         formatted_output = []
         for index, item in enumerate(organic_results, start=1):
             title = item.get("title", "")
-            # Verified canonical URL from Google Search
             link = item.get("link", "")
             snippet = item.get("snippet", "")
 
-            # Extract pricing from rich snippets if available
             rich_extensions = (
                 item.get("rich_snippet", {})
                 .get("top", {})
@@ -350,6 +361,7 @@ def geo_web_search(query: str) -> str:
         return "\n".join(formatted_output)
 
     except Exception as err:
+        print("geo_web_search: SerpApi call failed for query=%r", query)
         return f"SerpApi Search Failed: {str(err)}"
 
 
@@ -554,7 +566,20 @@ async def _create_new_product(
 
 
 def _build_chat_model(model_name: str):
-    """Instantiate the right LangChain chat model for a given LLMModels value."""
+    """Instantiate the right LangChain chat model for a given LLMModels value,
+    bound to the GEO tools so the model can actually call them."""
+    if model_name == "GPT":
+        base = ChatOpenAI(model="gpt-5-nano", temperature=0)
+    elif model_name == "GEMINI":
+        base = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    else:
+        base = ChatAnthropic(model="claude-haiku-4-5", temperature=0)
+    return base.bind_tools(GEO_TOOLS)
+
+
+def _build_chat_model_no_tools(model_name: str):
+    """Same as _build_chat_model but without tools bound - used for the final
+    structured-output pass after the tool-calling loop is done."""
     if model_name == "GPT":
         return ChatOpenAI(model="gpt-5-nano", temperature=0)
     if model_name == "GEMINI":
@@ -563,30 +588,81 @@ def _build_chat_model(model_name: str):
 
 
 async def _run_single_model_audit(
-    model_name: str, user_prompt: str, search_keyword: str
+    model_name: str,
+    user_prompt: str,
+    search_keyword: str,
+    max_tool_iterations: int = 5,
 ) -> Optional[UnifiedGEOResponse]:
+    """
+    Runs a real tool-calling loop: the model decides when/what to search for
+    via geo_web_search / scrape_product_metadata, we execute those calls and
+    feed the results back, and only once the model stops requesting tools do
+    we ask for the final structured UnifiedGEOResponse.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
-    # 1. Fetch live organic search data using SerpApi tool
-    live_search_data = geo_web_search.invoke({"query": search_keyword})
+    tools_by_name = {t.name: t for t in GEO_TOOLS}
 
-    # 2. Inject live verified links directly into the user prompt
-    augmented_prompt = f"""{user_prompt}
+    seed_prompt = f"""{user_prompt}
 
-VERIFIED SERPAPI LIVE SEARCH RESULTS:
-{live_search_data}
+Start by searching for: "{search_keyword}"
+Use the geo_web_search and scrape_product_metadata tools as needed to find
+real, verified competitor URLs, pricing, and product metadata before you
+finalize your analysis. Do not stop after a single search if more queries
+would materially improve the competitor/citation data.
 
 CRITICAL URL CONSTRAINT:
-When populating 'competitor_products' or 'citing_sources', you MUST ONLY copy exact URLs from the 'Verified URL' fields above.
-NEVER fabricate, edit, or invent URLs. If a URL is not present in the search results above, leave 'product_url' as an empty string "".
+Only use exact URLs returned by tool calls. Never fabricate, edit, or invent
+URLs. If no verified URL is available, leave 'product_url' as an empty string "".
 """
 
-    # 3. Request structured extraction from the LLM
-    llm = _build_chat_model(model_name)
-    structured_llm = llm.with_structured_output(UnifiedGEOResponse)
+    messages = [
+        SystemMessage(content=GEO_SYSTEM_PROMPT),
+        HumanMessage(content=seed_prompt),
+    ]
 
-    return await structured_llm.ainvoke(
-        [("system", GEO_SYSTEM_PROMPT), ("human", augmented_prompt)]
+    llm = _build_chat_model(model_name)
+
+    # --- Tool-calling loop ---
+    for _ in range(max_tool_iterations):
+        ai_message = await llm.ainvoke(messages)
+        messages.append(ai_message)
+
+        tool_calls = getattr(ai_message, "tool_calls", None) or []
+        if not tool_calls:
+            break
+
+        for call in tool_calls:
+            tool_fn = tools_by_name.get(call["name"])
+            if tool_fn is None:
+                tool_result = f"Error: unknown tool '{call['name']}'"
+            else:
+                try:
+                    tool_result = tool_fn.invoke(call["args"])
+                except Exception as tool_err:
+                    tool_result = f"Tool '{call['name']}' failed: {tool_err}"
+
+            messages.append(
+                ToolMessage(content=str(tool_result), tool_call_id=call["id"])
+            )
+    else:
+        # Hit max_tool_iterations without the model stopping on its own -
+        # force it to wrap up on the next call by not giving it tools again.
+        pass
+
+    # --- Final structured extraction pass, using the full tool-augmented conversation ---
+    structured_llm = _build_chat_model_no_tools(model_name).with_structured_output(
+        UnifiedGEOResponse
     )
+    messages.append(
+        HumanMessage(
+            content=(
+                "Based on everything above, produce the final UnifiedGEOResponse "
+                "JSON now. Use only URLs that appeared in tool results."
+            )
+        )
+    )
+    return await structured_llm.ainvoke(messages)
 
 
 # ======================================================================
