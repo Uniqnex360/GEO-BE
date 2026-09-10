@@ -41,7 +41,7 @@ def create_refresh_token(data: dict) -> str:
     payload = data.copy()
 
     payload["type"] = "refresh"
-    payload["exp"] = datetime.utcnow() + timedelta(days=7)  # refresh token longer life
+    payload["exp"] = datetime.utcnow() + timedelta(days=settings.ACCESS_TOKEN_EXPIRE_MINUTES + 7)  # refresh token longer life
     payload["is_super_admin"] = data.get("is_super_admin", False)
     payload["tenant_id"] = data.get("tenant_id")
 

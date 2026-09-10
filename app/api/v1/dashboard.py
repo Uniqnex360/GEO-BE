@@ -1,4 +1,3 @@
-
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import (
     APIRouter,
@@ -14,10 +13,11 @@ from app.services import TenantDashboardService
 router = APIRouter()
 
 
-
 @router.get("/")
 async def meta_brand_list(
     tenant_id: int = Query(None),
+    startDate: str = Query(None),
+    endDate: str = Query(None),
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(validate_jwt_token),
 ):
@@ -30,6 +30,8 @@ async def meta_brand_list(
             db=db,
             user=user,
             tenant_id=tenant_id,
+            start_date=startDate,
+            end_date=endDate,
         )
         return brands
     except Exception as e:

@@ -2,7 +2,7 @@ import json
 import statistics
 
 from typing import Dict, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +25,8 @@ class TenantDashboardService:
         db: AsyncSession,
         tenant_id: int,
         user: dict,
+        start_date: str | None,
+        end_date: str | None,
     ) -> Dict[str, Any]:
         """
         Calculates and returns ALL TIME dashboard metrics for a specific tenant.
@@ -36,6 +38,60 @@ class TenantDashboardService:
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied: You do not have permissions for this tenant's data.",
             )
+
+        # ------------------------------------------------------------------
+        # 1. Date Filter Preparation
+        # ------------------------------------------------------------------
+        date_filters = [
+            Product.tenant_id == tenant_id,
+            Product.is_deleted.is_(False),
+        ]
+
+        if start_date:
+            try:
+                start_dt = datetime.fromisoformat(start_date)
+
+                # If only a date is provided, start from 00:00:00
+                if start_dt.tzinfo is None:
+                    start_dt = start_dt.replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    )
+
+                date_filters.append(ChatSearchQuery.created_at >= start_dt)
+
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid start_date format. Use YYYY-MM-DD or ISO datetime.",
+                )
+
+        if end_date:
+            try:
+                end_dt = datetime.fromisoformat(end_date)
+
+                # If only a date is provided, include the ENTIRE end date.
+                # Example:
+                # end_date = 2026-09-10
+                # becomes < 2026-09-11 00:00:00
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(
+                        hour=0,
+                        minute=0,
+                        second=0,
+                        microsecond=0,
+                    )
+                    end_dt = end_dt + timedelta(days=1)
+                else:
+                    # For a full ISO datetime, use it as the exact upper bound.
+                    pass
+
+                date_filters.append(ChatSearchQuery.created_at < end_dt)
+
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid end_date format. Use YYYY-MM-DD or ISO datetime.",
+                )
 
         # ------------------------------------------------------------------
         # 1. Optimized 4-Table Join Query Execution
@@ -65,7 +121,7 @@ class TenantDashboardService:
                 (ChatGEOAuditRecord.tenant_id == Product.tenant_id)
                 & (ChatGEOAuditRecord.model_used == cast(Chat.model_choice, String)),
             )
-            .where(Product.tenant_id == tenant_id, Product.is_deleted.is_(False))
+            .where(*date_filters)
         )
 
         query_result = await db.execute(dashboard_query)
@@ -101,10 +157,10 @@ class TenantDashboardService:
         total_successful_audits = set()
 
         # ------------------------------------------------------------------
-        # 2. All Time Data Collection (No Date Filtering/Segmentation)
+        # 3. Filtered Data Collection
         # ------------------------------------------------------------------
         current_period_rows = []
-        previous_period_rows = []  # Remains empty for All-Time mode
+        previous_period_rows = []
 
         for q_row, chat_row, product_row, geo_row in rows:
             unique_product_ids.add(product_row.id)
@@ -115,8 +171,9 @@ class TenantDashboardService:
             else:
                 unique_countries.add("US")
 
-            # Push all rows directly into current period for All-Time calculation
-            current_period_rows.append((q_row, chat_row, product_row, geo_row))
+            current_period_rows.append(
+                (q_row, chat_row, product_row, geo_row)
+            )
 
         # ------------------------------------------------------------------
         # 3. DRY Metric Aggregator Engine
