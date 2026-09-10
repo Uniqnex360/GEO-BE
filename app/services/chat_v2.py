@@ -112,6 +112,13 @@ class PlatformBreakdownMetrics(BaseModel):
 class CompetitorMetrics(BaseModel):
     competitor_name: str = Field(description="Name of the competitor platform found.")
     product_title: str = Field(description="Title string used by this competitor.")
+    product_url: str = Field(
+        default="",
+        description=(
+            "Verified competitor product page URL resolved directly from SerpApi. "
+            "Never fabricate or construct this URL."
+        ),
+    )
     no_of_faq: int = Field(description="Count of FAQs on their page.")
     no_of_reviews: int = Field(description="Count of reviews/ratings on their page.")
     keywords_used: list[str] = Field(
@@ -363,6 +370,207 @@ def geo_web_search(query: str) -> str:
     except Exception as err:
         print("geo_web_search: SerpApi call failed for query=%r", query)
         return f"SerpApi Search Failed: {str(err)}"
+
+
+def _resolve_competitor_product_url(
+    competitor_name: str,
+    product_name: str,
+) -> str:
+    """
+    Resolve a real competitor product page URL directly from SerpApi.
+
+    The LLM identifies the competitor/product, but it is NOT trusted to
+    generate the URL. Only the URL returned by SerpApi is persisted.
+    """
+    api_key = os.getenv("SERPAPI_KEY") or os.getenv("SERPAPI_API_KEY")
+
+    if not api_key or not competitor_name or not product_name:
+        return ""
+
+    competitor_name = competitor_name.strip()
+    product_name = product_name.strip()
+
+    if not competitor_name or not product_name:
+        return ""
+
+    queries = [
+        f'"{competitor_name}" "{product_name}" product',
+        f'"{competitor_name}" "{product_name}" buy',
+        f"{competitor_name} {product_name}",
+    ]
+
+    try:
+        for search_query in queries:
+            search = GoogleSearch(
+                {
+                    "engine": "google",
+                    "q": search_query,
+                    "num": 10,
+                    "hl": "en",
+                    "gl": "uk",
+                    "api_key": api_key,
+                }
+            )
+
+            results = search.get_dict()
+
+            if "error" in results:
+                print(
+                    "SerpApi competitor URL lookup failed for %r: %s",
+                    search_query,
+                    results["error"],
+                )
+                continue
+
+            organic_results = results.get("organic_results", [])
+            if not organic_results:
+                continue
+
+            competitor_lower = competitor_name.lower()
+            product_words = [
+                word.lower() for word in product_name.split() if len(word.strip()) >= 3
+            ]
+
+            # Prefer a result whose title/snippet strongly matches the
+            # competitor and product. This avoids blindly taking result #1.
+            best_link = ""
+            best_score = 0
+
+            for result in organic_results:
+                link = (result.get("link") or "").strip()
+                title = (result.get("title") or "").strip().lower()
+                snippet = (result.get("snippet") or "").strip().lower()
+                text = f"{title} {snippet}"
+
+                if not link:
+                    continue
+
+                score = 0
+
+                if competitor_lower in text:
+                    score += 5
+
+                matched_words = sum(1 for word in product_words if word in text)
+                score += min(matched_words, 8)
+
+                # Product pages normally have the product name in the title.
+                if title and any(word in title for word in product_words):
+                    score += 3
+
+                if score > best_score:
+                    best_score = score
+                    best_link = link
+
+            if best_link and best_score >= 5:
+                print(
+                    "Resolved competitor URL: %s / %s -> %s",
+                    competitor_name,
+                    product_name,
+                    best_link,
+                )
+                return best_link
+
+            # SerpApi itself is still the source of truth. If no strong
+            # textual match exists, use the first organic URL as a fallback.
+            for result in organic_results:
+                link = (result.get("link") or "").strip()
+                if link:
+                    print(
+                        "Fallback competitor URL: %s / %s -> %s",
+                        competitor_name,
+                        product_name,
+                        link,
+                    )
+                    return link
+
+        return ""
+
+    except Exception as exc:
+        print(
+            "SerpApi competitor URL resolver failed: competitor=%r product=%r error=%s",
+            competitor_name,
+            product_name,
+            exc,
+        )
+        return ""
+
+
+def _resolve_all_competitor_product_urls(
+    structured: UnifiedGEOResponse,
+) -> None:
+    """
+    Resolve competitor URLs once per unique competitor/product pair.
+
+    URLs are written into BOTH:
+      1. queries_executed[].competitor_products[].product_url
+      2. competitor_analytics[].product_url
+
+    This makes the URL available to whichever API response mapper is already
+    being used by the frontend.
+    """
+    resolved_urls: dict[tuple[str, str], str] = {}
+
+    def resolve(competitor_name: str, product_name: str) -> str:
+        key = (
+            (competitor_name or "").strip().lower(),
+            (product_name or "").strip().lower(),
+        )
+
+        if not key[0] or not key[1]:
+            return ""
+
+        if key not in resolved_urls:
+            resolved_urls[key] = _resolve_competitor_product_url(
+                competitor_name=competitor_name,
+                product_name=product_name,
+            )
+
+        return resolved_urls[key]
+
+    # --------------------------------------------------------------
+    # 1. Resolve URLs for query-level competitor product references.
+    # --------------------------------------------------------------
+    for query in structured.queries_executed:
+        for competitor in query.competitor_products:
+            if not competitor.product_url:
+                competitor.product_url = resolve(
+                    competitor.competitor_name,
+                    competitor.product_name,
+                )
+            else:
+                # Always replace an LLM-generated URL with the SerpApi URL.
+                competitor.product_url = resolve(
+                    competitor.competitor_name,
+                    competitor.product_name,
+                )
+
+    # --------------------------------------------------------------
+    # 2. Attach the same verified URL to competitor_analytics.
+    # --------------------------------------------------------------
+    for competitor in structured.competitor_analytics:
+        competitor.product_url = resolve(
+            competitor.competitor_name,
+            competitor.product_title,
+        )
+
+    # --------------------------------------------------------------
+    # 3. If competitor_analytics has a name but the query-level data has a
+    #    better product name, use that URL as a fallback.
+    # --------------------------------------------------------------
+    analytics_by_name: dict[str, str] = {}
+
+    for query in structured.queries_executed:
+        for competitor in query.competitor_products:
+            name_key = competitor.competitor_name.strip().lower()
+            if name_key and competitor.product_url:
+                analytics_by_name.setdefault(name_key, competitor.product_url)
+
+    for competitor in structured.competitor_analytics:
+        if not competitor.product_url:
+            competitor.product_url = analytics_by_name.get(
+                competitor.competitor_name.strip().lower(),
+                "",
+            )
 
 
 @tool
@@ -829,6 +1037,12 @@ async def run_geo_audit_stream(
 
                 if structured:
                     structured.model_used = model_name
+
+                    # IMPORTANT: The LLM may identify competitor products,
+                    # but the product URL is always resolved by SerpApi.
+                    # This prevents fabricated/404 competitor URLs.
+                    _resolve_all_competitor_product_urls(structured)
+
                     if structured.product_details:
                         product_record.no_of_faqs = structured.product_details.faqs
                         product_record.no_of_reviews = (
