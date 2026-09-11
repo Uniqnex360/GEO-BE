@@ -1051,81 +1051,49 @@ class ProductService:
             }
 
         elif tab == "citation":
-            source_stats: Dict[str, Dict[str, Any]] = {}
+            ui_citations = []
 
-            for q in all_queries:
-                citing = q.citing_sources or []
-                competitors = q.competitors_mentioned or []
+            # Get citation data directly from Chat.citations JSONB
+            for chat in all_chats:
+                chat_citations = getattr(chat, "citations", None)
 
-                # Get source authority from the query if available
-                auth = getattr(q, "source_authority", None)
+                if not chat_citations:
+                    continue
 
-                for source in citing:
-                    # 1. Normalize/Clean source to extract domain FIRST
-                    if "://" not in source:
-                        source = "http://" + source
-
-                    parsed = urlparse(source)
-                    clean_source = parsed.netloc.lower()
-                    if clean_source.startswith("www."):
-                        clean_source = clean_source[4:]
-
-                    if not clean_source:
+                # JSONB should normally already be a Python list.
+                # Handle string just in case.
+                if isinstance(chat_citations, str):
+                    try:
+                        chat_citations = json.loads(chat_citations)
+                    except (json.JSONDecodeError, TypeError):
                         continue
 
-                    # 2. Aggregate stats under the cleaned domain name
-                    if clean_source not in source_stats:
-                        source_stats[clean_source] = {
-                            "you_count": 0,
-                            "competitor_count": 0,
-                            "authorities": [],
-                        }
+                if not isinstance(chat_citations, list):
+                    continue
 
-                    source_stats[clean_source]["you_count"] += 1
-                    source_stats[clean_source]["competitor_count"] += len(competitors)
+                # Get model directly from Chat
+                model_choice = getattr(chat, "model_choice", None)
 
-                    if auth is not None:
-                        source_stats[clean_source]["authorities"].append(auth)
+                if model_choice:
+                    model_choice = str(model_choice).upper()
 
-            ui_citations = []
-            for source, stats in source_stats.items():
-                you_count = stats["you_count"]
-                comp_count = stats["competitor_count"]
-                gap_count = you_count - comp_count
+                # Read every citation stored in Chat.citations
+                for citation in chat_citations:
+                    if not isinstance(citation, dict):
+                        continue
 
-                # 3. Calculate authority score per aggregated domain
-                if stats["authorities"]:
-                    # Average the authority across occurrences and scale to 0-10
-                    avg_auth = sum(stats["authorities"]) / len(stats["authorities"])
-                    calculated_authority = round(avg_auth / 10.0, 1)
-                else:
-                    calculated_authority = min(10.0, round(5.0 + (you_count * 0.5), 1))
-
-                ui_citations.append(
-                    {
-                        "source": source,
-                        "authority": calculated_authority,  # Scale: 0.0 - 10.0
-                        "you": you_count,
-                        "competitor": comp_count,
-                        "gap": gap_count,
-                    }
-                )
-
-            response_payload["tabData"] = {
-                "citations": (
-                    ui_citations
-                    if ui_citations
-                    else [
+                    ui_citations.append(
                         {
-                            "source": "No Citations Tracked",
-                            "authority": 0.0,
-                            "you": 0,
-                            "competitor": 0,
-                            "gap": 0,
+                            "model": model_choice,
+                            "source": citation.get("source", ""),
+                            "url": citation.get("url", ""),
+                            "quote": citation.get("quote", ""),
+                            "trust": citation.get("trust", 0),
                         }
-                    ]
-                )
-            }
+                    )
+
+            # KEEP THE SAME RESPONSE STRUCTURE
+            response_payload["tabData"] = {"citations": ui_citations}
 
         elif tab == "recommendations":
             ui_actions = []
