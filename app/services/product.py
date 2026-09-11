@@ -758,34 +758,124 @@ class ProductService:
         elif tab == "competitor":
             competitors_set = set()
 
+            # ==============================================================
+            # 1. Collect competitor names
+            # ==============================================================
+
             if (
                 hasattr(product, "competitor_analytics")
                 and product.competitor_analytics
             ):
                 if isinstance(product.competitor_analytics, list):
                     for comp_entry in product.competitor_analytics:
-                        if (
-                            isinstance(comp_entry, dict)
-                            and "competitor_name" in comp_entry
+                        if isinstance(comp_entry, dict) and comp_entry.get(
+                            "competitor_name"
                         ):
                             competitors_set.add(comp_entry["competitor_name"])
 
+            # Fallback: get competitor names from search queries
             if not competitors_set:
                 for q in all_queries:
                     if q.competitors_mentioned:
                         competitors_set.update(q.competitors_mentioned)
 
+            # ==============================================================
+            # 2. Build competitor -> product URL mapping
+            #
+            # The URL is stored inside:
+            #
+            # q.competitor_products = [
+            #     {
+            #         "competitor_name": "...",
+            #         "product_name": "...",
+            #         "product_url": "...",
+            #         "price": "..."
+            #     }
+            # ]
+            # ==============================================================
+
+            competitor_urls = {}
+
+            for q in all_queries:
+                competitor_products = getattr(
+                    q,
+                    "competitor_products",
+                    None,
+                )
+
+                if not competitor_products:
+                    continue
+
+                # Depending on SQLAlchemy/JSON configuration this may
+                # already be a list, or it may occasionally be a JSON string.
+                if isinstance(competitor_products, str):
+                    try:
+                        competitor_products = json.loads(competitor_products)
+                    except (json.JSONDecodeError, TypeError):
+                        competitor_products = []
+
+                if not isinstance(competitor_products, list):
+                    continue
+
+                for competitor_product in competitor_products:
+                    if not isinstance(competitor_product, dict):
+                        continue
+
+                    competitor_name = (
+                        competitor_product.get("competitor_name") or ""
+                    ).strip()
+
+                    product_url = (competitor_product.get("product_url") or "").strip()
+
+                    if not competitor_name or not product_url:
+                        continue
+
+                    # Only save a real URL.
+                    if not (
+                        product_url.startswith("http://")
+                        or product_url.startswith("https://")
+                    ):
+                        continue
+
+                    # Case-insensitive key so:
+                    # "John Lewis" and "john lewis"
+                    # are treated as the same competitor.
+                    competitor_key = competitor_name.lower()
+
+                    # Keep the first valid URL we found.
+                    if competitor_key not in competitor_urls:
+                        competitor_urls[competitor_key] = product_url
+
+            # ==============================================================
+            # 3. Build UI competitors
+            # ==============================================================
+
             ui_competitors = []
+
             for comp in list(competitors_set):
+                competitor_key = comp.strip().lower()
+
+                competitor_product_url = competitor_urls.get(
+                    competitor_key,
+                    "",
+                )
+
                 ui_competitors.append(
                     {
                         "name": comp,
+                        # IMPORTANT:
+                        # This is the SerpApi-resolved competitor product URL.
+                        "product_url": competitor_product_url,
                         "chatGPT": min(
                             10.0,
                             max(
                                 0.0,
                                 round(
-                                    engine_visibility_summary.get("chatgpt", 0.0) * 0.9,
+                                    engine_visibility_summary.get(
+                                        "chatgpt",
+                                        0.0,
+                                    )
+                                    * 0.9,
                                     1,
                                 ),
                             ),
@@ -795,7 +885,11 @@ class ProductService:
                             max(
                                 0.0,
                                 round(
-                                    engine_visibility_summary.get("gemini", 0.0) * 1.1,
+                                    engine_visibility_summary.get(
+                                        "gemini",
+                                        0.0,
+                                    )
+                                    * 1.1,
                                     1,
                                 ),
                             ),
@@ -805,32 +899,64 @@ class ProductService:
                             max(
                                 0.0,
                                 round(
-                                    engine_visibility_summary.get("claude", 0.0) * 0.95,
+                                    engine_visibility_summary.get(
+                                        "claude",
+                                        0.0,
+                                    )
+                                    * 0.95,
                                     1,
                                 ),
                             ),
                         ),
                         "avg": min(
-                            10.0, max(0.0, round(ai_visibility_score * 0.95, 1))
+                            10.0,
+                            max(
+                                0.0,
+                                round(
+                                    ai_visibility_score * 0.95,
+                                    1,
+                                ),
+                            ),
                         ),
                         "active": False,
                     }
                 )
 
+            # ==============================================================
+            # 4. Add the user's own product
+            # ==============================================================
+
             ui_competitors.insert(
                 0,
                 {
                     "name": f"{product.name} (You)",
-                    "chatGPT": engine_visibility_summary.get("chatgpt", 0.0),
-                    "gemini": engine_visibility_summary.get("gemini", 0.0),
-                    "claude": engine_visibility_summary.get("claude", 0.0),
+                    # User's own product URL.
+                    #
+                    # This uses the actual Product.product_url from DB.
+                    "product_url": (getattr(product, "product_url", None) or ""),
+                    "chatGPT": engine_visibility_summary.get(
+                        "chatgpt",
+                        0.0,
+                    ),
+                    "gemini": engine_visibility_summary.get(
+                        "gemini",
+                        0.0,
+                    ),
+                    "claude": engine_visibility_summary.get(
+                        "claude",
+                        0.0,
+                    ),
                     "avg": ai_visibility_score,
                     "active": True,
                 },
             )
 
-            # Content gaps scaled to 0-10 format
+            # ==============================================================
+            # 5. Content gaps scaled to 0-10 format
+            # ==============================================================
+
             schema_gaps = []
+
             if not product.sku:
                 schema_gaps.append(
                     {
@@ -841,6 +967,7 @@ class ProductService:
                         "gain": "+1.5 points",
                     }
                 )
+
             if not product.mpn:
                 schema_gaps.append(
                     {
@@ -851,6 +978,7 @@ class ProductService:
                         "gain": "+0.8 points",
                     }
                 )
+
             if total_reviews < 50:
                 schema_gaps.append(
                     {
@@ -873,112 +1001,99 @@ class ProductService:
                     }
                 )
 
-            # Radar data scaled to 0-10 format
+            # ==============================================================
+            # 6. Radar data
+            # ==============================================================
+
             response_payload["tabData"] = {
                 "competitors": ui_competitors,
                 "radarData": [
                     {
                         "subject": "Visibility Index",
                         "You": ai_visibility_score,
-                        "Competitor": round(ai_visibility_score * 0.9, 1),
+                        "Competitor": round(
+                            ai_visibility_score * 0.9,
+                            1,
+                        ),
                     },
                     {
                         "subject": "Citation Share",
-                        "You": min(10.0, round(mention_rate, 1)),
+                        "You": min(
+                            10.0,
+                            round(mention_rate, 1),
+                        ),
                         "Competitor": 6.5,
                     },
                     {
                         "subject": "Reviews Count",
-                        "You": min(10.0, round(total_reviews / 10, 1)),
+                        "You": min(
+                            10.0,
+                            round(total_reviews / 10, 1),
+                        ),
                         "Competitor": 7.5,
                     },
                     {
                         "subject": "FAQ Coverage",
-                        "You": min(10.0, round((total_faqs * 5) / 10, 1)),
+                        "You": min(
+                            10.0,
+                            round((total_faqs * 5) / 10, 1),
+                        ),
                         "Competitor": 8.0,
                     },
                 ],
-                "radarSummaryText": f"Currently outperforming {len(competitors_set)} competitor tracking profiles.",
-                "priorityCountText": f"{len(schema_gaps)} Content Gaps Identified",
+                "radarSummaryText": (
+                    f"Currently outperforming "
+                    f"{len(competitors_set)} "
+                    f"competitor tracking profiles."
+                ),
+                "priorityCountText": (f"{len(schema_gaps)} Content Gaps Identified"),
                 "gaps": schema_gaps,
             }
 
         elif tab == "citation":
-            source_stats: Dict[str, Dict[str, Any]] = {}
+            ui_citations = []
 
-            for q in all_queries:
-                citing = q.citing_sources or []
-                competitors = q.competitors_mentioned or []
+            # Get citation data directly from Chat.citations JSONB
+            for chat in all_chats:
+                chat_citations = getattr(chat, "citations", None)
 
-                # Get source authority from the query if available
-                auth = getattr(q, "source_authority", None)
+                if not chat_citations:
+                    continue
 
-                for source in citing:
-                    # 1. Normalize/Clean source to extract domain FIRST
-                    if "://" not in source:
-                        source = "http://" + source
-
-                    parsed = urlparse(source)
-                    clean_source = parsed.netloc.lower()
-                    if clean_source.startswith("www."):
-                        clean_source = clean_source[4:]
-
-                    if not clean_source:
+                # JSONB should normally already be a Python list.
+                # Handle string just in case.
+                if isinstance(chat_citations, str):
+                    try:
+                        chat_citations = json.loads(chat_citations)
+                    except (json.JSONDecodeError, TypeError):
                         continue
 
-                    # 2. Aggregate stats under the cleaned domain name
-                    if clean_source not in source_stats:
-                        source_stats[clean_source] = {
-                            "you_count": 0,
-                            "competitor_count": 0,
-                            "authorities": [],
-                        }
+                if not isinstance(chat_citations, list):
+                    continue
 
-                    source_stats[clean_source]["you_count"] += 1
-                    source_stats[clean_source]["competitor_count"] += len(competitors)
+                # Get model directly from Chat
+                model_choice = getattr(chat, "model_choice", None)
 
-                    if auth is not None:
-                        source_stats[clean_source]["authorities"].append(auth)
+                if model_choice:
+                    model_choice = str(model_choice).upper()
 
-            ui_citations = []
-            for source, stats in source_stats.items():
-                you_count = stats["you_count"]
-                comp_count = stats["competitor_count"]
-                gap_count = you_count - comp_count
+                # Read every citation stored in Chat.citations
+                for citation in chat_citations:
+                    if not isinstance(citation, dict):
+                        continue
 
-                # 3. Calculate authority score per aggregated domain
-                if stats["authorities"]:
-                    # Average the authority across occurrences and scale to 0-10
-                    avg_auth = sum(stats["authorities"]) / len(stats["authorities"])
-                    calculated_authority = round(avg_auth / 10.0, 1)
-                else:
-                    calculated_authority = min(10.0, round(5.0 + (you_count * 0.5), 1))
-
-                ui_citations.append(
-                    {
-                        "source": source,
-                        "authority": calculated_authority,  # Scale: 0.0 - 10.0
-                        "you": you_count,
-                        "competitor": comp_count,
-                        "gap": gap_count,
-                    }
-                )
-
-            response_payload["tabData"] = {
-                "citations": (
-                    ui_citations
-                    if ui_citations
-                    else [
+                    ui_citations.append(
                         {
-                            "source": "No Citations Tracked",
-                            "authority": 0.0,
-                            "you": 0,
-                            "competitor": 0,
-                            "gap": 0,
+                            "model": model_choice,
+                            "source": citation.get("source", ""),
+                            "url": citation.get("url", ""),
+                            "quote": citation.get("quote", ""),
+                            "trust": citation.get("trust", 0),
                         }
-                    ]
-                )
-            }
+                    )
+
+            # KEEP THE SAME RESPONSE STRUCTURE
+            response_payload["tabData"] = {"citations": ui_citations}
 
         elif tab == "recommendations":
             ui_actions = []

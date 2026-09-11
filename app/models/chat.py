@@ -33,6 +33,29 @@ class Chat(BaseModel):
         JSONB, nullable=True, default=list
     )
 
+    citations: Mapped[List[Dict[str, Any]]] = mapped_column(
+        JSONB, nullable=True, default=list
+    )
+
+    # NEW
+    input_tokens: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    output_tokens: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    total_tokens: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
     # Outputs captured
     final_optimization_report: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

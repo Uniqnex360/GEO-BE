@@ -1,883 +1,1172 @@
-"""
-GEO (Generative Engine Optimization) audit orchestration.
-
-Given a product identifier (name / SKU / MPN / UPC / URL), this module:
-  1. Looks up an existing product record, or creates one with LLM-enriched
-     baseline metadata if it doesn't exist yet.
-  2. Serves a cached report if a recent audit already exists.
-  3. Otherwise runs the audit through every configured LLM (GPT / Gemini /
-     Claude), persisting a Chat, its ChatSearchQuery rows, and a
-     ChatGEOAuditRecord per model.
-  4. Streams progress as newline-delimited JSON events the whole way through.
-"""
-
-import json
-import os
-from serpapi import GoogleSearch
-from typing import AsyncGenerator, Optional
-from datetime import datetime, timedelta
-
-from pydantic import BaseModel, Field
-
-from sqlalchemy import select, or_
-from sqlalchemy.orm import selectinload
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from langchain.tools import tool
-from langchain_openai import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_anthropic import ChatAnthropic
-
-from app.models.base import LLMModels
-from app.models import Product, Brand, Chat, ChatSearchQuery, ChatGEOAuditRecord
-
-# ======================================================================
-# CONSTANTS
-# ======================================================================
-
-RETENTION_DAYS_THRESHOLD = 7
-
-GEO_SYSTEM_PROMPT = """
-You are a GEO expert. Use tools to analyze visibility parameters and map competitive gaps.
-
-CRITICAL SCHEMA DIRECTION:
-Every dictionary field within the 'product_details' object MUST be structured as a JSON object containing EXACTLY these keys: "value", "score", and "tips".
-Output only valid JSON conforming perfectly to the schema definition.
-
-CRITICAL URL RULES:
-- NEVER invent, guess, or construct product URLs.
-- Only return a product_url if it was explicitly found in a trusted source during the search.
-- The product_url must be the exact canonical product page URL from the retailer or manufacturer's website.
-- Do NOT generate URLs from product names or slugs.
-- If no verified product URL is available, return an empty string "".
-- A 404 URL is worse than an empty URL.
-"""
-
-
-# ======================================================================
-# REQUEST SCHEMA
-# ======================================================================
-
-
-class GEOAuditRequest(BaseModel):
-    """V2 Flexible Request Inputs for multiple source identification types."""
-
-    product_name: Optional[str] = Field(None, description="Name of the target product")
-    product_url: Optional[str] = Field(
-        None, description="Target product landing page URL"
-    )
-    website: Optional[str] = Field(None, description="Brand/corporate target domain")
-    sku: Optional[str] = Field(None, description="Stock Keeping Unit number")
-    mpn: Optional[str] = Field(None, description="Manufacturer Part Number")
-    upc: Optional[str] = Field(None, description="Universal Product Code")
-    country: Optional[str] = Field(None, description="Target geographical focus region")
-    extra_context: Optional[str] = Field(
-        None, description="Additional context parameter text"
-    )
-    model_choice: LLMModels = Field(
-        default=LLMModels.GPT, description="Selected LLM execution engine"
-    )
-
-
-def build_user_instruction_v2(input_data: GEOAuditRequest) -> str:
-    return f"""Analyze the following product payload for optimization:
-Product Name: {input_data.product_name}
-Product URL: {input_data.product_url}
-Website Reference: {input_data.website}
-SKU: {input_data.sku} | MPN: {input_data.mpn} | UPC: {input_data.upc}
-Geographic Target Region: {input_data.country}
-User Request Extra Context: {input_data.extra_context}
-
-Generate relevant domain search queries dynamically based on the input text to extract real metadata metrics.
-"""
-
-
-# ======================================================================
-# OUTPUT SCHEMAS
-# ======================================================================
-
-
-class AssetMetrics(BaseModel):
-    images: bool = Field(default=False, description="True if images are present.")
-    videos: bool = Field(default=False, description="True if videos are present.")
-
-
-class PlatformBreakdownMetrics(BaseModel):
-    google: int = Field(default=0, description="Count for Google platform.")
-    anthropic: int = Field(default=0, description="Count for Anthropic platform.")
-    openai: int = Field(default=0, description="Count for OpenAI search platform.")
-    bing: int = Field(default=0, description="Count for Bing platform.")
-
-
-class CompetitorMetrics(BaseModel):
-    competitor_name: str = Field(description="Name of the competitor platform found.")
-    product_title: str = Field(description="Title string used by this competitor.")
-    no_of_faq: int = Field(description="Count of FAQs on their page.")
-    no_of_reviews: int = Field(description="Count of reviews/ratings on their page.")
-    keywords_used: list[str] = Field(
-        description="Core keywords used by this competitor."
-    )
-    no_of_attributes: int = Field(
-        description="Count of product attributes/specs listed."
-    )
-    assets_present: AssetMetrics = Field(description="Media asset indicators.")
-    no_of_features: int = Field(description="Count of main features listed.")
-    word_count: int = Field(description="Word count of their product description.")
-
-
-class CompetitorProductLink(BaseModel):
-    """A clickable reference to a specific competitor product surfaced during a search query."""
-
-    competitor_name: str = Field(description="Name of the competitor/brand.")
-    product_name: str = Field(description="Name of the competitor's product.")
-    product_url: str = Field(
-        description=(
-            "Exact verified canonical URL of the competitor product page. "
-            "Never fabricate, infer, rewrite, or guess the URL. "
-            "Only use a URL explicitly returned by a trusted search result. "
-            'If unavailable, return "".'
-        )
-    )
-    price: Optional[str] = Field(
-        None,
-        description="Listed price of the competitor product, if found (e.g. '$49.99').",
-    )
-
-
-class GEOAuditField(BaseModel):
-    """Used ONLY for elements undergoing rich copy visibility auditing."""
-
-    value: str = Field(
-        default="", description="The extracted data string or content description."
-    )
-    score: int = Field(
-        default=0, description="The evaluated visibility compliance score."
-    )
-    tips: str = Field(
-        default="",
-        description=(
-            "Concrete, ready-to-paste optimization advice. NEVER stop at naming the problem or telling the reader "
-            "to 'add', 'include', or 'change' something in the abstract - always write out the exact finished "
-            "content that should go in, AND exactly where it goes. Format: '<WHERE (field/section/position)>: "
-            '<WHAT TO DO> -> "<exact copy-pasteable text>"\'. '
-            "Examples of GOOD tips: "
-            "'Description, first sentence: state shipping coverage explicitly -> \"Ships to Germany within 3-5 "
-            "business days.\"'  "
-            "'Product title: replace with this exact title -> \"Bosch GKS 190 Circular Saw - 1400W, 190mm Blade, "
-            "Ships to Ireland\"'  "
-            "'Below the price: add this exact badge text -> \"In Stock - Dispatched within 24 hours\"'  "
-            "If recommending a testimonial, quote the FULL testimonial text verbatim as it should appear, not a "
-            "description of what a testimonial should say. If recommending region-specific content (e.g. a "
-            "location-targeted headline or an FAQ answer), write the complete final text, not just the topic. "
-            "BAD tips (never do this): 'Add an in-stock badge.' / 'Include Irish customer testimonials.' / "
-            "'Highlight that it ships to Ireland.' - these name the fix but give nothing the reader can paste in."
-        ),
-    )
-
-
-class GEOProductDetail(BaseModel):
-    product_name: str = Field(description="Name of the target product.")
-    product_url: str = Field(description="Target product landing page URL.")
-    sku: Optional[str] = Field(None, description="Stock Keeping Unit number.")
-    mpn: Optional[str] = Field(None, description="Manufacturer Part Number.")
-    upc: Optional[str] = Field(None, description="Universal Product Code.")
-    gtin: Optional[str] = Field(None, description="Global Trade Item Number.")
-    ean: Optional[str] = Field(None, description="European Article Number.")
-
-    faqs: int = Field(default=0, description="Count of found target FAQs.")
-    reviews: int = Field(default=0, description="Count of user reviews integrated.")
-    attributes: int = Field(
-        default=0, description="Count of detailed product specifications."
-    )
-    features: int = Field(
-        default=0, description="Count of unique item product features."
-    )
-
-    product_title: GEOAuditField = Field(
-        description="Audit and scoring for visibility title formatting optimization."
-    )
-    description_analysis: GEOAuditField = Field(
-        description="Audit and scoring for description keyword optimization."
-    )
-    keywords: GEOAuditField = Field(
-        description="Audit and scoring for extracted target context search terms."
-    )
-    assets: GEOAuditField = Field(
-        description="Audit and scoring for structural image/video configurations."
-    )
-
-
-class ChatQueryBase(BaseModel):
-    chat_context: str = Field(description="Scope tracking token context identifier.")
-    brand: str = Field(description="Identified target brand.")
-    query: str = Field(description="The generated search engine query executed.")
-    product_found: bool = Field(description="True if target product was discovered.")
-    share_of_voice: float = Field(description="Calculated share of voice percentage.")
-    total_websites_found: int = Field(
-        description="Count of unique reference web sources found."
-    )
-    citation_rank: int = Field(description="Organic ranking position across sources.")
-    platform_breakdown: PlatformBreakdownMetrics = Field(
-        description="Distribution metrics across discovery platforms."
-    )
-    citing_sources: list[str] = Field(description="List of source URLs referenced.")
-    competitors_mentioned: list[str] = Field(
-        description="Competitor platforms or alternative brands found."
-    )
-
-    # NEW: clickable competitor product references for this query.
-    competitor_products: list[CompetitorProductLink] = Field(
-        default_factory=list,
-        description=(
-            "Specific competitor products discovered while researching this query. Each entry MUST include a "
-            "real product_url so the user can click through and view the listing directly."
-        ),
-    )
-
-    optimization_tag: str = Field(
-        description=(
-            "A single-word category representing the primary optimization recommendation. "
-            "Examples: 'title', 'brand', 'attributes','description', 'faq', 'content', 'schema', 'images', "
-            "'reviews', 'pricing', 'specifications', 'comparison', 'keywords', "
-            "'metadata', 'headings', 'internal-links', 'external-links', 'trust', "
-            "'availability',  'video', 'performance', 'citations'."
-        )
-    )
-
-    # UPDATED description: now demands finished, pasteable content + exact placement,
-    optimization_tips_for_better_result: str = Field(
-        description=(
-            "Strategic GEO suggestion explaining WHERE and WHAT to optimize. "
-            "Identifies the target field/section and the high-level fix required "
-            "(e.g., adjusting price positioning, adding local relevance, tweaking title structure, "
-            "or recommending a new FAQ section if none exists on the product page). "
-            "BAD: Do not supply the finished copy here—keep this focused purely on the strategy/location."
-        )
-    )
-
-    copy_pasteable_solution: str = Field(
-        description=(
-            "The exact, finished, copy-pasteable text, example title, or full FAQ section implementing the suggestion. "
-            "Never stop at naming the fix—always supply the literal text ready for deployment. "
-            "IF THE PRODUCT PAGE LACKS AN FAQ SECTION: Create and supply a complete, production-ready Q&A block here "
-            "addressing common consumer query gaps. "
-            "Examples: 'For a lower-cost option, see the Pilot G2 at $2.50.' or "
-            "'Q: Is this pen refillable? A: Yes, it accepts standard G2 gel refills.'"
-        )
-    )
-
-
-class BrandAnalysis(BaseModel):
-    brand_name: str = Field(description="Extracted primary brand.")
-
-
-class UnifiedGEOResponse(BaseModel):
-    model_used: str = Field(
-        description="The running LLM configuration model name identifier."
-    )
-    brand: BrandAnalysis = Field(description="Target brand information.")
-    product_details: GEOProductDetail = Field(
-        description="Granular field audit and scoring metrics."
-    )
-    competitor_analytics: list[CompetitorMetrics] = Field(
-        description="Competitor baseline data blocks."
-    )
-    queries_executed: list[ChatQueryBase] = Field(
-        description="Search trace matrix execution logs."
-    )
-    final_optimized_tips_summary: str = Field(
-        description=(
-            "Summarized checklist of the highest-impact fixes across product_details and queries_executed. Each "
-            "checklist line must follow the same rule as the individual tips fields: name where it goes and give "
-            "the exact finished content to paste in, not just the action. E.g. '- In Stock badge (below price): "
-            "\"In Stock - Dispatched within 24 hours\"' rather than '- Add an in-stock badge.'"
-        )
-    )
-
-
-# ======================================================================
-# TOOLS
-# ======================================================================
-
-
-@tool
-def geo_web_search(query: str) -> str:
-    """Searches the web via SerpApi for live product metadata, verified competitor URLs, pricing, and organic search listings."""
-    api_key = os.getenv("SERPAPI_KEY") or os.getenv("SERPAPI_API_KEY")
-    if not api_key:
-        return "Error: SERPAPI_KEY environment variable is missing."
-
-    try:
-        search = GoogleSearch(
-            {
-                "engine": "google",
-                "q": query,
-                "num": 5,
-                "hl": "en",
-                "gl": "us",
-                "api_key": api_key,
-            }
-        )
-        results = search.get_dict()
-
-        if "error" in results:
-            print(
-                "geo_web_search: SerpApi returned error for query=%r: %s",
-                query,
-                results["error"],
-            )
-            return f"SerpApi Search Failed: {results['error']}"
-
-        organic_results = results.get("organic_results", [])
-        if not organic_results:
-            print(
-                "geo_web_search: no organic_results for query=%r, raw keys=%s",
-                query,
-                list(results.keys()),
-            )
-            return f"No organic web results discovered for query: '{query}'."
-
-        formatted_output = []
-        for index, item in enumerate(organic_results, start=1):
-            title = item.get("title", "")
-            link = item.get("link", "")
-            snippet = item.get("snippet", "")
-
-            rich_extensions = (
-                item.get("rich_snippet", {})
-                .get("top", {})
-                .get("detected_extensions", {})
-            )
-            price = rich_extensions.get("price") or item.get("price", "N/A")
-
-            formatted_output.append(
-                f"Result #{index}:\n"
-                f"- Title: {title}\n"
-                f"- Verified URL: {link}\n"
-                f"- Price: {price}\n"
-                f"- Summary: {snippet}\n"
-            )
-
-        return "\n".join(formatted_output)
-
-    except Exception as err:
-        print("geo_web_search: SerpApi call failed for query=%r", query)
-        return f"SerpApi Search Failed: {str(err)}"
-
-
-@tool
-def scrape_product_metadata(url: str) -> str:
-    """Scrapes raw data profiles, review elements, text configurations, and media blocks from a given landing page URL."""
-    return f"Raw Scraped Payload from {url}: FAQs found=2, Reviews found=10."
-
-
-GEO_TOOLS = [geo_web_search, scrape_product_metadata]
-
-
-class ProductEnrichment(BaseModel):
-    """Best-effort metadata inferred for a product that isn't in our database yet."""
-
-    product_name: Optional[str] = None
-    brand_name: Optional[str] = None
-    country: Optional[str] = None
-    category: Optional[str] = None
-    no_of_faqs: int = Field(
-        default=None,
-        description="Estimated number of FAQs for this item. CRITICAL: Do not return 0; if unknown, estimate a realistic baseline count based on product type.",
-    )
-    no_of_reviews: int = Field(
-        default=None,
-        description="Estimated number of customer reviews for this item. CRITICAL: Do not return 0; if unknown, estimate a realistic baseline count based on product type.",
-    )
-
-
-# ======================================================================
-# STREAMING EVENT HELPERS
-#
-# All of these just DRY up "build a dict, json.dumps it, append a newline".
-# The exact keys/values sent for each situation are unchanged from the
-# original implementation - callers still choose exactly what goes in.
-# ======================================================================
-
-
-def _emit(**fields) -> str:
-    return json.dumps(fields) + "\n"
-
-
-def _status(message: str, progress_pct: int) -> str:
-    return _emit(
-        type="status",
-        color="#4f46e5",
-        status="progress",
-        message=message,
-        progress_pct=progress_pct,
-    )
-
-
-def _result(message: str, report) -> str:
-    return _emit(
-        type="result",
-        color="#22c55e",
-        status="completed",
-        message=message,
-        report=report,
-        progress_pct=100,
-    )
-
-
-def _model_warning(model_name: str, error: Exception) -> str:
-    return _emit(
-        type="error",
-        color="#f59e0b",
-        status="warning",
-        message=f"{model_name} failed: {str(error)}",
-    )
-
-
-# ======================================================================
-# PRODUCT LOOKUP / CREATION HELPERS
-# ======================================================================
-
-
-def _build_lookup_filters(payload: GEOAuditRequest) -> list:
-    filters = []
-    if payload.product_name:
-        filters.append(Product.name == payload.product_name)
-    if payload.sku:
-        filters.append(Product.sku == payload.sku)
-    if payload.mpn:
-        filters.append(Product.mpn == payload.mpn)
-    if payload.upc:
-        filters.append(Product.upc == payload.upc)
-    return filters
-
-
-async def _find_existing_product(
-    db: AsyncSession, tenant_id: int, filters: list
-) -> Optional[Product]:
-    if not filters:
-        return None
-    stmt = (
-        select(Product)
-        .options(selectinload(Product.brand))
-        .where(Product.tenant_id == tenant_id, or_(*filters))
-    )
-    result = await db.execute(stmt)
-    return result.scalar_one_or_none()
-
-
-async def _get_recent_cached_chat(db: AsyncSession, product_id: int) -> Optional[Chat]:
-    threshold = datetime.now() - timedelta(days=RETENTION_DAYS_THRESHOLD)
-    stmt = (
-        select(Chat)
-        .where(Chat.product_id == product_id, Chat.created_at >= threshold)
-        .order_by(Chat.created_at.desc())
-        .limit(1)
-    )
-    result = await db.execute(stmt)
-    return result.scalar_one_or_none()
-
-
-async def _enrich_missing_product_metadata(
-    payload: GEOAuditRequest,
-) -> ProductEnrichment:
-    """Ask an LLM to fill in baseline metadata for a product we don't have on file yet."""
-    prompt = f"""
-        You are a real-time web crawler agent. Analyze the following product metadata footprints:
-
-        Product Name: {payload.product_name}
-        Product URL: {payload.product_url}
-        SKU: {payload.sku} | MPN: {payload.mpn} | UPC: {payload.upc}
-        Extra Context: {payload.extra_context}
-
-        CRITICAL ASSIGNMENT DIRECTIONS:
-        1. Estimate or look up real-world search index results for this item.
-        2. Natively determine non-zero values for 'no_of_faqs' and 'no_of_reviews'.
-        3. If this exact SKU/MPN item has a low digital footprint in your training data, pull baseline statistics from similar marine/e-commerce category listings (e.g., popular 2.7m inflatable boat tenders usually carry 3-5 FAQs and 5-15 customer reviews across marine chandlery networks).
-        4. Strictly DO NOT return 0 or null for these metric fields. Provide your best contextual evaluation value.
-    """
-    try:
-        model = ChatOpenAI(model="gpt-4o-mini", temperature=0).bind_tools(GEO_TOOLS)
-        return await model.with_structured_output(ProductEnrichment).ainvoke(prompt)
-    except Exception:
-        return ProductEnrichment()
-
-
-async def _get_or_create_brand(
-    db: AsyncSession,
-    tenant_id: int,
-    brand_name: str,
-    country: str,
-    user_id: Optional[int],
-) -> Brand:
-    stmt = select(Brand).where(Brand.name == brand_name, Brand.tenant_id == tenant_id)
-    result = await db.execute(stmt)
-    brand_record = result.scalar_one_or_none()
-    if brand_record:
-        return brand_record
-
-    brand_record = Brand(
-        tenant_id=tenant_id, name=brand_name, country=country, created_by=user_id
-    )
-    db.add(brand_record)
-    await db.flush()
-    return brand_record
-
-
-async def _create_new_product(
-    db: AsyncSession, payload: GEOAuditRequest, tenant_id: int, user_id: Optional[int]
-) -> Product:
-    enriched = await _enrich_missing_product_metadata(payload)
-
-    product_name = (
-        payload.product_name
-        or enriched.product_name
-        or f"Unknown Product {datetime.now().timestamp()}"
-    )
-    brand_name = enriched.brand_name or product_name
-    country = payload.country or enriched.country or "Unknown"
-
-    brand_record = await _get_or_create_brand(
-        db, tenant_id, brand_name, country, user_id
-    )
-
-    product_record = Product(
-        tenant_id=tenant_id,
-        brand_id=brand_record.id,
-        name=product_name,
-        product_url=payload.product_url,
-        brand_name=brand_name,
-        model_choice=LLMModels.GPT,
-        sku=payload.sku,
-        mpn=payload.mpn,
-        upc=payload.upc,
-        no_of_faqs=enriched.no_of_faqs,
-        no_of_reviews=enriched.no_of_reviews,
-        created_by=user_id,
-    )
-    db.add(product_record)
-    await db.flush()
-    return product_record
-
-
-# ======================================================================
-# LLM / MODEL-RUN HELPERS
-# ======================================================================
-
-
-def _build_chat_model(model_name: str):
-    """Instantiate the right LangChain chat model for a given LLMModels value,
-    bound to the GEO tools so the model can actually call them."""
-    if model_name == "GPT":
-        base = ChatOpenAI(model="gpt-5-nano", temperature=0)
-    elif model_name == "GEMINI":
-        base = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-    else:
-        base = ChatAnthropic(model="claude-haiku-4-5", temperature=0)
-    return base.bind_tools(GEO_TOOLS)
-
-
-def _build_chat_model_no_tools(model_name: str):
-    """Same as _build_chat_model but without tools bound - used for the final
-    structured-output pass after the tool-calling loop is done."""
-    if model_name == "GPT":
-        return ChatOpenAI(model="gpt-5-nano", temperature=0)
-    if model_name == "GEMINI":
-        return ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-    return ChatAnthropic(model="claude-haiku-4-5", temperature=0)
-
-
-async def _run_single_model_audit(
-    model_name: str,
-    user_prompt: str,
-    search_keyword: str,
-    max_tool_iterations: int = 5,
-) -> Optional[UnifiedGEOResponse]:
-    """
-    Runs a real tool-calling loop: the model decides when/what to search for
-    via geo_web_search / scrape_product_metadata, we execute those calls and
-    feed the results back, and only once the model stops requesting tools do
-    we ask for the final structured UnifiedGEOResponse.
-    """
-    from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-
-    tools_by_name = {t.name: t for t in GEO_TOOLS}
-
-    seed_prompt = f"""{user_prompt}
-
-Start by searching for: "{search_keyword}"
-Use the geo_web_search and scrape_product_metadata tools as needed to find
-real, verified competitor URLs, pricing, and product metadata before you
-finalize your analysis. Do not stop after a single search if more queries
-would materially improve the competitor/citation data.
-
-CRITICAL URL CONSTRAINT:
-Only use exact URLs returned by tool calls. Never fabricate, edit, or invent
-URLs. If no verified URL is available, leave 'product_url' as an empty string "".
-"""
-
-    messages = [
-        SystemMessage(content=GEO_SYSTEM_PROMPT),
-        HumanMessage(content=seed_prompt),
-    ]
-
-    llm = _build_chat_model(model_name)
-
-    # --- Tool-calling loop ---
-    for _ in range(max_tool_iterations):
-        ai_message = await llm.ainvoke(messages)
-        messages.append(ai_message)
-
-        tool_calls = getattr(ai_message, "tool_calls", None) or []
-        if not tool_calls:
-            break
-
-        for call in tool_calls:
-            tool_fn = tools_by_name.get(call["name"])
-            if tool_fn is None:
-                tool_result = f"Error: unknown tool '{call['name']}'"
-            else:
-                try:
-                    tool_result = tool_fn.invoke(call["args"])
-                except Exception as tool_err:
-                    tool_result = f"Tool '{call['name']}' failed: {tool_err}"
-
-            messages.append(
-                ToolMessage(content=str(tool_result), tool_call_id=call["id"])
-            )
-    else:
-        # Hit max_tool_iterations without the model stopping on its own -
-        # force it to wrap up on the next call by not giving it tools again.
-        pass
-
-    # --- Final structured extraction pass, using the full tool-augmented conversation ---
-    structured_llm = _build_chat_model_no_tools(model_name).with_structured_output(
-        UnifiedGEOResponse
-    )
-    messages.append(
-        HumanMessage(
-            content=(
-                "Based on everything above, produce the final UnifiedGEOResponse "
-                "JSON now. Use only URLs that appeared in tool results."
-            )
-        )
-    )
-    return await structured_llm.ainvoke(messages)
-
-
-# ======================================================================
-# PERSISTENCE HELPERS
-# ======================================================================
-
-
-def _build_chat_record(
-    tenant_id: int,
-    product_id: int,
-    payload: GEOAuditRequest,
-    model_enum: LLMModels,
-    structured: UnifiedGEOResponse,
-) -> Chat:
-    return Chat(
-        tenant_id=tenant_id,
-        product_id=product_id,
-        product_name=payload.product_name or "",
-        product_url=payload.product_url or payload.website or "",
-        extra_context=payload.extra_context,
-        model_choice=model_enum,
-        competitor_analytics=[
-            c.model_dump(mode="json") for c in structured.competitor_analytics
-        ],
-        final_optimization_report=structured.final_optimized_tips_summary,
-    )
-
-
-def _build_search_query_records(
-    chat_id: int, queries: list[ChatQueryBase]
-) -> list[ChatSearchQuery]:
-    """
-    NOTE: this now writes a `competitor_products` field (list of
-    {competitor_name, product_name, product_url, price} dicts) alongside the
-    existing `competitors_mentioned` list. The ChatSearchQuery model/table needs
-    a matching `competitor_products` JSON column added via migration for this
-    to persist - see explanation below.
-    """
-    return [
-        ChatSearchQuery(
-            chat_id=chat_id,
-            chat_context=query.chat_context,
-            brand_name=query.brand,
-            query_text=query.query,
-            product_found=query.product_found,
-            share_of_voice=min(query.share_of_voice, 100.0),
-            total_websites_found=query.total_websites_found,
-            citation_rank=query.citation_rank,
-            platform_breakdown=query.platform_breakdown.model_dump(mode="json"),
-            best_metrics_variance={},
-            raw_api_response=json.dumps(query.model_dump(mode="json")),
-            citing_sources=query.citing_sources,
-            competitors_mentioned=query.competitors_mentioned,
-            competitor_products=[
-                p.model_dump(mode="json") for p in query.competitor_products
-            ],
-            query_optimization_tag=query.optimization_tag,
-            query_optimization_tips=query.optimization_tips_for_better_result,
-            solution=query.copy_pasteable_solution,
-        )
-        for query in queries
-    ]
-
-
-def _build_audit_record(
-    tenant_id: int,
-    identifier: str,
-    model_name: str,
-    structured: Optional[UnifiedGEOResponse],
-) -> ChatGEOAuditRecord:
-    return ChatGEOAuditRecord(
-        tenant_id=tenant_id,
-        product_identifier=identifier,
-        model_used=model_name,
-        status="SUCCESS",
-        audit_data=structured.model_dump(mode="json") if structured else {},
-    )
-
-
-def _resolve_identifier(payload: GEOAuditRequest) -> str:
-    return payload.product_name or payload.sku or payload.product_url or ""
-
-
-# ======================================================================
-# MAIN ENTRYPOINT
-# ======================================================================
-
-
-async def run_geo_audit_stream(
-    payload: GEOAuditRequest,
-    db: AsyncSession,
-    tenant_id: int,
-    user_id: int | None = None,
-) -> AsyncGenerator[str, None]:
-    try:
-        if tenant_id is None:
-            yield _emit(color="red", status="failed", message="tenant_id is required.")
-            return
-
-        if payload is None:
-            yield _emit(
-                color="red", status="failed", message="Payload cannot be empty."
-            )
-            return
-
-        yield _status("Checking product registry...", 5)
-
-        lookup_filters = _build_lookup_filters(payload)
-
-        if not lookup_filters and not payload.product_url:
-            yield _emit(
-                type="error",
-                color="#ef4444",
-                status="failed",
-                message="One identifier is required (product_name/sku/mpn/upc/product_url)",
-            )
-            return
-
-        product_record = await _find_existing_product(db, tenant_id, lookup_filters)
-
-        if product_record:
-            product_id = product_record.id
-            yield _status("Existing product located", 10)
-
-            recent_chat = await _get_recent_cached_chat(db, product_id)
-            if recent_chat:
-                yield _result("Warm cache hit", recent_chat.final_optimization_report)
-                return
-        else:
-            yield _status("Enriching missing product metadata...", 15)
-            product_record = await _create_new_product(db, payload, tenant_id, user_id)
-            product_id = product_record.id
-
-        user_prompt = build_user_instruction_v2(payload)
-        identifier = _resolve_identifier(payload)
-
-        models = list(LLMModels)
-        total_models = len(models)
-        all_reports = []
-
-        for index, model_enum in enumerate(models):
-            model_name = model_enum.value
-            progress_start = int((index / total_models) * 100)
-
-            yield _status(
-                f"Configuring runtime pool engine: '{model_name}'...", progress_start
-            )
-
-            try:
-                yield _status(
-                    f"[{model_name}] Extracting payload identifier strings...",
-                    progress_start + 10,
-                )
-                yield _status(
-                    f"[{model_name}] Invoking context analysis tracing...",
-                    progress_start + 20,
-                )
-
-                search_keyword = f"{identifier} competitors buy online"
-
-                structured = await _run_single_model_audit(
-                    model_name, user_prompt, search_keyword
-                )
-
-                if structured:
-                    structured.model_used = model_name
-                    if structured.product_details:
-                        product_record.no_of_faqs = structured.product_details.faqs
-                        product_record.no_of_reviews = (
-                            structured.product_details.reviews
-                        )
-
-                yield _status(
-                    f"[{model_name}] Recording PostgreSQL logs...", progress_start + 30
-                )
-
-                if structured:
-                    chat_record = _build_chat_record(
-                        tenant_id, product_id, payload, model_enum, structured
-                    )
-                    db.add(chat_record)
-                    await db.flush()  # need chat_record.id before building search queries
-
-                    for search_record in _build_search_query_records(
-                        chat_record.id, structured.queries_executed
-                    ):
-                        db.add(search_record)
-
-                    db.add(
-                        _build_audit_record(
-                            tenant_id, identifier, model_name, structured
-                        )
-                    )
-
-                await db.commit()
-
-                if structured:
-                    all_reports.append(structured.model_dump(mode="json"))
-
-                yield _emit(
-                    status="progress",
-                    progress_pct=int(((index + 1) / total_models) * 100),
-                    message=f"{model_name} completed successfully.",
-                )
-
-                if all_reports:
-                    yield _result(
-                        "GEO audit completed successfully",
-                        all_reports[-1]["final_optimized_tips_summary"],
-                    )
-
-            except Exception as model_error:
-                await db.rollback()
-                yield _model_warning(model_name, model_error)
-
-    except Exception as e:
-        await db.rollback()
-        yield json.dumps({"status": "failed", "message": str(e)}) + "\n"
+# """
+# GEO (Generative Engine Optimization) audit orchestration.
+
+# Given a product identifier (name / SKU / MPN / UPC / URL), this module:
+#   1. Looks up an existing product record, or creates one with LLM-enriched
+#      baseline metadata if it doesn't exist yet.
+#   2. Serves a cached report if a recent audit already exists.
+#   3. Otherwise runs the audit through every configured LLM (GPT / Gemini /
+#      Claude), persisting a Chat, its ChatSearchQuery rows, and a
+#      ChatGEOAuditRecord per model.
+#   4. Streams progress as newline-delimited JSON events the whole way through.
+# """
+
+# import json
+# import os
+# from serpapi import GoogleSearch
+# from typing import AsyncGenerator, Optional
+# from datetime import datetime, timedelta
+
+# from pydantic import BaseModel, Field
+
+# from sqlalchemy import select, or_
+# from sqlalchemy.orm import selectinload
+# from sqlalchemy.ext.asyncio import AsyncSession
+
+# from langchain.tools import tool
+# from langchain_openai import ChatOpenAI
+# from langchain_google_genai import ChatGoogleGenerativeAI
+# from langchain_anthropic import ChatAnthropic
+
+# from app.models.base import LLMModels
+# from app.models import Product, Brand, Chat, ChatSearchQuery, ChatGEOAuditRecord
+
+# # ======================================================================
+# # CONSTANTS
+# # ======================================================================
+
+
+# def _extract_token_usage(message) -> dict[str, int]:
+#     input_tokens = 0
+#     output_tokens = 0
+#     total_tokens = 0
+
+#     usage_metadata = getattr(message, "usage_metadata", None)
+
+#     if usage_metadata:
+#         input_tokens = int(usage_metadata.get("input_tokens", 0) or 0)
+#         output_tokens = int(usage_metadata.get("output_tokens", 0) or 0)
+#         total_tokens = int(usage_metadata.get("total_tokens", 0) or 0)
+
+#     if not total_tokens:
+#         response_metadata = getattr(message, "response_metadata", {}) or {}
+
+#         token_usage = (
+#             response_metadata.get("token_usage") or response_metadata.get("usage") or {}
+#         )
+
+#         input_tokens = int(token_usage.get("prompt_tokens", input_tokens) or 0)
+
+#         output_tokens = int(token_usage.get("completion_tokens", output_tokens) or 0)
+
+#         total_tokens = int(
+#             token_usage.get(
+#                 "total_tokens",
+#                 input_tokens + output_tokens,
+#             )
+#             or 0
+#         )
+
+#     if not total_tokens:
+#         total_tokens = input_tokens + output_tokens
+
+#     return {
+#         "input_tokens": input_tokens,
+#         "output_tokens": output_tokens,
+#         "total_tokens": total_tokens,
+#     }
+
+
+# RETENTION_DAYS_THRESHOLD = 7
+
+# GEO_SYSTEM_PROMPT = """
+# You are a GEO expert. Use tools to analyze visibility parameters and map competitive gaps.
+
+# CRITICAL SCHEMA DIRECTION:
+# Every dictionary field within the 'product_details' object MUST be structured as a JSON object containing EXACTLY these keys: "value", "score", and "tips".
+# Output only valid JSON conforming perfectly to the schema definition.
+
+# CRITICAL URL RULES:
+# - NEVER invent, guess, or construct product URLs.
+# - Only return a product_url if it was explicitly found in a trusted source during the search.
+# - The product_url must be the exact canonical product page URL from the retailer or manufacturer's website.
+# - Do NOT generate URLs from product names or slugs.
+# - If no verified product URL is available, return an empty string "".
+# - A 404 URL is worse than an empty URL.
+# """
+
+
+# # ======================================================================
+# # REQUEST SCHEMA
+# # ======================================================================
+
+
+# class GEOAuditRequest(BaseModel):
+#     """V2 Flexible Request Inputs for multiple source identification types."""
+
+#     product_name: Optional[str] = Field(None, description="Name of the target product")
+#     product_url: Optional[str] = Field(
+#         None, description="Target product landing page URL"
+#     )
+#     website: Optional[str] = Field(None, description="Brand/corporate target domain")
+#     sku: Optional[str] = Field(None, description="Stock Keeping Unit number")
+#     mpn: Optional[str] = Field(None, description="Manufacturer Part Number")
+#     upc: Optional[str] = Field(None, description="Universal Product Code")
+#     country: Optional[str] = Field(None, description="Target geographical focus region")
+#     extra_context: Optional[str] = Field(
+#         None, description="Additional context parameter text"
+#     )
+#     model_choice: LLMModels = Field(
+#         default=LLMModels.GPT, description="Selected LLM execution engine"
+#     )
+
+
+# def build_user_instruction_v2(input_data: GEOAuditRequest) -> str:
+#     return f"""Analyze the following product payload for optimization:
+# Product Name: {input_data.product_name}
+# Product URL: {input_data.product_url}
+# Website Reference: {input_data.website}
+# SKU: {input_data.sku} | MPN: {input_data.mpn} | UPC: {input_data.upc}
+# Geographic Target Region: {input_data.country}
+# User Request Extra Context: {input_data.extra_context}
+
+# Generate relevant domain search queries dynamically based on the input text to extract real metadata metrics.
+# """
+
+
+# # ======================================================================
+# # OUTPUT SCHEMAS
+# # ======================================================================
+
+
+# class AssetMetrics(BaseModel):
+#     images: bool = Field(default=False, description="True if images are present.")
+#     videos: bool = Field(default=False, description="True if videos are present.")
+
+
+# class PlatformBreakdownMetrics(BaseModel):
+#     google: int = Field(default=0, description="Count for Google platform.")
+#     anthropic: int = Field(default=0, description="Count for Anthropic platform.")
+#     openai: int = Field(default=0, description="Count for OpenAI search platform.")
+#     bing: int = Field(default=0, description="Count for Bing platform.")
+
+
+# class CompetitorMetrics(BaseModel):
+#     competitor_name: str = Field(description="Name of the competitor platform found.")
+#     product_title: str = Field(description="Title string used by this competitor.")
+#     product_url: str = Field(
+#         default="",
+#         description=(
+#             "Verified competitor product page URL resolved directly from SerpApi. "
+#             "Never fabricate or construct this URL."
+#         ),
+#     )
+#     no_of_faq: int = Field(description="Count of FAQs on their page.")
+#     no_of_reviews: int = Field(description="Count of reviews/ratings on their page.")
+#     keywords_used: list[str] = Field(
+#         description="Core keywords used by this competitor."
+#     )
+#     no_of_attributes: int = Field(
+#         description="Count of product attributes/specs listed."
+#     )
+#     assets_present: AssetMetrics = Field(description="Media asset indicators.")
+#     no_of_features: int = Field(description="Count of main features listed.")
+#     word_count: int = Field(description="Word count of their product description.")
+
+
+# class CompetitorProductLink(BaseModel):
+#     """A clickable reference to a specific competitor product surfaced during a search query."""
+
+#     competitor_name: str = Field(description="Name of the competitor/brand.")
+#     product_name: str = Field(description="Name of the competitor's product.")
+#     product_url: str = Field(
+#         description=(
+#             "Exact verified canonical URL of the competitor product page. "
+#             "Never fabricate, infer, rewrite, or guess the URL. "
+#             "Only use a URL explicitly returned by a trusted search result. "
+#             'If unavailable, return "".'
+#         )
+#     )
+#     price: Optional[str] = Field(
+#         None,
+#         description="Listed price of the competitor product, if found (e.g. '$49.99').",
+#     )
+
+
+# class GEOAuditField(BaseModel):
+#     """Used ONLY for elements undergoing rich copy visibility auditing."""
+
+#     value: str = Field(
+#         default="", description="The extracted data string or content description."
+#     )
+#     score: int = Field(
+#         default=0, description="The evaluated visibility compliance score."
+#     )
+#     tips: str = Field(
+#         default="",
+#         description=(
+#             "Concrete, ready-to-paste optimization advice. NEVER stop at naming the problem or telling the reader "
+#             "to 'add', 'include', or 'change' something in the abstract - always write out the exact finished "
+#             "content that should go in, AND exactly where it goes. Format: '<WHERE (field/section/position)>: "
+#             '<WHAT TO DO> -> "<exact copy-pasteable text>"\'. '
+#             "Examples of GOOD tips: "
+#             "'Description, first sentence: state shipping coverage explicitly -> \"Ships to Germany within 3-5 "
+#             "business days.\"'  "
+#             "'Product title: replace with this exact title -> \"Bosch GKS 190 Circular Saw - 1400W, 190mm Blade, "
+#             "Ships to Ireland\"'  "
+#             "'Below the price: add this exact badge text -> \"In Stock - Dispatched within 24 hours\"'  "
+#             "If recommending a testimonial, quote the FULL testimonial text verbatim as it should appear, not a "
+#             "description of what a testimonial should say. If recommending region-specific content (e.g. a "
+#             "location-targeted headline or an FAQ answer), write the complete final text, not just the topic. "
+#             "BAD tips (never do this): 'Add an in-stock badge.' / 'Include Irish customer testimonials.' / "
+#             "'Highlight that it ships to Ireland.' - these name the fix but give nothing the reader can paste in."
+#         ),
+#     )
+
+
+# class Citation(BaseModel):
+#     source: str = Field(
+#         default="",
+#         description="Name of the website or publication that cited/referenced the product.",
+#     )
+#     url: str = Field(
+#         default="",
+#         description=(
+#             "Exact verified URL of the source page. "
+#             "Never fabricate, guess, or construct URLs."
+#         ),
+#     )
+#     quote: str = Field(
+#         default="",
+#         description="The relevant excerpt or statement from the source referencing the product.",
+#     )
+#     trust: int = Field(
+#         default=0,
+#         ge=0,
+#         le=10,
+#         description="Trust/authority score of the citation source from 0 to 10.",
+#     )
+
+
+# class GEOProductDetail(BaseModel):
+#     product_name: str = Field(description="Name of the target product.")
+#     product_url: str = Field(description="Target product landing page URL.")
+#     sku: Optional[str] = Field(None, description="Stock Keeping Unit number.")
+#     mpn: Optional[str] = Field(None, description="Manufacturer Part Number.")
+#     upc: Optional[str] = Field(None, description="Universal Product Code.")
+#     gtin: Optional[str] = Field(None, description="Global Trade Item Number.")
+#     ean: Optional[str] = Field(None, description="European Article Number.")
+
+#     faqs: int = Field(default=0, description="Count of found target FAQs.")
+#     reviews: int = Field(default=0, description="Count of user reviews integrated.")
+#     attributes: int = Field(
+#         default=0, description="Count of detailed product specifications."
+#     )
+#     features: int = Field(
+#         default=0, description="Count of unique item product features."
+#     )
+
+#     product_title: GEOAuditField = Field(
+#         description="Audit and scoring for visibility title formatting optimization."
+#     )
+#     description_analysis: GEOAuditField = Field(
+#         description="Audit and scoring for description keyword optimization."
+#     )
+#     keywords: GEOAuditField = Field(
+#         description="Audit and scoring for extracted target context search terms."
+#     )
+#     assets: GEOAuditField = Field(
+#         description="Audit and scoring for structural image/video configurations."
+#     )
+
+
+# class ChatQueryBase(BaseModel):
+#     chat_context: str = Field(description="Scope tracking token context identifier.")
+#     brand: str = Field(description="Identified target brand.")
+#     query: str = Field(description="The generated search engine query executed.")
+#     product_found: bool = Field(description="True if target product was discovered.")
+#     share_of_voice: float = Field(description="Calculated share of voice percentage.")
+#     total_websites_found: int = Field(
+#         description="Count of unique reference web sources found."
+#     )
+#     citation_rank: int = Field(description="Organic ranking position across sources.")
+#     platform_breakdown: PlatformBreakdownMetrics = Field(
+#         description="Distribution metrics across discovery platforms."
+#     )
+#     citing_sources: list[str] = Field(description="List of source URLs referenced.")
+#     competitors_mentioned: list[str] = Field(
+#         description="Competitor platforms or alternative brands found."
+#     )
+
+#     # NEW: clickable competitor product references for this query.
+#     competitor_products: list[CompetitorProductLink] = Field(
+#         default_factory=list,
+#         description=(
+#             "Specific competitor products discovered while researching this query. Each entry MUST include a "
+#             "real product_url so the user can click through and view the listing directly."
+#         ),
+#     )
+
+#     optimization_tag: str = Field(
+#         description=(
+#             "A single-word category representing the primary optimization recommendation. "
+#             "Examples: 'title', 'brand', 'attributes','description', 'faq', 'content', 'schema', 'images', "
+#             "'reviews', 'pricing', 'specifications', 'comparison', 'keywords', "
+#             "'metadata', 'headings', 'internal-links', 'external-links', 'trust', "
+#             "'availability',  'video', 'performance', 'citations'."
+#         )
+#     )
+
+#     # UPDATED description: now demands finished, pasteable content + exact placement,
+#     optimization_tips_for_better_result: str = Field(
+#         description=(
+#             "Strategic GEO suggestion explaining WHERE and WHAT to optimize. "
+#             "Identifies the target field/section and the high-level fix required "
+#             "(e.g., adjusting price positioning, adding local relevance, tweaking title structure, "
+#             "or recommending a new FAQ section if none exists on the product page). "
+#             "BAD: Do not supply the finished copy here—keep this focused purely on the strategy/location."
+#         )
+#     )
+
+#     copy_pasteable_solution: str = Field(
+#         description=(
+#             "The exact, finished, copy-pasteable text, example title, or full FAQ section implementing the suggestion. "
+#             "Never stop at naming the fix—always supply the literal text ready for deployment. "
+#             "IF THE PRODUCT PAGE LACKS AN FAQ SECTION: Create and supply a complete, production-ready Q&A block here "
+#             "addressing common consumer query gaps. "
+#             "Examples: 'For a lower-cost option, see the Pilot G2 at $2.50.' or "
+#             "'Q: Is this pen refillable? A: Yes, it accepts standard G2 gel refills.'"
+#         )
+#     )
+
+
+# class BrandAnalysis(BaseModel):
+#     brand_name: str = Field(description="Extracted primary brand.")
+
+
+# class UnifiedGEOResponse(BaseModel):
+#     model_used: str = Field(
+#         description="The running LLM configuration model name identifier."
+#     )
+#     brand: BrandAnalysis = Field(description="Target brand information.")
+#     product_details: GEOProductDetail = Field(
+#         description="Granular field audit and scoring metrics."
+#     )
+#     competitor_analytics: list[CompetitorMetrics] = Field(
+#         description="Competitor baseline data blocks."
+#     )
+#     citations: list[Citation] = Field(
+#         default_factory=list,
+#         description=(
+#             "Verified external sources cited when referencing the target product. "
+#             "Each citation must contain the source name, exact verified URL, "
+#             "relevant quote, and trust score."
+#         ),
+#     )
+#     queries_executed: list[ChatQueryBase] = Field(
+#         description="Search trace matrix execution logs."
+#     )
+#     final_optimized_tips_summary: str = Field(
+#         description=(
+#             "Summarized checklist of the highest-impact fixes across product_details and queries_executed. Each "
+#             "checklist line must follow the same rule as the individual tips fields: name where it goes and give "
+#             "the exact finished content to paste in, not just the action. E.g. '- In Stock badge (below price): "
+#             "\"In Stock - Dispatched within 24 hours\"' rather than '- Add an in-stock badge.'"
+#         )
+#     )
+
+
+# # ======================================================================
+# # TOOLS
+# # ======================================================================
+
+
+# @tool
+# def geo_web_search(query: str) -> str:
+#     """Searches the web via SerpApi for live product metadata, verified competitor URLs, pricing, and organic search listings."""
+#     api_key = os.getenv("SERPAPI_KEY") or os.getenv("SERPAPI_API_KEY")
+#     if not api_key:
+#         return "Error: SERPAPI_KEY environment variable is missing."
+
+#     try:
+#         search = GoogleSearch(
+#             {
+#                 "engine": "google",
+#                 "q": query,
+#                 "num": 5,
+#                 "hl": "en",
+#                 "gl": "us",
+#                 "api_key": api_key,
+#             }
+#         )
+#         results = search.get_dict()
+
+#         if "error" in results:
+#             print(
+#                 "geo_web_search: SerpApi returned error for query=%r: %s",
+#                 query,
+#                 results["error"],
+#             )
+#             return f"SerpApi Search Failed: {results['error']}"
+
+#         organic_results = results.get("organic_results", [])
+#         if not organic_results:
+#             print(
+#                 "geo_web_search: no organic_results for query=%r, raw keys=%s",
+#                 query,
+#                 list(results.keys()),
+#             )
+#             return f"No organic web results discovered for query: '{query}'."
+
+#         formatted_output = []
+#         for index, item in enumerate(organic_results, start=1):
+#             title = item.get("title", "")
+#             link = item.get("link", "")
+#             snippet = item.get("snippet", "")
+
+#             rich_extensions = (
+#                 item.get("rich_snippet", {})
+#                 .get("top", {})
+#                 .get("detected_extensions", {})
+#             )
+#             price = rich_extensions.get("price") or item.get("price", "N/A")
+
+#             formatted_output.append(
+#                 f"Result #{index}:\n"
+#                 f"- Title: {title}\n"
+#                 f"- Verified URL: {link}\n"
+#                 f"- Price: {price}\n"
+#                 f"- Summary: {snippet}\n"
+#             )
+
+#         return "\n".join(formatted_output)
+
+#     except Exception as err:
+#         print("geo_web_search: SerpApi call failed for query=%r", query)
+#         return f"SerpApi Search Failed: {str(err)}"
+
+
+# def _resolve_competitor_product_url(
+#     competitor_name: str,
+#     product_name: str,
+# ) -> str:
+#     """
+#     Resolve a real competitor product page URL directly from SerpApi.
+
+#     The LLM identifies the competitor/product, but it is NOT trusted to
+#     generate the URL. Only the URL returned by SerpApi is persisted.
+#     """
+#     api_key = os.getenv("SERPAPI_KEY") or os.getenv("SERPAPI_API_KEY")
+
+#     if not api_key or not competitor_name or not product_name:
+#         return ""
+
+#     competitor_name = competitor_name.strip()
+#     product_name = product_name.strip()
+
+#     if not competitor_name or not product_name:
+#         return ""
+
+#     queries = [
+#         f'"{competitor_name}" "{product_name}" product',
+#         f'"{competitor_name}" "{product_name}" buy',
+#         f"{competitor_name} {product_name}",
+#     ]
+
+#     try:
+#         for search_query in queries:
+#             search = GoogleSearch(
+#                 {
+#                     "engine": "google",
+#                     "q": search_query,
+#                     "num": 10,
+#                     "hl": "en",
+#                     "gl": "uk",
+#                     "api_key": api_key,
+#                 }
+#             )
+
+#             results = search.get_dict()
+
+#             if "error" in results:
+#                 print(
+#                     "SerpApi competitor URL lookup failed for %r: %s",
+#                     search_query,
+#                     results["error"],
+#                 )
+#                 continue
+
+#             organic_results = results.get("organic_results", [])
+#             if not organic_results:
+#                 continue
+
+#             competitor_lower = competitor_name.lower()
+#             product_words = [
+#                 word.lower() for word in product_name.split() if len(word.strip()) >= 3
+#             ]
+
+#             # Prefer a result whose title/snippet strongly matches the
+#             # competitor and product. This avoids blindly taking result #1.
+#             best_link = ""
+#             best_score = 0
+
+#             for result in organic_results:
+#                 link = (result.get("link") or "").strip()
+#                 title = (result.get("title") or "").strip().lower()
+#                 snippet = (result.get("snippet") or "").strip().lower()
+#                 text = f"{title} {snippet}"
+
+#                 if not link:
+#                     continue
+
+#                 score = 0
+
+#                 if competitor_lower in text:
+#                     score += 5
+
+#                 matched_words = sum(1 for word in product_words if word in text)
+#                 score += min(matched_words, 8)
+
+#                 # Product pages normally have the product name in the title.
+#                 if title and any(word in title for word in product_words):
+#                     score += 3
+
+#                 if score > best_score:
+#                     best_score = score
+#                     best_link = link
+
+#             if best_link and best_score >= 5:
+#                 print(
+#                     "Resolved competitor URL: %s / %s -> %s",
+#                     competitor_name,
+#                     product_name,
+#                     best_link,
+#                 )
+#                 return best_link
+
+#             # SerpApi itself is still the source of truth. If no strong
+#             # textual match exists, use the first organic URL as a fallback.
+#             for result in organic_results:
+#                 link = (result.get("link") or "").strip()
+#                 if link:
+#                     print(
+#                         "Fallback competitor URL: %s / %s -> %s",
+#                         competitor_name,
+#                         product_name,
+#                         link,
+#                     )
+#                     return link
+
+#         return ""
+
+#     except Exception as exc:
+#         print(
+#             "SerpApi competitor URL resolver failed: competitor=%r product=%r error=%s",
+#             competitor_name,
+#             product_name,
+#             exc,
+#         )
+#         return ""
+
+
+# def _resolve_all_competitor_product_urls(
+#     structured: UnifiedGEOResponse,
+# ) -> None:
+#     """
+#     Resolve competitor URLs once per unique competitor/product pair.
+
+#     URLs are written into BOTH:
+#       1. queries_executed[].competitor_products[].product_url
+#       2. competitor_analytics[].product_url
+
+#     This makes the URL available to whichever API response mapper is already
+#     being used by the frontend.
+#     """
+#     resolved_urls: dict[tuple[str, str], str] = {}
+
+#     def resolve(competitor_name: str, product_name: str) -> str:
+#         key = (
+#             (competitor_name or "").strip().lower(),
+#             (product_name or "").strip().lower(),
+#         )
+
+#         if not key[0] or not key[1]:
+#             return ""
+
+#         if key not in resolved_urls:
+#             resolved_urls[key] = _resolve_competitor_product_url(
+#                 competitor_name=competitor_name,
+#                 product_name=product_name,
+#             )
+
+#         return resolved_urls[key]
+
+#     # --------------------------------------------------------------
+#     # 1. Resolve URLs for query-level competitor product references.
+#     # --------------------------------------------------------------
+#     for query in structured.queries_executed:
+#         for competitor in query.competitor_products:
+#             if not competitor.product_url:
+#                 competitor.product_url = resolve(
+#                     competitor.competitor_name,
+#                     competitor.product_name,
+#                 )
+#             else:
+#                 # Always replace an LLM-generated URL with the SerpApi URL.
+#                 competitor.product_url = resolve(
+#                     competitor.competitor_name,
+#                     competitor.product_name,
+#                 )
+
+#     # --------------------------------------------------------------
+#     # 2. Attach the same verified URL to competitor_analytics.
+#     # --------------------------------------------------------------
+#     for competitor in structured.competitor_analytics:
+#         competitor.product_url = resolve(
+#             competitor.competitor_name,
+#             competitor.product_title,
+#         )
+
+#     # --------------------------------------------------------------
+#     # 3. If competitor_analytics has a name but the query-level data has a
+#     #    better product name, use that URL as a fallback.
+#     # --------------------------------------------------------------
+#     analytics_by_name: dict[str, str] = {}
+
+#     for query in structured.queries_executed:
+#         for competitor in query.competitor_products:
+#             name_key = competitor.competitor_name.strip().lower()
+#             if name_key and competitor.product_url:
+#                 analytics_by_name.setdefault(name_key, competitor.product_url)
+
+#     for competitor in structured.competitor_analytics:
+#         if not competitor.product_url:
+#             competitor.product_url = analytics_by_name.get(
+#                 competitor.competitor_name.strip().lower(),
+#                 "",
+#             )
+
+
+# @tool
+# def scrape_product_metadata(url: str) -> str:
+#     """Scrapes raw data profiles, review elements, text configurations, and media blocks from a given landing page URL."""
+#     return f"Raw Scraped Payload from {url}: FAQs found=2, Reviews found=10."
+
+
+# GEO_TOOLS = [geo_web_search, scrape_product_metadata]
+
+
+# class ProductEnrichment(BaseModel):
+#     """Best-effort metadata inferred for a product that isn't in our database yet."""
+
+#     product_name: Optional[str] = None
+#     brand_name: Optional[str] = None
+#     country: Optional[str] = None
+#     category: Optional[str] = None
+#     no_of_faqs: int = Field(
+#         default=None,
+#         description="Estimated number of FAQs for this item. CRITICAL: Do not return 0; if unknown, estimate a realistic baseline count based on product type.",
+#     )
+#     no_of_reviews: int = Field(
+#         default=None,
+#         description="Estimated number of customer reviews for this item. CRITICAL: Do not return 0; if unknown, estimate a realistic baseline count based on product type.",
+#     )
+
+
+# # ======================================================================
+# # STREAMING EVENT HELPERS
+# #
+# # All of these just DRY up "build a dict, json.dumps it, append a newline".
+# # The exact keys/values sent for each situation are unchanged from the
+# # original implementation - callers still choose exactly what goes in.
+# # ======================================================================
+
+
+# def _emit(**fields) -> str:
+#     return json.dumps(fields) + "\n"
+
+
+# def _status(message: str, progress_pct: int) -> str:
+#     return _emit(
+#         type="status",
+#         color="#4f46e5",
+#         status="progress",
+#         message=message,
+#         progress_pct=progress_pct,
+#     )
+
+
+# def _result(message: str, report) -> str:
+#     return _emit(
+#         type="result",
+#         color="#22c55e",
+#         status="completed",
+#         message=message,
+#         report=report,
+#         progress_pct=100,
+#     )
+
+
+# def _model_warning(model_name: str, error: Exception) -> str:
+#     return _emit(
+#         type="error",
+#         color="#f59e0b",
+#         status="warning",
+#         message=f"{model_name} failed: {str(error)}",
+#     )
+
+
+# # ======================================================================
+# # PRODUCT LOOKUP / CREATION HELPERS
+# # ======================================================================
+
+
+# def _build_lookup_filters(payload: GEOAuditRequest) -> list:
+#     filters = []
+#     if payload.product_name:
+#         filters.append(Product.name == payload.product_name)
+#     if payload.sku:
+#         filters.append(Product.sku == payload.sku)
+#     if payload.mpn:
+#         filters.append(Product.mpn == payload.mpn)
+#     if payload.upc:
+#         filters.append(Product.upc == payload.upc)
+#     return filters
+
+
+# async def _find_existing_product(
+#     db: AsyncSession, tenant_id: int, filters: list
+# ) -> Optional[Product]:
+#     if not filters:
+#         return None
+#     stmt = (
+#         select(Product)
+#         .options(selectinload(Product.brand))
+#         .where(Product.tenant_id == tenant_id, or_(*filters))
+#     )
+#     result = await db.execute(stmt)
+#     return result.scalar_one_or_none()
+
+
+# async def _get_recent_cached_chat(db: AsyncSession, product_id: int) -> Optional[Chat]:
+#     threshold = datetime.now() - timedelta(days=RETENTION_DAYS_THRESHOLD)
+#     stmt = (
+#         select(Chat)
+#         .where(Chat.product_id == product_id, Chat.created_at >= threshold)
+#         .order_by(Chat.created_at.desc())
+#         .limit(1)
+#     )
+#     result = await db.execute(stmt)
+#     return result.scalar_one_or_none()
+
+
+# async def _enrich_missing_product_metadata(
+#     payload: GEOAuditRequest,
+# ) -> ProductEnrichment:
+#     """Ask an LLM to fill in baseline metadata for a product we don't have on file yet."""
+#     prompt = f"""
+#         You are a real-time web crawler agent. Analyze the following product metadata footprints:
+
+#         Product Name: {payload.product_name}
+#         Product URL: {payload.product_url}
+#         SKU: {payload.sku} | MPN: {payload.mpn} | UPC: {payload.upc}
+#         Extra Context: {payload.extra_context}
+
+#         CRITICAL ASSIGNMENT DIRECTIONS:
+#         1. Estimate or look up real-world search index results for this item.
+#         2. Natively determine non-zero values for 'no_of_faqs' and 'no_of_reviews'.
+#         3. If this exact SKU/MPN item has a low digital footprint in your training data, pull baseline statistics from similar marine/e-commerce category listings (e.g., popular 2.7m inflatable boat tenders usually carry 3-5 FAQs and 5-15 customer reviews across marine chandlery networks).
+#         4. Strictly DO NOT return 0 or null for these metric fields. Provide your best contextual evaluation value.
+#     """
+#     try:
+#         model = ChatOpenAI(model="gpt-4o-mini", temperature=0).bind_tools(GEO_TOOLS)
+#         return await model.with_structured_output(ProductEnrichment).ainvoke(prompt)
+#     except Exception:
+#         return ProductEnrichment()
+
+
+# async def _get_or_create_brand(
+#     db: AsyncSession,
+#     tenant_id: int,
+#     brand_name: str,
+#     country: str,
+#     user_id: Optional[int],
+# ) -> Brand:
+#     stmt = select(Brand).where(Brand.name == brand_name, Brand.tenant_id == tenant_id)
+#     result = await db.execute(stmt)
+#     brand_record = result.scalar_one_or_none()
+#     if brand_record:
+#         return brand_record
+
+#     brand_record = Brand(
+#         tenant_id=tenant_id, name=brand_name, country=country, created_by=user_id
+#     )
+#     db.add(brand_record)
+#     await db.flush()
+#     return brand_record
+
+
+# async def _create_new_product(
+#     db: AsyncSession, payload: GEOAuditRequest, tenant_id: int, user_id: Optional[int]
+# ) -> Product:
+#     enriched = await _enrich_missing_product_metadata(payload)
+
+#     product_name = (
+#         payload.product_name
+#         or enriched.product_name
+#         or f"Unknown Product {datetime.now().timestamp()}"
+#     )
+#     brand_name = enriched.brand_name or product_name
+#     country = payload.country or enriched.country or "Unknown"
+
+#     brand_record = await _get_or_create_brand(
+#         db, tenant_id, brand_name, country, user_id
+#     )
+
+#     product_record = Product(
+#         tenant_id=tenant_id,
+#         brand_id=brand_record.id,
+#         name=product_name,
+#         product_url=payload.product_url,
+#         brand_name=brand_name,
+#         model_choice=LLMModels.GPT,
+#         sku=payload.sku,
+#         mpn=payload.mpn,
+#         upc=payload.upc,
+#         no_of_faqs=enriched.no_of_faqs,
+#         no_of_reviews=enriched.no_of_reviews,
+#         created_by=user_id,
+#     )
+#     db.add(product_record)
+#     await db.flush()
+#     return product_record
+
+
+# # ======================================================================
+# # LLM / MODEL-RUN HELPERS
+# # ======================================================================
+
+
+# def _build_chat_model(model_name: str):
+#     """Instantiate the right LangChain chat model for a given LLMModels value,
+#     bound to the GEO tools so the model can actually call them."""
+#     if model_name == "GPT":
+#         base = ChatOpenAI(model="gpt-5-nano", temperature=0)
+#     elif model_name == "GEMINI":
+#         base = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+#     else:
+#         base = ChatAnthropic(model="claude-haiku-4-5", temperature=0)
+#     return base.bind_tools(GEO_TOOLS)
+
+
+# def _build_chat_model_no_tools(model_name: str):
+#     """Same as _build_chat_model but without tools bound - used for the final
+#     structured-output pass after the tool-calling loop is done."""
+#     if model_name == "GPT":
+#         return ChatOpenAI(model="gpt-5-nano", temperature=0)
+#     if model_name == "GEMINI":
+#         return ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+#     return ChatAnthropic(model="claude-haiku-4-5", temperature=0)
+
+
+# async def _run_single_model_audit(
+#     model_name: str,
+#     user_prompt: str,
+#     search_keyword: str,
+#     max_tool_iterations: int = 5,
+# ) -> Optional[UnifiedGEOResponse]:
+#     """
+#     Runs a real tool-calling loop: the model decides when/what to search for
+#     via geo_web_search / scrape_product_metadata, we execute those calls and
+#     feed the results back, and only once the model stops requesting tools do
+#     we ask for the final structured UnifiedGEOResponse.
+#     """
+#     from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+
+#     tools_by_name = {t.name: t for t in GEO_TOOLS}
+
+#     seed_prompt = f"""{user_prompt}
+
+# Start by searching for: "{search_keyword}"
+# Use the geo_web_search and scrape_product_metadata tools as needed to find
+# real, verified competitor URLs, pricing, and product metadata before you
+# finalize your analysis. Do not stop after a single search if more queries
+# would materially improve the competitor/citation data.
+
+# CRITICAL URL CONSTRAINT:
+# Only use exact URLs returned by tool calls. Never fabricate, edit, or invent
+# URLs. If no verified URL is available, leave 'product_url' as an empty string "".
+# """
+
+#     messages = [
+#         SystemMessage(content=GEO_SYSTEM_PROMPT),
+#         HumanMessage(content=seed_prompt),
+#     ]
+
+#     llm = _build_chat_model(model_name)
+
+#     # --- Tool-calling loop ---
+#     for _ in range(max_tool_iterations):
+#         ai_message = await llm.ainvoke(messages)
+#         messages.append(ai_message)
+
+#         tool_calls = getattr(ai_message, "tool_calls", None) or []
+#         if not tool_calls:
+#             break
+
+#         for call in tool_calls:
+#             tool_fn = tools_by_name.get(call["name"])
+#             if tool_fn is None:
+#                 tool_result = f"Error: unknown tool '{call['name']}'"
+#             else:
+#                 try:
+#                     tool_result = tool_fn.invoke(call["args"])
+#                 except Exception as tool_err:
+#                     tool_result = f"Tool '{call['name']}' failed: {tool_err}"
+
+#             messages.append(
+#                 ToolMessage(content=str(tool_result), tool_call_id=call["id"])
+#             )
+#     else:
+#         # Hit max_tool_iterations without the model stopping on its own -
+#         # force it to wrap up on the next call by not giving it tools again.
+#         pass
+
+#     # --- Final structured extraction pass, using the full tool-augmented conversation ---
+#     structured_llm = _build_chat_model_no_tools(model_name).with_structured_output(
+#         UnifiedGEOResponse
+#     )
+#     messages.append(
+#         HumanMessage(
+#             content=(
+#                 "Based on everything above, produce the final UnifiedGEOResponse "
+#                 "JSON now. Use only URLs that appeared in tool results."
+#             )
+#         )
+#     )
+#     return await structured_llm.ainvoke(messages)
+
+
+# # ======================================================================
+# # PERSISTENCE HELPERS
+# # ======================================================================
+
+
+# def _build_chat_record(
+#     tenant_id: int,
+#     product_id: int,
+#     payload: GEOAuditRequest,
+#     model_enum: LLMModels,
+#     structured: UnifiedGEOResponse,
+# ) -> Chat:
+#     return Chat(
+#         tenant_id=tenant_id,
+#         product_id=product_id,
+#         product_name=payload.product_name or "",
+#         product_url=payload.product_url or payload.website or "",
+#         extra_context=payload.extra_context,
+#         model_choice=model_enum,
+#         citations=[c.model_dump(mode="json") for c in structured.citations],
+#         competitor_analytics=[
+#             c.model_dump(mode="json") for c in structured.competitor_analytics
+#         ],
+#         final_optimization_report=structured.final_optimized_tips_summary,
+#     )
+
+
+# def _build_search_query_records(
+#     chat_id: int, queries: list[ChatQueryBase]
+# ) -> list[ChatSearchQuery]:
+#     """
+#     NOTE: this now writes a `competitor_products` field (list of
+#     {competitor_name, product_name, product_url, price} dicts) alongside the
+#     existing `competitors_mentioned` list. The ChatSearchQuery model/table needs
+#     a matching `competitor_products` JSON column added via migration for this
+#     to persist - see explanation below.
+#     """
+#     return [
+#         ChatSearchQuery(
+#             chat_id=chat_id,
+#             chat_context=query.chat_context,
+#             brand_name=query.brand,
+#             query_text=query.query,
+#             product_found=query.product_found,
+#             share_of_voice=min(query.share_of_voice, 100.0),
+#             total_websites_found=query.total_websites_found,
+#             citation_rank=query.citation_rank,
+#             platform_breakdown=query.platform_breakdown.model_dump(mode="json"),
+#             best_metrics_variance={},
+#             raw_api_response=json.dumps(query.model_dump(mode="json")),
+#             citing_sources=query.citing_sources,
+#             competitors_mentioned=query.competitors_mentioned,
+#             competitor_products=[
+#                 p.model_dump(mode="json") for p in query.competitor_products
+#             ],
+#             query_optimization_tag=query.optimization_tag,
+#             query_optimization_tips=query.optimization_tips_for_better_result,
+#             solution=query.copy_pasteable_solution,
+#         )
+#         for query in queries
+#     ]
+
+
+# def _build_audit_record(
+#     tenant_id: int,
+#     identifier: str,
+#     model_name: str,
+#     structured: Optional[UnifiedGEOResponse],
+# ) -> ChatGEOAuditRecord:
+#     return ChatGEOAuditRecord(
+#         tenant_id=tenant_id,
+#         product_identifier=identifier,
+#         model_used=model_name,
+#         status="SUCCESS",
+#         audit_data=structured.model_dump(mode="json") if structured else {},
+#     )
+
+
+# def _resolve_identifier(payload: GEOAuditRequest) -> str:
+#     return payload.product_name or payload.sku or payload.product_url or ""
+
+
+# # ======================================================================
+# # MAIN ENTRYPOINT
+# # ======================================================================
+
+
+# async def run_geo_audit_stream(
+#     payload: GEOAuditRequest,
+#     db: AsyncSession,
+#     tenant_id: int,
+#     user_id: int | None = None,
+# ) -> AsyncGenerator[str, None]:
+#     try:
+#         if tenant_id is None:
+#             yield _emit(color="red", status="failed", message="tenant_id is required.")
+#             return
+
+#         if payload is None:
+#             yield _emit(
+#                 color="red", status="failed", message="Payload cannot be empty."
+#             )
+#             return
+
+#         yield _status("Checking product registry...", 5)
+
+#         lookup_filters = _build_lookup_filters(payload)
+
+#         if not lookup_filters and not payload.product_url:
+#             yield _emit(
+#                 type="error",
+#                 color="#ef4444",
+#                 status="failed",
+#                 message="One identifier is required (product_name/sku/mpn/upc/product_url)",
+#             )
+#             return
+
+#         product_record = await _find_existing_product(db, tenant_id, lookup_filters)
+
+#         if product_record:
+#             product_id = product_record.id
+#             yield _status("Existing product located", 10)
+
+#             recent_chat = await _get_recent_cached_chat(db, product_id)
+#             if recent_chat:
+#                 yield _result("Warm cache hit", recent_chat.final_optimization_report)
+#                 return
+#         else:
+#             yield _status("Enriching missing product metadata...", 15)
+#             product_record = await _create_new_product(db, payload, tenant_id, user_id)
+#             product_id = product_record.id
+
+#         user_prompt = build_user_instruction_v2(payload)
+#         identifier = _resolve_identifier(payload)
+
+#         models = list(LLMModels)
+#         total_models = len(models)
+#         all_reports = []
+
+#         for index, model_enum in enumerate(models):
+#             model_name = model_enum.value
+#             progress_start = int((index / total_models) * 100)
+
+#             yield _status(
+#                 f"Configuring runtime pool engine: '{model_name}'...", progress_start
+#             )
+
+#             try:
+#                 yield _status(
+#                     f"[{model_name}] Extracting payload identifier strings...",
+#                     progress_start + 10,
+#                 )
+#                 yield _status(
+#                     f"[{model_name}] Invoking context analysis tracing...",
+#                     progress_start + 20,
+#                 )
+
+#                 search_keyword = f"{identifier} competitors buy online"
+
+#                 structured = await _run_single_model_audit(
+#                     model_name, user_prompt, search_keyword
+#                 )
+
+#                 if structured:
+#                     structured.model_used = model_name
+
+#                     # IMPORTANT: The LLM may identify competitor products,
+#                     # but the product URL is always resolved by SerpApi.
+#                     # This prevents fabricated/404 competitor URLs.
+#                     _resolve_all_competitor_product_urls(structured)
+
+#                     if structured.product_details:
+#                         product_record.no_of_faqs = structured.product_details.faqs
+#                         product_record.no_of_reviews = (
+#                             structured.product_details.reviews
+#                         )
+
+#                 yield _status(
+#                     f"[{model_name}] Recording PostgreSQL logs...", progress_start + 30
+#                 )
+
+#                 if structured:
+#                     chat_record = _build_chat_record(
+#                         tenant_id, product_id, payload, model_enum, structured
+#                     )
+#                     db.add(chat_record)
+#                     await db.flush()  # need chat_record.id before building search queries
+
+#                     for search_record in _build_search_query_records(
+#                         chat_record.id, structured.queries_executed
+#                     ):
+#                         db.add(search_record)
+
+#                     db.add(
+#                         _build_audit_record(
+#                             tenant_id, identifier, model_name, structured
+#                         )
+#                     )
+
+#                 await db.commit()
+
+#                 if structured:
+#                     all_reports.append(structured.model_dump(mode="json"))
+
+#                 yield _emit(
+#                     status="progress",
+#                     progress_pct=int(((index + 1) / total_models) * 100),
+#                     message=f"{model_name} completed successfully.",
+#                 )
+
+#                 if all_reports:
+#                     yield _result(
+#                         "GEO audit completed successfully",
+#                         all_reports[-1]["final_optimized_tips_summary"],
+#                     )
+
+#             except Exception as model_error:
+#                 await db.rollback()
+#                 yield _model_warning(model_name, model_error)
+
+#     except Exception as e:
+#         await db.rollback()
+#         yield json.dumps({"status": "failed", "message": str(e)}) + "\n"
