@@ -1172,6 +1172,8 @@ class ProductService:
                 "chats": chat_list,
             }
 
+        elif tab == "actual_content":
+            response_payload["tabData"] = {"actual_content": product.actual_content}
         return response_payload
 
     @staticmethod

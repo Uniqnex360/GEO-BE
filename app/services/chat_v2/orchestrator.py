@@ -96,6 +96,16 @@ async def run_geo_audit_stream(
             product_record = await create_new_product(db, payload, tenant_id, user_id)
             product_id = product_record.id
 
+        from .actual_content import (
+            save_extraction_to_product,
+            extract_product_page_once,
+        )
+        print("payload", payload)
+        data = await extract_product_page_once(url=payload.product_url or payload.website, use_web_fallback=True)
+        print("data", data)
+        await save_extraction_to_product(db, product_record, data)
+        print("saving is finished")
+
         user_prompt = build_user_instruction_v2(payload)
         identifier = resolve_identifier(payload)
 

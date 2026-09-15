@@ -710,63 +710,49 @@ def looks_content_poor(soup: BeautifulSoup) -> bool:
     return len(text) < 200
 
 
-def fetch_html_playwright(url: str) -> str:
-    """Only invoked when the plain HTTP fetch looks JS-rendered / content-poor."""
+async def fetch_html_playwright(url: str) -> str:
+    """Fetch page HTML using Playwright Async API."""
+
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.async_api import async_playwright
     except ImportError as exc:
         raise RuntimeError(
-            "Playwright is not installed but a JS-rendered fallback was needed. "
+            "Playwright is not installed. "
             "Run: pip install playwright && playwright install chromium"
         ) from exc
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
             args=["--disable-blink-features=AutomationControlled"]
         )
-        context = browser.new_context(
+
+        context = await browser.new_context(
             user_agent=BROWSER_HEADERS["User-Agent"],
             viewport={"width": 1366, "height": 900},
             locale="en-US",
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
         )
-        page = context.new_page()
-        page.goto(url, timeout=REQUEST_TIMEOUT_SECONDS * 1000, wait_until="networkidle")
-        html = page.content()
-        browser.close()
+
+        page = await context.new_page()
+
+        await page.goto(
+            url,
+            timeout=REQUEST_TIMEOUT_SECONDS * 1000,
+            wait_until="networkidle",
+        )
+
+        html = await page.content()
+
+        await browser.close()
+
         return html
 
 
-def fetch_html(url: str) -> str:
+async def fetch_html(url: str) -> str:
     """
-    Tries a plain HTTP fetch first (cheap, fast). Falls back to a real
-    browser (Playwright) if:
-      - the plain fetch was blocked by bot/WAF protection (403/429/503), or
-      - the plain fetch succeeded but the page looks JS-rendered / content-poor.
+    Fetches the page using Playwright browser.
     """
-    try:
-        html = fetch_html_httpx(url)
-    except BotBlockedError as exc:
-        logger.info(
-            "httpx fetch blocked (status %s) for %s, falling back to Playwright",
-            exc.status_code,
-            url,
-        )
-        return fetch_html_playwright(url)
-
-    soup = BeautifulSoup(html, "html.parser")
-    if looks_content_poor(soup):
-        logger.info(
-            "Content looks JS-rendered / sparse, falling back to Playwright for %s", url
-        )
-        try:
-            html = fetch_html_playwright(url)
-        except Exception as exc:
-            logger.warning(
-                "Playwright fallback failed (%s); continuing with httpx result", exc
-            )
-
-    return html
+    return await fetch_html_playwright(url)
 
 
 # --------------------------------------------------------------------------
@@ -774,7 +760,7 @@ def fetch_html(url: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def extract_product_page_once(
+async def extract_product_page_once(
     url: str, use_web_fallback: bool = True
 ) -> dict[str, Any]:
     """
@@ -784,7 +770,7 @@ def extract_product_page_once(
     """
     started_at = time.time()
 
-    html = fetch_html(url)
+    html = await fetch_html(url)
     original_html_chars = len(html)
 
     # Parse once to pull JSON-LD before anything is stripped.
@@ -869,24 +855,15 @@ def extract_product_page_once(
 # query/aggregate spend without unpacking the whole JSON blob.
 
 
-def save_extraction_to_product(session, product, extraction_result: dict) -> None:
+async def save_extraction_to_product(
+    session: AsyncSession, product, extraction_result: dict
+) -> None:
     """
     Persists a one-time extraction result onto an existing Product row.
-
-    `session` is your SQLAlchemy session; `product` is the Product instance
-    (already fetched / created) you want to attach this to.
     """
+
     product.actual_content = extraction_result
     product.extraction_token_usage = extraction_result.get("token_usage", {})
+
     session.add(product)
-    session.commit()
-
-
-# --------------------------------------------------------------------------
-# Example usage
-# --------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    example_url = "https://www.chmarine.com/musto-essential-pique-polo-men-black/"
-    result = extract_product_page_once(example_url)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    await session.commit()

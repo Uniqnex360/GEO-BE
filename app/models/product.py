@@ -133,6 +133,12 @@ class Product(BaseModel):
         Integer, nullable=True, default=None
     )
 
+    # actual content
+    actual_content: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    extraction_token_usage: Mapped[dict] = mapped_column(
+        JSONB, nullable=True, default=dict, server_default="{}"
+    )
+
     # relationships
     tenant: Mapped["Tenant"] = relationship(back_populates="products")
     brand: Mapped["Brand"] = relationship(back_populates="products")
