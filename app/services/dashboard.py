@@ -12,6 +12,109 @@ from fastapi import HTTPException, status
 
 from app.models import Product, Chat, ChatGEOAuditRecord, ChatSearchQuery
 
+MARKET_PLACES = [
+    "amazon",
+    "ebay",
+    "walmart",
+    "etsy",
+    "target",
+    "wayfair",
+    "temu",
+    "aliexpress",
+    "tiktokshop",
+    "walmartmarketplace",
+    "bestbuy",
+    "homedepot",
+    "lowes",
+    "macys",
+    "kohls",
+    "samsclub",
+    "costco",
+    "newegg",
+    "overstock",
+    "poshmark",
+    "chewy",
+    "wayfair",
+    "zappos",
+    "nordstrom",
+    "dickssportinggoods",
+    "academy",
+    "rei",
+    "bassproshops",
+    "cabelas",
+    "tractorsupply",
+    "chmarine",
+    "westmarine",
+    "boatersworld",
+    "defender",
+    "overtons",
+    "fisheriesupply",
+    "wholesalemarine",
+    "iboats",
+    "tacklewarehouse",
+    "basspro",
+    "onbuy",
+    "argos",
+    "asos",
+    "tesco",
+    "sainsburys",
+    "bq",
+    "currys",
+    "johnlewis",
+    "marksandspencer",
+    "next",
+    "notonthehighstreet",
+    "game",
+    "very",
+    "ao",
+    "fruugo",
+    "manomano",
+    "zavvi",
+    "sportsdirect",
+    "jdsports",
+    "decathlon",
+    "zalando",
+    "otto",
+    "kaufland",
+    "mediamarkt",
+    "saturn",
+    "aboutyou",
+    "breuninger",
+    "zooplus",
+    "fressnapf",
+    "douglas",
+    "allegro",
+    "cdiscount",
+    "fnac",
+    "darty",
+    "rakuten",
+    "veepee",
+    "carrefour",
+    "leboncoin",
+    "backmarket",
+    "vinted",
+    "bol",
+    "galaxus",
+    "wehkamp",
+    "coolblue",
+    "conrad",
+    "alternate",
+    "notebooksbilliger",
+    "pccomponentes",
+    "worten",
+    "elcorteingles",
+    "miravia",
+    "emag",
+    "skroutz",
+    "hepsiburada",
+    "trendyol",
+    "ceneo",
+    "wallapop",
+    "catawiki",
+    "stockx",
+    "vestiairecollective",
+]
+
 
 class DynamicRow:
     def __init__(self, **kwargs):
@@ -171,9 +274,7 @@ class TenantDashboardService:
             else:
                 unique_countries.add("US")
 
-            current_period_rows.append(
-                (q_row, chat_row, product_row, geo_row)
-            )
+            current_period_rows.append((q_row, chat_row, product_row, geo_row))
 
         # ------------------------------------------------------------------
         # 3. DRY Metric Aggregator Engine
@@ -289,17 +390,7 @@ class TenantDashboardService:
                                 ]
                             ):
                                 citation_distribution["News"] += 1
-                            elif any(
-                                w in url_lower
-                                for w in [
-                                    "amazon",
-                                    "shop",
-                                    "dickssportinggoods",
-                                    "ebay",
-                                    "marketplace",
-                                    "fleetfeet",
-                                ]
-                            ):
+                            elif any(w in url_lower for w in MARKET_PLACES):
                                 citation_distribution["Marketplaces"] += 1
                             else:
                                 citation_distribution["Forums"] += 1
