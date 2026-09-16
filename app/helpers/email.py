@@ -11,8 +11,8 @@ async def send_email(
     html: str,
 ):
     params: resend.Emails.SendParams = {
-        # "from": "techteam@uniqnex360.com",
-        "from": "onboarding@resend.dev",
+        # "from": "onboarding@resend.dev", # for testing
+        "from":"growth@contentlynxe.com",
         "to": [to],
         "subject": subject,
         "html": html,

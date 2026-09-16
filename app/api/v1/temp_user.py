@@ -89,9 +89,8 @@ async def create_temp_user(
 
         # send welcome email
         _ = await send_email(
-            # to="growth@contentlynxe.com",
+            to="growth@contentlynxe.com",
             # to="delson@uniqnex360.com",
-            to="techteam@uniqnex360.com",
             subject="New user Onboarded",
             html=f"""
             <h1>User {data.name}</h1>
@@ -103,8 +102,7 @@ async def create_temp_user(
 
         # send user a welcom email
         _ = await send_email(
-            # to=data.email,
-            to="techteam@uniqnex360.com",
+            to=data.email,
             subject="New user Onboarded",
             html=f"""
                     <h1>Welcome {data.name}</h1>
@@ -218,8 +216,7 @@ async def create_temp_user(
     html = build_geo_email({"product": product_data})
 
     await send_email(
-        # to=data.email,
-        to="techteam@uniqnex360.com",
+        to=data.email,
         subject=f"Report for the product {data.product_url}",
         html=html,
     )
