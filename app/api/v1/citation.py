@@ -24,3 +24,17 @@ async def citation_dashboard(
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/list/")
+async def citation_list(
+    db: AsyncSession = Depends(get_db),
+    tenant_id: Optional[int] = Query(None),
+):
+    """returns citation list data"""
+
+    try:
+        print("tenant id", tenant_id, type(tenant_id))
+        return await CitationService.get_unique_citations(db, int(tenant_id))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
