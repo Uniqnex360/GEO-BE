@@ -1,4 +1,5 @@
 import uuid
+import json
 import statistics
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
@@ -7,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.chat import Chat, ChatSearchQuery
+from app.models import Product
 
 
 class CitationService:
@@ -390,3 +392,40 @@ class CitationService:
                 for chat in chats
             ],
         }
+
+    async def get_unique_citations(
+        db: AsyncSession,
+        tenant_id: int,
+    ) -> list[str]:
+        """Get unique citation URLs for a tenant from the database."""
+
+        query = (
+            select(ChatSearchQuery.citing_sources)
+            .join(Chat, ChatSearchQuery.chat_id == Chat.id)
+            .join(Product, Chat.product_id == Product.id)
+            .where(
+                Product.tenant_id == tenant_id,
+                Product.is_deleted.is_(False),
+            )
+        )
+
+        result = await db.execute(query)
+        rows = result.scalars().all()
+
+        unique_citations = set()
+
+        for sources in rows:
+            if isinstance(sources, str):
+                try:
+                    sources = json.loads(sources) or []
+                except Exception:
+                    continue
+
+            if not isinstance(sources, list):
+                continue
+
+            for url in sources:
+                if url and isinstance(url, str):
+                    unique_citations.add(url)
+
+        return {"citations": list(unique_citations)}
