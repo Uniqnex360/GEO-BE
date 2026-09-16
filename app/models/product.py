@@ -149,3 +149,4 @@ class Product(BaseModel):
         back_populates="product", cascade="all, delete-orphan"
     )
     chats = relationship("Chat", back_populates="product")
+

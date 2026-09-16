@@ -15,6 +15,7 @@ from .meta import router as meta_router
 from .dashboard import router as dashboard_router
 from .app_settings import router as app_settings_router
 from .generate_content import router as generate_content
+from .temp_user import router as temp_user_router
 
 router = APIRouter()
 
@@ -35,3 +36,4 @@ router.include_router(app_settings_router, prefix="/settings", tags=["Settings"]
 router.include_router(
     generate_content, prefix="/generate_content", tags=["Generate API content"]
 )
+router.include_router(temp_user_router, prefix="/temp-user", tags=["Temp User"])

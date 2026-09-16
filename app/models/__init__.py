@@ -5,3 +5,4 @@ from .product import Product, ProductFAQ, ProductFeature
 from .chat import Chat, ChatSearchQuery, ChatGEOAuditRecord
 from .meta import MetaTable
 from .app_settings import AppSettings
+from .tempUser import TempUesr

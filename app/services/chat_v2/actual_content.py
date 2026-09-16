@@ -57,7 +57,7 @@ logging.basicConfig(level=logging.INFO)
 
 MAX_LLM_PAGE_CHARS = 18000  # upper limit, not a target
 MIN_BLOCK_TEXT_LEN = 10
-REQUEST_TIMEOUT_SECONDS = 15.0
+REQUEST_TIMEOUT_SECONDS = 150.0
 OPENAI_MODEL = "gpt-4o-mini"  # cheap + supports structured outputs; swap as needed
 
 REMOVE_TAGS = [
