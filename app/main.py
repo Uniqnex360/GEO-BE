@@ -11,7 +11,8 @@ app.add_middleware(
         "http://localhost:5173",  # Vite
         "http://localhost:5174", 
         "https://geo-fe.onrender.com",
-        "https://app.contentlynxe.com"
+        "https://app.contentlynxe.com",
+        "https://www.contentlynxe.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],
