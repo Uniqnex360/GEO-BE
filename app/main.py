@@ -9,6 +9,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",  # Vite
+        "http://localhost:5174", 
         "https://geo-fe.onrender.com",
         "https://app.contentlynxe.com"
     ],

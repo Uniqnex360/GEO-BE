@@ -1,0 +1,3 @@
+docker exec -it fastapi_app alembic revision --autogenerate -m "new temp user"
+
+docker exec -it fastapi_app alembic upgrade head

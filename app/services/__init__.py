@@ -9,3 +9,4 @@ from .chat import ChatService
 from .chat_v2 import run_geo_audit_stream
 from .dashboard import TenantDashboardService
 from .brand_analytics import start_brand_analytics
+from .build_email_html import build_geo_email, send_geo_email

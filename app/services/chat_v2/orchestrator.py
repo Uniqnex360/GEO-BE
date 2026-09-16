@@ -53,7 +53,6 @@ from .streaming import (
 )
 from .tools import resolve_all_competitor_product_urls
 
-
 async def run_geo_audit_stream(
     payload: GEOAuditRequest,
     db: AsyncSession,
@@ -101,7 +100,7 @@ async def run_geo_audit_stream(
             extract_product_page_once,
         )
         print("payload", payload)
-        data = await extract_product_page_once(url=payload.product_url or payload.website, use_web_fallback=True)
+        data = await extract_product_page_once(url=payload.product_url or payload.website)
         print("data", data)
         await save_extraction_to_product(db, product_record, data)
         print("saving is finished")

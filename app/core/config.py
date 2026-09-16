@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     #search api key
     SERPAPI_KEY: str
 
+    RESEND_API_KEY: str
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
