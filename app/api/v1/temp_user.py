@@ -16,7 +16,7 @@ from app.models import (
 )
 from app.services.chat_v2 import run_geo_audit_stream
 from app.services.chat_v2.schemas import GEOAuditRequest
-from app.services import build_geo_email, send_geo_email
+from app.services import build_geo_email
 from app.helpers.email import send_email
 
 

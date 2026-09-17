@@ -1174,7 +1174,7 @@ class ProductService:
 
         elif tab == "actual_content":
             response_payload["tabData"] = {"actual_content": product.actual_content}
-        return response_payload #test
+        return response_payload  # test
 
     @staticmethod
     async def list_products(
@@ -1254,6 +1254,7 @@ class ProductService:
         # 3. Dynamic Filters & Product ID Resolution
         # ------------------------------------------------------------------
         view_filters = list(tenant_filters)
+
         if brand:
             brand_list = [b.strip() for b in brand.split(",") if b.strip()]
             if brand_list:
@@ -1273,6 +1274,7 @@ class ProductService:
         # 4. Sorting & Paginated ID Fetching
         # ------------------------------------------------------------------
         total_count_col = func.count().over().label("total_count_val")
+
         VISIBILITY_SORT_KEYS = {
             "visibility": None,
             "visibility_gpt": "GPT",
@@ -1286,6 +1288,7 @@ class ProductService:
                 matched_total = func.sum(
                     case((Chat.model_choice == engine_code, 1), else_=0)
                 )
+
                 matched_found = func.sum(
                     case(
                         (
@@ -1296,6 +1299,7 @@ class ProductService:
                         else_=0,
                     )
                 )
+
                 return case(
                     (
                         matched_total > 0,
@@ -1312,7 +1316,10 @@ class ProductService:
                     _engine_rate_col("CLAUDE").label("claude_rate"),
                 )
                 .outerjoin(Chat, Chat.product_id == Product.id)
-                .outerjoin(ChatSearchQuery, ChatSearchQuery.chat_id == Chat.id)
+                .outerjoin(
+                    ChatSearchQuery,
+                    ChatSearchQuery.chat_id == Chat.id,
+                )
                 .where(*view_filters)
                 .group_by(Product.id)
                 .subquery()
@@ -1330,42 +1337,66 @@ class ProductService:
                     + func.coalesce(engine_rate_cols[1], 0.0)
                     + func.coalesce(engine_rate_cols[2], 0.0)
                 )
+
                 order_visibility_col = sum_rates_expr / 3.0
+
             else:
                 target_engine = VISIBILITY_SORT_KEYS[sort_by]
+
                 col_map = {
                     "GPT": vis_subquery.c.gpt_rate,
                     "GEMINI": vis_subquery.c.gemini_rate,
                     "CLAUDE": vis_subquery.c.claude_rate,
                 }
-                order_visibility_col = func.coalesce(col_map[target_engine], 0.0)
+
+                order_visibility_col = func.coalesce(
+                    col_map[target_engine],
+                    0.0,
+                )
 
             paginated_id_stmt = (
                 select(Product.id, total_count_col)
-                .outerjoin(vis_subquery, Product.id == vis_subquery.c.prod_id)
+                .outerjoin(
+                    vis_subquery,
+                    Product.id == vis_subquery.c.prod_id,
+                )
                 .where(*view_filters)
-                .order_by(direction(order_visibility_col), desc(Product.created_at))
+                .order_by(
+                    direction(order_visibility_col),
+                    desc(Product.created_at),
+                )
                 .offset((page - 1) * limit)
                 .limit(limit)
             )
+
         else:
-            paginated_id_stmt = select(Product.id, total_count_col).where(*view_filters)
+            paginated_id_stmt = select(
+                Product.id,
+                total_count_col,
+            ).where(*view_filters)
+
             if sort_by == "brand":
                 paginated_id_stmt = paginated_id_stmt.outerjoin(
-                    Brand, Product.brand_id == Brand.id
+                    Brand,
+                    Product.brand_id == Brand.id,
                 )
 
             order_clauses = []
+
             if sort_by == "name":
                 order_clauses.append(direction(func.lower(Product.name)))
+
             elif sort_by == "sku":
                 order_clauses.append(direction(func.lower(Product.sku)))
+
             elif sort_by == "brand":
                 order_clauses.append(direction(func.lower(Brand.name)))
+
             else:
                 order_clauses.append(direction(Product.created_at))
 
             order_clauses.append(desc(Product.created_at))
+
             paginated_id_stmt = (
                 paginated_id_stmt.order_by(*order_clauses)
                 .offset((page - 1) * limit)
@@ -1374,7 +1405,9 @@ class ProductService:
 
         id_result = await db.execute(paginated_id_stmt)
         id_rows = id_result.all()
+
         ordered_product_ids = [row[0] for row in id_rows]
+
         total = id_rows[0].total_count_val if id_rows else len(all_product_ids)
 
         # ------------------------------------------------------------------
@@ -1389,10 +1422,12 @@ class ProductService:
                 joinedload(Product.brand),
             )
         )
+
         products_result = await db.execute(products_fetch_stmt)
         fetched_products = products_result.unique().scalars().all()
 
         product_by_id = {p.id: p for p in fetched_products}
+
         ordered_products = [
             product_by_id[pid] for pid in ordered_product_ids if pid in product_by_id
         ]
@@ -1407,20 +1442,77 @@ class ProductService:
                 func.count(Chat.id.distinct()).label("total_chats"),
                 func.count(ChatSearchQuery.id).label("total_queries"),
                 func.sum(
-                    case((ChatSearchQuery.product_found.is_(True), 1), else_=0)
+                    case(
+                        (
+                            ChatSearchQuery.product_found.is_(True),
+                            1,
+                        ),
+                        else_=0,
+                    )
                 ).label("found_count"),
-                func.avg(cast(ChatSearchQuery.share_of_voice, Float)).label("avg_sov"),
-                func.avg(cast(ChatSearchQuery.citation_rank, Float)).label("avg_rank"),
+                func.avg(
+                    cast(
+                        ChatSearchQuery.share_of_voice,
+                        Float,
+                    )
+                ).label("avg_sov"),
+                func.avg(
+                    cast(
+                        ChatSearchQuery.citation_rank,
+                        Float,
+                    )
+                ).label("avg_rank"),
                 func.max(Chat.created_at).label("last_analysis"),
             )
             .join(Chat, Chat.product_id == Product.id)
-            .join(ChatSearchQuery, ChatSearchQuery.chat_id == Chat.id)
+            .join(
+                ChatSearchQuery,
+                ChatSearchQuery.chat_id == Chat.id,
+            )
             .where(Product.id.in_(ordered_product_ids))
-            .group_by(Product.id, Chat.model_choice)
+            .group_by(
+                Product.id,
+                Chat.model_choice,
+            )
         )
 
         engine_metrics_res = await db.execute(engine_metrics_stmt)
+
         metrics_rows = engine_metrics_res.all()
+
+        # ------------------------------------------------------------------
+        # 7. Product Token Aggregation
+        # ------------------------------------------------------------------
+        product_tokens_stmt = (
+            select(
+                Chat.product_id.label("product_id"),
+                func.coalesce(
+                    func.sum(Chat.input_tokens),
+                    0,
+                ).label("input_tokens"),
+                func.coalesce(
+                    func.sum(Chat.output_tokens),
+                    0,
+                ).label("output_tokens"),
+                func.coalesce(
+                    func.sum(Chat.total_tokens),
+                    0,
+                ).label("total_tokens"),
+            )
+            .where(Chat.product_id.in_(ordered_product_ids))
+            .group_by(Chat.product_id)
+        )
+
+        product_tokens_res = await db.execute(product_tokens_stmt)
+
+        product_tokens_map = {
+            row.product_id: {
+                "input_tokens": row.input_tokens,
+                "output_tokens": row.output_tokens,
+                "total_tokens": row.total_tokens,
+            }
+            for row in product_tokens_res.all()
+        }
 
         ENGINE_LABEL_MAP = {
             "GPT": "chatgpt",
@@ -1429,6 +1521,7 @@ class ProductService:
         }
 
         product_engine_map = defaultdict(dict)
+
         product_totals_map = defaultdict(
             lambda: {
                 "chats": set(),
@@ -1442,71 +1535,134 @@ class ProductService:
 
         for row in metrics_rows:
             engine_key = ENGINE_LABEL_MAP.get(
-                row.model_choice, str(row.model_choice).lower()
+                row.model_choice,
+                str(row.model_choice).lower(),
             )
+
             tot_q = row.total_queries or 0
-            vis_rate = round((row.found_count / tot_q) * 10, 2) if tot_q > 0 else 0.0
+
+            vis_rate = (
+                round(
+                    (row.found_count / tot_q) * 10,
+                    2,
+                )
+                if tot_q > 0
+                else 0.0
+            )
 
             product_engine_map[row.product_id][engine_key] = {
                 "total_chats": row.total_chats,
                 "total_queries": tot_q,
-                "avg_share_of_voice": round(row.avg_sov or 0.0, 2),
-                "avg_citation_rank": round(row.avg_rank or 0.0, 2),
+                "avg_share_of_voice": round(
+                    row.avg_sov or 0.0,
+                    2,
+                ),
+                "avg_citation_rank": round(
+                    row.avg_rank or 0.0,
+                    2,
+                ),
                 "visibility_rate": vis_rate,
                 "last_analysis": row.last_analysis,
             }
 
             p_tot = product_totals_map[row.product_id]
+
             p_tot["queries"] += tot_q
+
             p_tot["sov_sum"] += (row.avg_sov or 0.0) * tot_q
+
             if row.avg_rank:
                 p_tot["rank_sum"] += (row.avg_rank or 0.0) * tot_q
+
                 p_tot["rank_cnt"] += tot_q
+
             if p_tot["last_analysis"] is None or (
                 row.last_analysis and row.last_analysis > p_tot["last_analysis"]
             ):
                 p_tot["last_analysis"] = row.last_analysis
 
+        # ------------------------------------------------------------------
+        # 8. Build Product Payload
+        # ------------------------------------------------------------------
         products_payload = []
         all_vis_scores = []
 
         for product in ordered_products:
-            by_engine = product_engine_map.get(product.id, {})
-            # FIX: use the defaultdict's own indexing (not .get(..., {}))
-            # so products with no chat/query rows still get the full
-            # default shape (queries, sov_sum, rank_sum, rank_cnt, last_analysis)
-            # instead of a bare {} that has no "queries" key -> KeyError: 'queries'
+            by_engine = product_engine_map.get(
+                product.id,
+                {},
+            )
+
             totals = product_totals_map[product.id]
 
+            token_data = product_tokens_map.get(
+                product.id,
+                {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+            )
+
             rates = [eng["visibility_rate"] for eng in by_engine.values()]
-            overall_vis = round(sum(rates) / 3.0, 2)
+
+            overall_vis = round(
+                sum(rates) / 3.0,
+                2,
+            )
+
             all_vis_scores.append(overall_vis)
 
             tot_q = totals["queries"]
 
             product.product_brand_id = product.brand_id
+
             product.analytics = {
                 "total_queries": tot_q,
                 "avg_share_of_voice": (
-                    round(totals["sov_sum"] / tot_q, 2) if tot_q > 0 else 0.0
+                    round(
+                        totals["sov_sum"] / tot_q,
+                        2,
+                    )
+                    if tot_q > 0
+                    else 0.0
                 ),
                 "avg_citation_rank": (
-                    round(totals["rank_sum"] / totals["rank_cnt"], 2)
+                    round(
+                        totals["rank_sum"] / totals["rank_cnt"],
+                        2,
+                    )
                     if totals.get("rank_cnt", 0) > 0
                     else 0.0
                 ),
                 "visibility_rate": overall_vis,
                 "last_analysis": totals.get("last_analysis"),
                 "by_engine": by_engine,
+                # Product-level token usage
+                "input_tokens": token_data["input_tokens"],
+                "output_tokens": token_data["output_tokens"],
+                "total_tokens": token_data["total_tokens"],
             }
+
             products_payload.append(product)
 
+        # ------------------------------------------------------------------
+        # 9. Tenant Average Visibility
+        # ------------------------------------------------------------------
         if all_vis_scores:
             tenant_stats["avg_visibility_score"] = round(
-                sum(all_vis_scores) / len(all_vis_scores), 1
+                sum(all_vis_scores) / len(all_vis_scores),
+                1,
             )
 
         print(
-            f"⏱️ Total Optimized Execution Time: {round((time.perf_counter() - start_time) * 1000, 2)} ms"
+            f"⏱️ Total Optimized Execution Time: "
+            f"{round((time.perf_counter() - start_time) * 1000, 2)} ms"
         )
-        return products_payload, total, tenant_stats, all_product_ids
+
+        return (
+            products_payload,
+            total,
+            tenant_stats,
+            all_product_ids,
+        )
