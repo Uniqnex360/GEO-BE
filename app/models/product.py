@@ -89,6 +89,9 @@ class Product(BaseModel):
     description_ai: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default="{}"
     )
+    recommandation_v2: Mapped[dict] = mapped_column(
+        JSONB, nullable=True, default=dict, server_default="{}"
+    )
     specifications: Mapped[str] = mapped_column(Text, nullable=True)
 
     # Integer rewrite counters
@@ -149,4 +152,3 @@ class Product(BaseModel):
         back_populates="product", cascade="all, delete-orphan"
     )
     chats = relationship("Chat", back_populates="product")
-
