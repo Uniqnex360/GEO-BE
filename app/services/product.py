@@ -1095,60 +1095,65 @@ class ProductService:
             # KEEP THE SAME RESPONSE STRUCTURE
             response_payload["tabData"] = {"citations": ui_citations}
 
+        # elif tab == "recommendations":
+        #     ui_actions = []
+        #     for q in all_queries:
+        #         if q.query_optimization_tips and q.query_optimization_tips.strip():
+        #             parent_chat = getattr(q, "_parent_chat", None)
+        #             model_choice = parent_chat.model_choice if parent_chat else ""
+
+        #             chat_competitors = []
+        #             if (
+        #                 parent_chat
+        #                 and hasattr(parent_chat, "competitor_analytics")
+        #                 and parent_chat.competitor_analytics
+        #             ):
+        #                 if isinstance(parent_chat.competitor_analytics, list):
+        #                     chat_competitors = parent_chat.competitor_analytics
+
+        #             ui_actions.append(
+        #                 {
+        #                     "type": (
+        #                         "content"
+        #                         if "content" in q.query_optimization_tips.lower()
+        #                         else "gap"
+        #                     ),
+        #                     "effort": (
+        #                         "Low Effort"
+        #                         if len(q.query_optimization_tips) < 50
+        #                         else "Medium Effort"
+        #                     ),
+        #                     "query_optimization_tag": q.query_optimization_tag,
+        #                     "title": q.query_optimization_tips.strip(),
+        #                     "solution": q.solution,
+        #                     "model": model_choice,
+        #                     # "competitors": chat_competitors,
+        #                     "impact": (
+        #                         8.5 if q.product_found is False else 6.0
+        #                     ),  # Scale: 0.0 - 10.0
+        #                     "competitor_products": q.competitor_products,
+        #                 }
+        #             )
+
+        #     if not ui_actions:
+        #         ui_actions.append(
+        #             {
+        #                 "type": "citation",
+        #                 "effort": "Medium Effort",
+        #                 "title": "Inject missing merchant schema markup and structural FAQs to expand engine crawl vectors.",
+        #                 "model": "Unknown Model",
+        #                 "competitors": [],
+        #                 "impact": 9.0,  # Scale: 0.0 - 10.0
+        #             }
+        #         )
+
+        #     response_payload["tabData"] = {"actions": ui_actions[:8]}
+
         elif tab == "recommendations":
-            ui_actions = []
-            for q in all_queries:
-                if q.query_optimization_tips and q.query_optimization_tips.strip():
-                    parent_chat = getattr(q, "_parent_chat", None)
-                    model_choice = parent_chat.model_choice if parent_chat else ""
-
-                    chat_competitors = []
-                    if (
-                        parent_chat
-                        and hasattr(parent_chat, "competitor_analytics")
-                        and parent_chat.competitor_analytics
-                    ):
-                        if isinstance(parent_chat.competitor_analytics, list):
-                            chat_competitors = parent_chat.competitor_analytics
-
-                    ui_actions.append(
-                        {
-                            "type": (
-                                "content"
-                                if "content" in q.query_optimization_tips.lower()
-                                else "gap"
-                            ),
-                            "effort": (
-                                "Low Effort"
-                                if len(q.query_optimization_tips) < 50
-                                else "Medium Effort"
-                            ),
-                            "query_optimization_tag": q.query_optimization_tag,
-                            "title": q.query_optimization_tips.strip(),
-                            "solution": q.solution,
-                            "model": model_choice,
-                            # "competitors": chat_competitors,
-                            "impact": (
-                                8.5 if q.product_found is False else 6.0
-                            ),  # Scale: 0.0 - 10.0
-                            "competitor_products": q.competitor_products,
-                        }
-                    )
-
-            if not ui_actions:
-                ui_actions.append(
-                    {
-                        "type": "citation",
-                        "effort": "Medium Effort",
-                        "title": "Inject missing merchant schema markup and structural FAQs to expand engine crawl vectors.",
-                        "model": "Unknown Model",
-                        "competitors": [],
-                        "impact": 9.0,  # Scale: 0.0 - 10.0
-                    }
-                )
-
-            response_payload["tabData"] = {"actions": ui_actions[:8]}
-
+            response_payload["tabData"] = {
+                "actions": product.recommandation_v2 or []
+            }
+            
         elif tab == "tips":
             chat_list = []
             for chat in all_chats:
