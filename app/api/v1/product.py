@@ -9,6 +9,7 @@ from fastapi import (
     HTTPException,
     Query,
     BackgroundTasks,
+    Form,
     File,
     UploadFile,
 )
@@ -143,23 +144,25 @@ async def list_products(
 
     try:
 
-        products, total, tenant_states, product_ids = await ProductService.list_products(
-            db=db,
-            user=user,
-            tenant_id=active_tenant_id,
-            page=page,
-            limit=limit,
-            search=search,
-            brand=brand,
-            sort_by=sort_by,
-            sort_order=sort_order,
+        products, total, tenant_states, product_ids = (
+            await ProductService.list_products(
+                db=db,
+                user=user,
+                tenant_id=active_tenant_id,
+                page=page,
+                limit=limit,
+                search=search,
+                brand=brand,
+                sort_by=sort_by,
+                sort_order=sort_order,
+            )
         )
 
         return {
             "data": products,
             "tenant_states": tenant_states,
             "pagination": {"page": page, "limit": limit, "total": total},
-            "product_ids": product_ids
+            "product_ids": product_ids,
         }
 
     except Exception as e:
@@ -382,9 +385,12 @@ async def process_product_row(
             raise
 
 
+
+
+
 @router.post("/bulk-upload/")
 async def upload_excel_data(
-    background_tasks: BackgroundTasks,
+    tenant_id: int = Form(...),
     file: UploadFile = File(...),
     user: dict = Depends(validate_jwt_token),
 ):
@@ -397,77 +403,252 @@ async def upload_excel_data(
         data = list(sheet.iter_rows(values_only=True))
 
         if not data:
-            raise HTTPException(status_code=400, detail="Excel file is empty")
+            raise HTTPException(
+                status_code=400,
+                detail="Excel file is empty",
+            )
 
-        # Clean header strings
-        headers = [str(h).strip().lower() if h else "" for h in data[0]]
+        # ---------------------------------------------------------
+        # 1. Validate tenant_id received from frontend
+        # ---------------------------------------------------------
+        try:
+            tenant_id = int(tenant_id)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid tenant/project ID.",
+            )
+
+        print(
+            f"[BULK UPLOAD] Tenant ID received from frontend: {tenant_id}",
+            flush=True,
+        )
+
+        # ---------------------------------------------------------
+        # 2. Read and normalize headers
+        # ---------------------------------------------------------
+        headers = [
+            str(h).strip().lower().replace("_", " ") if h else ""
+            for h in data[0]
+        ]
+
         rows = data[1:]
 
-        validation = await validate_headers(headers, PRODUCT_TEMPLATE_HEADERS)
+        # ---------------------------------------------------------
+        # 3. Validate headers
+        # ---------------------------------------------------------
+        validation = await validate_headers(
+            headers,
+            PRODUCT_TEMPLATE_HEADERS,
+        )
+
         if validation:
             raise HTTPException(
                 status_code=400,
-                detail=f"Missing Columns: {', '.join(validation)}. Kindly use the explicit corporate template file.",
+                detail=(
+                    f"Missing Columns: {', '.join(validation)}. "
+                    "Kindly use the explicit corporate template file."
+                ),
             )
 
-        tenant_id = user.get("tenant_id")
-        if not tenant_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Project Id is required, Please Log in again",
-            )
-
+        # ---------------------------------------------------------
+        # 4. Get user ID from JWT
+        # ---------------------------------------------------------
         user_id = user.get("id") or user.get("user_id")
-        session_factory = SessionLocal
 
-        task_count = 0
+        if user_id is not None:
+            try:
+                user_id = int(user_id)
+            except (TypeError, ValueError):
+                user_id = None
 
-        for row in rows:
-            if not any(row):
-                continue
+        # ---------------------------------------------------------
+        # 5. Process Excel rows
+        # ---------------------------------------------------------
+        created_products = 0
+        skipped_products = 0
+        errors = []
 
-            row_dict = dict(zip(headers, row))
+        async with SessionLocal() as db:
+            for row_number, row in enumerate(rows, start=2):
 
-            print("row dict", row_dict)
+                # Skip completely empty rows
+                if not any(row):
+                    continue
 
-            cleaned_payload = {
-                "product_name": (
-                    str(row_dict["product name"]).strip()
-                    if row_dict.get("product name")
-                    else None
-                ),
-                "brand_name": (
-                    str(row_dict["brand name"]).strip()
-                    if row_dict.get("brand name")
-                    else None
-                ),
-                "sku": (str(row_dict["sku"]).strip() if row_dict.get("sku") else None),
-                "mpn": (str(row_dict["mpn"]).strip() if row_dict.get("mpn") else None),
-                "product_url": (
-                    str(row_dict["product url"]).strip()
-                    if row_dict.get("product url")
-                    else None
-                ),
-            }
-            print("data", cleaned_payload)
-            background_tasks.add_task(
-                process_product_row,
-                row_data=cleaned_payload,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                session_factory=session_factory,
-            )
-            task_count += 1
+                try:
+                    row_dict = dict(zip(headers, row))
 
+                    # ---------------------------------------------
+                    # Extract values
+                    # ---------------------------------------------
+                    product_name = (
+                        str(row_dict.get("product name")).strip()
+                        if row_dict.get("product name")
+                        else None
+                    )
+
+                    brand_name = (
+                        str(row_dict.get("brand name")).strip()
+                        if row_dict.get("brand name")
+                        else "Generic"
+                    )
+
+                    sku = (
+                        str(row_dict.get("sku")).strip()
+                        if row_dict.get("sku")
+                        else None
+                    )
+
+                    mpn = (
+                        str(row_dict.get("mpn")).strip()
+                        if row_dict.get("mpn")
+                        else None
+                    )
+
+                    product_url = (
+                        str(row_dict.get("product url")).strip()
+                        if row_dict.get("product url")
+                        else None
+                    )
+
+                    # ---------------------------------------------
+                    # Required product name
+                    # ---------------------------------------------
+                    if not product_name:
+                        skipped_products += 1
+
+                        errors.append(
+                            {
+                                "row": row_number,
+                                "error": "Product Name is required",
+                            }
+                        )
+
+                        continue
+
+                    # ---------------------------------------------
+                    # 6. Find existing Brand for this tenant
+                    # ---------------------------------------------
+                    brand_stmt = select(Brand).where(
+                        Brand.tenant_id == tenant_id,
+                        Brand.name == brand_name,
+                    )
+
+                    brand_result = await db.execute(brand_stmt)
+                    brand = brand_result.scalars().first()
+
+                    # ---------------------------------------------
+                    # 7. Create Brand if it doesn't exist
+                    # ---------------------------------------------
+                    if not brand:
+                        brand = Brand(
+                            name=brand_name,
+                            tenant_id=tenant_id,
+                        )
+
+                        db.add(brand)
+                        await db.flush()
+
+                    # ---------------------------------------------
+                    # 8. Check whether Product already exists
+                    # ---------------------------------------------
+                    existing_product_stmt = select(Product).where(
+                        Product.tenant_id == tenant_id,
+                        Product.name == product_name,
+                        Product.sku == sku,
+                        Product.mpn == mpn,
+                        Product.brand_name == brand.name,
+                    )
+
+                    existing_product_result = await db.execute(
+                        existing_product_stmt
+                    )
+
+                    existing_product = (
+                        existing_product_result.scalars().first()
+                    )
+
+                    if existing_product:
+                        skipped_products += 1
+
+                        print(
+                            f"[SKIP] Row {row_number}: "
+                            f"Product already exists - {product_name} "
+                            f"(tenant_id={tenant_id})",
+                            flush=True,
+                        )
+
+                        continue
+
+                    # ---------------------------------------------
+                    # 9. Create Product
+                    # ---------------------------------------------
+                    new_product = Product(
+                        tenant_id=tenant_id,
+                        brand_id=brand.id,
+                        brand=brand,
+                        brand_name=brand.name,
+                        name=product_name,
+                        sku=sku,
+                        mpn=mpn,
+                        product_url=product_url,
+                        created_by=user_id,
+                    )
+
+                    db.add(new_product)
+
+                    created_products += 1
+
+                    print(
+                        f"[SUCCESS] Row {row_number}: "
+                        f"Product created - {product_name} "
+                        f"(tenant_id={tenant_id})",
+                        flush=True,
+                    )
+
+                except Exception as row_error:
+                    skipped_products += 1
+
+                    errors.append(
+                        {
+                            "row": row_number,
+                            "error": str(row_error),
+                        }
+                    )
+
+                    print(
+                        f"[ERROR] Row {row_number}: {row_error}",
+                        flush=True,
+                    )
+
+            # -----------------------------------------------------
+            # 10. Commit all products
+            # -----------------------------------------------------
+            await db.commit()
+
+        # ---------------------------------------------------------
+        # 11. Response
+        # ---------------------------------------------------------
         return {
             "status": "success",
-            "message": f"Bulk processing initiated for {task_count} rows.",
-            "task_count": task_count,
+            "message": "Bulk product upload completed.",
+            "tenant_id": tenant_id,
+            "created_products": created_products,
+            "skipped_products": skipped_products,
+            "errors": errors,
         }
 
     except HTTPException:
         raise
+
     except Exception as e:
+        print(
+            f"[ERROR] Bulk upload failed: {e}",
+            flush=True,
+        )
+
         raise HTTPException(
-            status_code=500, detail=f"Bulk process initialization failed: {str(e)}"
+            status_code=500,
+            detail=f"Bulk process failed: {str(e)}",
         )
