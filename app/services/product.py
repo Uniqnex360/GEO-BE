@@ -600,6 +600,8 @@ class ProductService:
         all_chats: List[Chat] = product.chats or []
         all_queries: List[ChatSearchQuery] = []
 
+        token_usage = ProductService._get_llm_token_usage(all_chats)
+
         for chat in all_chats:
             for q in chat.search_queries or []:
                 q._parent_chat = chat
@@ -675,6 +677,7 @@ class ProductService:
         # 4. Construct Shared Product Identity Header Schema Block
         # ------------------------------------------------------------------
         response_payload = {
+            "token": token_usage,
             "productInfo": {
                 "id": product.id,
                 "icon": (
@@ -1150,10 +1153,8 @@ class ProductService:
         #     response_payload["tabData"] = {"actions": ui_actions[:8]}
 
         elif tab == "recommendations":
-            response_payload["tabData"] = {
-                "actions": product.recommandation_v2 or []
-            }
-            
+            response_payload["tabData"] = {"actions": product.recommandation_v2 or []}
+
         elif tab == "tips":
             chat_list = []
             for chat in all_chats:
@@ -1671,3 +1672,77 @@ class ProductService:
             tenant_stats,
             all_product_ids,
         )
+
+    @staticmethod
+    def _get_llm_token_usage(chats: List[Chat]) -> Dict[str, Any]:
+        """
+        Aggregate input, output, and total token usage across chats.
+
+        Returns:
+            {
+                "inputTokens": int,
+                "outputTokens": int,
+                "totalTokens": int,
+                "byModel": {
+                    "GPT": {
+                        "inputTokens": int,
+                        "outputTokens": int,
+                        "totalTokens": int,
+                    },
+                    "GEMINI": {
+                        "inputTokens": int,
+                        "outputTokens": int,
+                        "totalTokens": int,
+                    },
+                    "CLAUDE": {
+                        "inputTokens": int,
+                        "outputTokens": int,
+                        "totalTokens": int,
+                    },
+                }
+            }
+        """
+
+        # Initialize global totals
+        usage = {
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "totalTokens": 0,
+            "byModel": {},
+        }
+
+        for chat in chats or []:
+            model = str(getattr(chat, "model_choice", None) or "UNKNOWN").upper()
+
+            input_tokens = int(getattr(chat, "input_tokens", 0) or 0)
+
+            output_tokens = int(getattr(chat, "output_tokens", 0) or 0)
+
+            # Use DB total_tokens when available.
+            # Otherwise calculate it from input + output.
+            total_tokens = int(
+                getattr(chat, "total_tokens", None) or (input_tokens + output_tokens)
+            )
+
+            # --------------------------------------------------------------
+            # Global totals
+            # --------------------------------------------------------------
+            usage["inputTokens"] += input_tokens
+            usage["outputTokens"] += output_tokens
+            usage["totalTokens"] += total_tokens
+
+            # --------------------------------------------------------------
+            # Model-wise totals
+            # --------------------------------------------------------------
+            if model not in usage["byModel"]:
+                usage["byModel"][model] = {
+                    "inputTokens": 0,
+                    "outputTokens": 0,
+                    "totalTokens": 0,
+                }
+
+            usage["byModel"][model]["inputTokens"] += input_tokens
+            usage["byModel"][model]["outputTokens"] += output_tokens
+            usage["byModel"][model]["totalTokens"] += total_tokens
+
+        return usage
