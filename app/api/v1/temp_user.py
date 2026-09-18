@@ -16,7 +16,7 @@ from app.models import (
 )
 from app.services.chat_v2 import run_geo_audit_stream
 from app.services.chat_v2.schemas import GEOAuditRequest
-from app.services import build_geo_email
+from app.services import build_geo_email, generate_ai_visibility_pdf
 from app.helpers.email import send_email
 
 
@@ -26,6 +26,7 @@ class TempUserCreate(BaseModel):
     phone_number: str | None = None
     email: EmailStr
     product_url: str
+    country: str
 
 
 router = APIRouter()
@@ -80,6 +81,7 @@ async def create_temp_user(
             phone_number=data.phone_number,
             email=data.email,
             product_url=data.product_url,
+            country=data.country,
         )
 
         db.add(temp_user)
@@ -89,13 +91,14 @@ async def create_temp_user(
 
         # send welcome email
         _ = await send_email(
-            to="growth@contentlynxe.com",
-            # to="delson@uniqnex360.com",
+            # to="growth@contentlynxe.com",
+            to="delson@uniqnex360.com",
             subject="New user Onboarded",
             html=f"""
-            <h1>User {data.name}</h1>
+            <h1>User : {data.name}</h1>
             <p>Company: {data.company_name}</p>
             <p>Email: {data.email}</p>
+            <p>Phone Number: {data.phone_number}</p>
             <p>Product URL: {data.product_url}</p>
             """,
         )
@@ -103,7 +106,7 @@ async def create_temp_user(
         # send user a welcom email
         _ = await send_email(
             to=data.email,
-            subject="New user Onboarded",
+            subject="Onboard Successfull",
             html=f"""
                     <h1>Welcome {data.name}</h1>
                     <p>You will get a your report in shorly!</p>
@@ -118,8 +121,7 @@ async def create_temp_user(
     # ---------------------------------------------------------
 
     payload = GEOAuditRequest(
-        # product_url=data.product_url,
-        product_name=data.company_name,
+        product_url=data.product_url,
         website=data.product_url,
     )
 
@@ -134,11 +136,13 @@ async def create_temp_user(
     # ---------------------------------------------------------
     # Get created product
     # ---------------------------------------------------------
+    print("Looking for product:", data.product_url)
 
     result = await db.execute(
-        select(Product)
-        .where(Product.tenant_id == tenant_id)
-        .order_by(Product.id.desc())
+        select(Product).where(
+            Product.tenant_id == tenant_id,
+            Product.product_url == data.product_url,
+        )
     )
 
     product = result.scalars().first()
@@ -164,7 +168,7 @@ async def create_temp_user(
     )
 
     product = result.scalars().first()
-
+    print("i am working")
     if not product:
         raise HTTPException(
             status_code=404,
@@ -213,13 +217,21 @@ async def create_temp_user(
         for audit in geo_audits
     ]
 
-    html = build_geo_email({"product": product_data})
+    html = build_geo_email({"product": product_data,  "first_name": data.name})
+
+    pdf_bytes = generate_ai_visibility_pdf(product_data)
 
     await send_email(
         to=data.email,
-        subject=f"Report for the product {data.product_url}",
+        subject=f"Your ContentLynxe AI Visibility Report — {product_data.get("name", "")}",
         html=html,
+        pdf_bytes=pdf_bytes,
     )
+
+    return {
+        "tenant_id": tenant_id,
+        "product": product_data,
+    }
 
     return {
         "tenant_id": tenant_id,

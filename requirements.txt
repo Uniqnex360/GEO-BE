@@ -46,3 +46,6 @@ httpx[http2]==0.28.1
 #email
 resend==2.46.0
 
+#pdf
+fpdf2==2.8.8
+

@@ -115,16 +115,31 @@ Rules:
 
 
 def _product_data(product: Any) -> dict[str, Any]:
-    """Keep this simple; change field names here if your Product differs."""
     return {
-        "id": getattr(product, "id", None),
-        "name": getattr(product, "name", None),
-        "title": getattr(product, "title", None),
-        "description": getattr(product, "description", None),
-        "url": getattr(product, "url", None),
-        "brand": getattr(product, "brand", None),
-        "sku": getattr(product, "sku", None),
-        "price": getattr(product, "price", None),
+        "id": product.id,
+        "name": product.name,
+        "brand_name": product.brand_name,
+        "manufacturer": product.manufacturer,
+        "model_number": product.model_number,
+        "product_type": product.product_type,
+        "category": product.category,
+        "sku": product.sku,
+        "mpn": product.mpn,
+        "upc": product.upc,
+        "gtin": product.gtin,
+        "ean": product.ean,
+        "product_url": product.product_url,
+        "short_description": product.short_description,
+        "long_description": product.long_description,
+        "meta_title": product.meta_title,
+        "meta_description": product.meta_description,
+        "regular_price": product.regular_price,
+        "sale_price": product.sale_price,
+        "currency": product.currency,
+        "rating": product.rating,
+        "rating_count": product.rating_count,
+        "no_of_faqs": product.no_of_faqs,
+        "no_of_reviews": product.no_of_reviews,
     }
 
 
@@ -133,9 +148,7 @@ async def _get_model_recommendations(
     product_data: dict[str, Any],
     audit_data: Any,
 ) -> ModelRecommendations:
-    llm = build_chat_model(model_name).with_structured_output(
-        ModelRecommendations
-    )
+    llm = build_chat_model(model_name).with_structured_output(ModelRecommendations)
 
     audit_json = (
         audit_data.model_dump(mode="json")
@@ -256,7 +269,5 @@ async def generate_product_recommendations(
     product.recommendation = final_result.model_dump(mode="json")
 
     db.add(product)
-    await db.commit()
-    await db.refresh(product)
 
     return final_result

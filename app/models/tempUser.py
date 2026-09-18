@@ -13,3 +13,4 @@ class TempUesr(BaseModel):
     phone_number: Mapped[str] = mapped_column(String(255), nullable=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     product_url: Mapped[str] = mapped_column(Text, nullable=False)
+    country: Mapped[str] = mapped_column(String(255), nullable=True)
