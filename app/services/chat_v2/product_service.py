@@ -29,6 +29,8 @@ def build_lookup_filters(payload: GEOAuditRequest) -> list:
         filters.append(Product.mpn == payload.mpn)
     if payload.upc:
         filters.append(Product.upc == payload.upc)
+    if payload.product_url:
+        filters.append(Product.product_url == payload.product_url)
     return filters
 
 

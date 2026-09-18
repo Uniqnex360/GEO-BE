@@ -1,288 +1,1733 @@
-import os
-import resend
+from io import BytesIO
+
+import requests
+from fpdf import FPDF
+from fpdf.enums import MethodReturnValue
+
+# ============================================================
+# GET BEST RECOMMENDATION
+# ============================================================
 
 
-def _score_color(score: int) -> str:
-    """Return a color based on score thresholds (red/amber/green)."""
-    if score >= 70:
-        return "#16a34a"  # green
-    if score >= 45:
-        return "#d97706"  # amber
-    return "#dc2626"  # red
+def clean_pdf_text(text):
+    if text is None:
+        return ""
+
+    return (
+        str(text)
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace("’", "'")
+        .replace("‘", "'")
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("…", "...")
+        .replace("✓", "[OK]")
+        .replace("→", "->")
+        .encode("latin-1", "replace")
+        .decode("latin-1")
+    )
 
 
-def _score_bar(label: str, score: int) -> str:
-    """Render a single labeled progress bar for a 0-100 score."""
-    color = _score_color(score)
-    return f"""
-    <tr>
-        <td style="padding: 8px 0; font-size: 13px; color: #444; width: 140px;">{label}</td>
-        <td style="padding: 8px 0;">
-            <div style="background:#eef0f5; border-radius: 6px; height: 10px; width: 100%; overflow:hidden;">
-                <div style="background:{color}; height: 10px; width: {score}%; border-radius: 6px;"></div>
-            </div>
-        </td>
-        <td style="padding: 8px 0 8px 12px; font-size: 13px; font-weight: 700; color:{color}; width: 40px; text-align:right;">{score}</td>
-    </tr>
+def get_best_recommendation(
+    product_data: dict,
+    criterion: str,
+):
     """
+    Get the highest-impact recommendation for a criterion.
+    """
+
+    models = product_data.get(
+        "recommandation_v2",
+        {},
+    ).get(
+        "models",
+        [],
+    )
+
+    recommendations = []
+
+    for model in models:
+
+        data = model.get(
+            criterion,
+            {},
+        )
+
+        for recommendation in data.get(
+            "recommendations",
+            [],
+        ):
+
+            recommendations.append(recommendation)
+
+    if not recommendations:
+        return None
+
+    recommendations.sort(
+        key=lambda x: x.get("impact", 0),
+        reverse=True,
+    )
+
+    return recommendations[0]
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+
+def get_status(score):
+    if score >= 70:
+        return "Strong"
+    elif score >= 45:
+        return "Needs Improvement"
+    else:
+        return "Needs Improvement"
+
+
+def get_priority(score):
+    if score < 45:
+        return "HIGH"
+    elif score < 70:
+        return "MEDIUM"
+    else:
+        return "LOW"
+
+
+# ============================================================
+# SCORE HELPERS
+# ============================================================
+
+
+def get_scores(product_data: dict):
+    """
+    Calculate all report scores from the actual API JSON.
+
+    Returns:
+        scores, overall
+
+    scores contains:
+        title
+        description
+        attributes
+        features
+        assets
+        pricing
+        ai_visibility
+        product_readiness
+        recommendation_readiness
+    """
+
+    recommandation_v2 = product_data.get(
+        "recommandation_v2",
+        {},
+    )
+
+    criteria = recommandation_v2.get(
+        "criteria",
+        {},
+    )
+
+    models = recommandation_v2.get(
+        "models",
+        [],
+    )
+
+    # --------------------------------------------------------
+    # Criterion scores
+    # --------------------------------------------------------
+
+    title = criteria.get(
+        "title",
+        {},
+    ).get(
+        "score",
+        0,
+    )
+
+    assets = criteria.get(
+        "assets",
+        {},
+    ).get(
+        "score",
+        0,
+    )
+
+    pricing = criteria.get(
+        "pricing",
+        {},
+    ).get(
+        "score",
+        0,
+    )
+
+    features = criteria.get(
+        "features",
+        {},
+    ).get(
+        "score",
+        0,
+    )
+
+    attributes = criteria.get(
+        "attributes",
+        {},
+    ).get(
+        "score",
+        0,
+    )
+
+    description = criteria.get(
+        "description",
+        {},
+    ).get(
+        "score",
+        0,
+    )
+
+    scores = {
+        "title": title,
+        "description": description,
+        "attributes": attributes,
+        "features": features,
+        "assets": assets,
+        "pricing": pricing,
+    }
+
+    # --------------------------------------------------------
+    # Product Readiness
+    #
+    # Average of the 6 actual product criteria.
+    # --------------------------------------------------------
+
+    product_readiness = round(
+        (title + description + attributes + features + assets + pricing) / 6
+    )
+
+    # --------------------------------------------------------
+    # AI Visibility
+    #
+    # Each model has its own scores.
+    # Calculate each model's average, then average
+    # the model scores.
+    # --------------------------------------------------------
+
+    model_scores = []
+
+    for model in models:
+
+        model_total = 0
+        model_count = 0
+
+        for criterion in [
+            "title",
+            "assets",
+            "pricing",
+            "features",
+            "attributes",
+            "description",
+        ]:
+
+            criterion_data = model.get(
+                criterion,
+                {},
+            )
+
+            score = criterion_data.get("score")
+
+            if score is not None:
+                model_total += score
+                model_count += 1
+
+        if model_count:
+            model_scores.append(model_total / model_count)
+
+    if model_scores:
+
+        ai_visibility = round(sum(model_scores) / len(model_scores))
+
+    else:
+        ai_visibility = 0
+
+    # --------------------------------------------------------
+    # Recommendation Readiness
+    #
+    # avg_impact is 0-10.
+    # Convert it to a percentage.
+    # --------------------------------------------------------
+
+    impact_scores = []
+
+    for criterion in [
+        "title",
+        "assets",
+        "pricing",
+        "features",
+        "attributes",
+        "description",
+    ]:
+
+        criterion_data = criteria.get(
+            criterion,
+            {},
+        )
+
+        avg_impact = criterion_data.get("avg_impact")
+
+        if avg_impact is not None:
+            impact_scores.append(avg_impact)
+
+    if impact_scores:
+
+        recommendation_readiness = round((sum(impact_scores) / len(impact_scores)) * 10)
+
+    else:
+        recommendation_readiness = 0
+
+    # --------------------------------------------------------
+    # Overall AI Readiness
+    #
+    # Average of:
+    #   AI Visibility
+    #   Product Readiness
+    #   Recommendation Readiness
+    # --------------------------------------------------------
+
+    overall = round((ai_visibility + product_readiness + recommendation_readiness) / 3)
+
+    # Add calculated values to scores
+    # so email and PDF can use the same function.
+
+    scores["ai_visibility"] = ai_visibility
+    scores["product_readiness"] = product_readiness
+    scores["recommendation_readiness"] = recommendation_readiness
+
+    return scores, overall
+
+
+# ============================================================
+# EMAIL
+# ============================================================
 
 
 def build_geo_email(data: dict) -> str:
-    product = data["product"]
-
-    actual_content = product.get("actual_content", {}) or {}
-    product_content = actual_content.get("product_content", {}) or {}
-
-    # Prefer the real scraped product title/URL over the tenant label.
-    product_name = product_content.get("product_title") or product.get(
-        "name", "Your Product"
-    )
-    product_url = actual_content.get("url") or product.get("product_url", "")
-    brand_name = product_content.get("brand") or product.get("brand_name", "")
-    price = product_content.get("price")
-    currency = product_content.get("currency", "")
-
-    chats = product.get("chats", [])
-    geo_audits = product.get("geo_audits", []) or []
-
-    total_analyses = len(chats)
-    total_queries = sum(len(chat.get("search_queries", [])) for chat in chats)
-    total_citations = sum(len(chat.get("citations", [])) for chat in chats)
-
-    # Pull per-category scores from the richest available audit (usually Claude's).
-    score_fields = {}
-    best_audit = None
-    for audit in geo_audits:
-        pd_ = (audit.get("audit_data") or {}).get("product_details", {})
-        if pd_.get("product_title", {}).get("score", 0):
-            best_audit = audit
-            break
-    if best_audit is None and geo_audits:
-        best_audit = geo_audits[0]
-
-    if best_audit:
-        pd_ = (best_audit.get("audit_data") or {}).get("product_details", {})
-        for key, label in [
-            ("product_title", "Title"),
-            ("description_analysis", "Description"),
-            ("keywords", "Keywords/SEO"),
-            ("assets", "Media Assets"),
-        ]:
-            entry = pd_.get(key)
-            if isinstance(entry, dict) and "score" in entry:
-                score_fields[label] = entry.get("score", 0)
-
-    overall_score = (
-        round(sum(score_fields.values()) / len(score_fields)) if score_fields else None
-    )
-
-    # Best share-of-voice query, for a highlight stat.
-    best_sov = 0
-    for chat in chats:
-        for q in chat.get("search_queries", []):
-            best_sov = max(best_sov, q.get("share_of_voice", 0) or 0)
-
-    score_bars_html = "".join(
-        _score_bar(label, score) for label, score in score_fields.items()
-    )
-
-    overall_block = ""
-    if overall_score is not None:
-        color = _score_color(overall_score)
-        overall_block = f"""
-        <div style="text-align:center; margin: 4px 0 28px;">
-            <div style="
-                display:inline-flex; align-items:center; justify-content:center;
-                width:120px; height:120px; border-radius:50%;
-                background:conic-gradient({color} {overall_score * 3.6}deg, #eef0f5 0deg);
-                position:relative;
-            ">
-                <div style="
-                    width:96px; height:96px; border-radius:50%; background:#ffffff;
-                    display:flex; align-items:center; justify-content:center;
-                    flex-direction:column;
-                ">
-                    <span style="font-size:28px; font-weight:800; color:{color};">{overall_score}</span>
-                    <span style="font-size:10px; color:#888; letter-spacing:0.5px;">GEO SCORE</span>
-                </div>
-            </div>
-        </div>
-        """
-
-    # Per-AI-engine cards
-    model_cards_html = ""
-    model_colors = {
-        "GPT": "#10a37f",
-        "CLAUDE": "#d97757",
-        "GEMINI": "#4285f4",
-    }
-    for chat in chats:
-        model = chat.get("model_choice", "AI Engine")
-        queries = chat.get("search_queries", [])
-        citations = chat.get("citations", [])
-        color = model_colors.get(model, "#6d5dfc")
-        found = sum(1 for q in queries if q.get("product_found"))
-
-        model_cards_html += f"""
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
-               style="border:1px solid #eef0f5; border-radius:10px; margin-bottom:12px;">
-            <tr>
-                <td style="padding:16px 18px;">
-                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-                        <tr>
-                            <td>
-                                <span style="
-                                    display:inline-block; width:8px; height:8px; border-radius:50%;
-                                    background:{color}; margin-right:8px;
-                                "></span>
-                                <span style="font-size:15px; font-weight:700; color:#222;">{model}</span>
-                            </td>
-                            <td style="text-align:right; font-size:12px; color:#888;">
-                                {found}/{len(queries)} queries found your product
-                            </td>
-                        </tr>
-                    </table>
-                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:12px;">
-                        <tr>
-                            <td style="text-align:center; padding:6px; border-right:1px solid #f0f0f4;">
-                                <div style="font-size:18px; font-weight:700; color:#222;">{len(queries)}</div>
-                                <div style="font-size:11px; color:#888;">Queries</div>
-                            </td>
-                            <td style="text-align:center; padding:6px;">
-                                <div style="font-size:18px; font-weight:700; color:#222;">{len(citations)}</div>
-                                <div style="font-size:11px; color:#888;">Citations</div>
-                            </td>
-                        </tr>
-                    </table>
-                </td>
-            </tr>
-        </table>
-        """
-
-    price_line = f"{currency} {price}" if price else ""
-
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Your GEO Audit is Complete</title>
-    </head>
-    <body style="margin:0; padding:0; background:#f2f3f7; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; color:#222;">
-
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f2f3f7; padding: 24px 0;">
-        <tr>
-            <td align="center">
-                <table role="presentation" width="640" cellpadding="0" cellspacing="0"
-                       style="background:#ffffff; border-radius:14px; overflow:hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06);">
-
-                    <!-- Header -->
-                    <tr>
-                        <td style="background:linear-gradient(135deg,#6d5dfc,#8b7bff); padding:36px 32px;">
-                            <div style="font-size:12px; letter-spacing:1.5px; color:#e4e0ff; text-transform:uppercase; font-weight:600;">
-                                GEO Audit Report
-                            </div>
-                            <div style="font-size:26px; font-weight:800; color:#ffffff; margin-top:8px;">
-                                Your AI Visibility Audit is Ready
-                            </div>
-                            <div style="font-size:14px; color:#e9e6ff; margin-top:6px;">
-                                See how {brand_name or "your brand"} shows up across AI search engines
-                            </div>
-                        </td>
-                    </tr>
-
-                    <!-- Body -->
-                    <tr>
-                        <td style="padding:32px;">
-
-                            <div style="font-size:12px; color:#888; text-transform:uppercase; letter-spacing:0.5px; font-weight:700;">
-                                Product
-                            </div>
-                            <div style="font-size:19px; font-weight:700; color:#222; margin-top:4px;">
-                                {product_name}
-                            </div>
-                            {f'<div style="font-size:13px; color:#888; margin-top:2px;">{price_line}</div>' if price_line else ""}
-
-                            {overall_block}
-
-                            <!-- Top-line metrics -->
-                            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin: 8px 0 28px;">
-                                <tr>
-                                    <td width="33%" style="text-align:center; padding:16px 6px; background:#f7f7fb; border-radius:10px 0 0 10px;">
-                                        <div style="font-size:24px; font-weight:800; color:#6d5dfc;">{total_analyses}</div>
-                                        <div style="font-size:11px; color:#888; margin-top:4px;">AI Engines Checked</div>
-                                    </td>
-                                    <td width="2" style="background:#ffffff;"></td>
-                                    <td width="33%" style="text-align:center; padding:16px 6px; background:#f7f7fb;">
-                                        <div style="font-size:24px; font-weight:800; color:#6d5dfc;">{total_queries}</div>
-                                        <div style="font-size:11px; color:#888; margin-top:4px;">Queries Run</div>
-                                    </td>
-                                    <td width="2" style="background:#ffffff;"></td>
-                                    <td width="33%" style="text-align:center; padding:16px 6px; background:#f7f7fb; border-radius:0 10px 10px 0;">
-                                        <div style="font-size:24px; font-weight:800; color:#6d5dfc;">{total_citations}</div>
-                                        <div style="font-size:11px; color:#888; margin-top:4px;">Citations Found</div>
-                                    </td>
-                                </tr>
-                            </table>
-
-                            {f'''
-                            <div style="background:#f0fdf4; border:1px solid #bbf7d0; border-radius:10px; padding:14px 18px; margin-bottom:28px;">
-                                <span style="font-size:13px; color:#15803d; font-weight:600;">
-                                    Peak share of voice: {best_sov:.1f}%
-                                </span>
-                                <span style="font-size:12px; color:#4b7a5e;"> — your best-performing query result</span>
-                            </div>
-                            ''' if best_sov else ""}
-
-                            <!-- Score breakdown -->
-                            {"<div style='font-size:15px; font-weight:700; margin-bottom:12px;'>Score Breakdown</div>" if score_bars_html else ""}
-                            {f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">{score_bars_html}</table>' if score_bars_html else ""}
-
-                            <!-- Per-engine breakdown -->
-                            <div style="font-size:15px; font-weight:700; margin-bottom:12px;">AI Engine Analysis</div>
-                            {model_cards_html}
-
-                            <!-- What we analyzed -->
-                            <div style="font-size:15px; font-weight:700; margin: 24px 0 12px;">What We Analyzed</div>
-                            <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-                                <tr><td style="padding:5px 0; font-size:14px; color:#444;">✓ Product visibility across AI search engines</td></tr>
-                                <tr><td style="padding:5px 0; font-size:14px; color:#444;">✓ Search queries related to your product</td></tr>
-                                <tr><td style="padding:5px 0; font-size:14px; color:#444;">✓ Competitor mentions and citations</td></tr>
-                                <tr><td style="padding:5px 0; font-size:14px; color:#444;">✓ Optimization opportunities</td></tr>
-                            </table>
-
-                            {f'''
-                            <table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:28px;">
-                                <tr>
-                                    <td style="background:#6d5dfc; border-radius:8px;">
-                                        <a href="{product_url}" style="display:inline-block; padding:13px 24px; font-size:14px; font-weight:700; color:#ffffff; text-decoration:none;">
-                                            View Full Report
-                                        </a>
-                                    </td>
-                                </tr>
-                            </table>
-                            ''' if product_url else ""}
-
-                        </td>
-                    </tr>
-
-                    <!-- Footer -->
-                    <tr>
-                        <td style="padding:20px 32px; background:#f7f7f9; text-align:center;">
-                            <div style="font-size:12px; color:#999;">
-                                GEO Audit Report &middot; This email was automatically generated.
-                            </div>
-                        </td>
-                    </tr>
-
-                </table>
-            </td>
-        </tr>
-    </table>
-
-    </body>
-    </html>
+    """
+    Build the ContentLynxe AI Visibility email.
     """
 
-    return html
+    product = (
+        data.get(
+            "product",
+            {},
+        )
+        or {}
+    )
+
+    actual_content = (
+        product.get(
+            "actual_content",
+            {},
+        )
+        or {}
+    )
+
+    product_content = (
+        actual_content.get(
+            "product_content",
+            {},
+        )
+        or {}
+    )
+
+    # --------------------------------------------------------
+    # Product name
+    # --------------------------------------------------------
+
+    product_name = (
+        product_content.get("product_title")
+        or product.get("name")
+        or product.get("product_name")
+        or "Your Product"
+    )
+
+    # --------------------------------------------------------
+    # First name
+    # --------------------------------------------------------
+
+    first_name = data.get("first_name") or product.get("first_name") or "there"
+
+    # --------------------------------------------------------
+    # Scores
+    # --------------------------------------------------------
+
+    scores, overall = get_scores(product)
+
+    ai_visibility = scores["ai_visibility"]
+
+    product_readiness = scores["product_readiness"]
+
+    recommendation_readiness = scores["recommendation_readiness"]
+
+    overall_ai_readiness = overall
+
+    # --------------------------------------------------------
+    # Opportunities
+    # --------------------------------------------------------
+
+    opportunities = product.get("opportunities") or []
+
+    if isinstance(
+        opportunities,
+        dict,
+    ):
+
+        opportunity_count = len(opportunities)
+
+    elif isinstance(
+        opportunities,
+        (list, tuple, set),
+    ):
+
+        opportunity_count = len(opportunities)
+
+    else:
+
+        opportunity_count = 0
+
+    # If opportunities are not provided separately,
+    # count the available recommendations.
+
+    if opportunity_count == 0:
+
+        opportunity_count = 0
+
+        for criterion in [
+            "title",
+            "description",
+            "attributes",
+            "features",
+            "assets",
+            "pricing",
+        ]:
+
+            recommendation = get_best_recommendation(
+                product,
+                criterion,
+            )
+
+            if recommendation:
+                opportunity_count += 1
+
+    # --------------------------------------------------------
+    # Email HTML
+    # --------------------------------------------------------
+
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ContentLynxe AI Visibility Report</title>
+</head>
+
+<body style="
+    margin: 0;
+    padding: 0;
+    background-color: #f6f8fb;
+    font-family: Arial, Helvetica, sans-serif;
+    color: #222222;
+">
+
+<table
+    width="100%"
+    cellpadding="0"
+    cellspacing="0"
+    border="0"
+    style="
+        background-color: #f6f8fb;
+        padding: 40px 20px;
+    "
+>
+    <tr>
+        <td align="center">
+
+            <table
+                width="600"
+                cellpadding="0"
+                cellspacing="0"
+                border="0"
+                style="
+                    width: 100%;
+                    max-width: 600px;
+                    background-color: #ffffff;
+                    border-radius: 10px;
+                    padding: 40px;
+                "
+            >
+
+                <tr>
+                    <td
+                        style="
+                            font-size: 16px;
+                            line-height: 1.7;
+                            color: #222222;
+                        "
+                    >
+
+                        <p style="margin: 0 0 24px 0;">
+                            Hi {first_name},
+                        </p>
+
+                        <p style="margin: 0 0 20px 0;">
+                            Thanks for checking out
+                            <a
+                                href="https://www.contentlynxe.com/"
+                                style="
+                                    color: #111111;
+                                    text-decoration: none;
+                                    font-weight: 700;
+                                "
+                            >
+                                ContentLynxe
+                            </a>.
+                        </p>
+
+                        <p style="margin: 0 0 24px 0;">
+                            We analyzed
+                            <strong>{product_name}</strong>
+                            to see how well its product information is
+                            positioned for AI-powered search and
+                            recommendations.
+                        </p>
+
+                    </td>
+                </tr>
+
+                <tr>
+                    <td>
+
+                        <h2
+                            style="
+                                margin: 0 0 18px 0;
+                                font-size: 20px;
+                                line-height: 1.4;
+                                color: #111111;
+                            "
+                        >
+                            Your initial snapshot
+                        </h2>
+
+                        <table
+                            width="100%"
+                            cellpadding="0"
+                            cellspacing="0"
+                            border="0"
+                            style="
+                                background-color: #f7f9fc;
+                                border-radius: 8px;
+                            "
+                        >
+
+                            <tr>
+                                <td
+                                    style="
+                                        padding: 12px 18px;
+                                        font-size: 15px;
+                                        color: #555555;
+                                    "
+                                >
+                                    AI Visibility:
+                                </td>
+
+                                <td
+                                    align="right"
+                                    style="
+                                        padding: 12px 18px;
+                                        font-size: 15px;
+                                        font-weight: 700;
+                                        color: #222222;
+                                    "
+                                >
+                                    {ai_visibility}%
+                                </td>
+                            </tr>
+
+                            <tr>
+                                <td
+                                    style="
+                                        padding: 12px 18px;
+                                        font-size: 15px;
+                                        color: #555555;
+                                    "
+                                >
+                                    Product Readiness:
+                                </td>
+
+                                <td
+                                    align="right"
+                                    style="
+                                        padding: 12px 18px;
+                                        font-size: 15px;
+                                        font-weight: 700;
+                                        color: #222222;
+                                    "
+                                >
+                                    {product_readiness}%
+                                </td>
+                            </tr>
+
+                            <tr>
+                                <td
+                                    style="
+                                        padding: 12px 18px;
+                                        font-size: 15px;
+                                        color: #555555;
+                                    "
+                                >
+                                    Recommendation Readiness:
+                                </td>
+
+                                <td
+                                    align="right"
+                                    style="
+                                        padding: 12px 18px;
+                                        font-size: 15px;
+                                        font-weight: 700;
+                                        color: #222222;
+                                    "
+                                >
+                                    {recommendation_readiness}%
+                                </td>
+                            </tr>
+
+                            <tr>
+                                <td
+                                    style="
+                                        padding: 14px 18px;
+                                        font-size: 15px;
+                                        color: #222222;
+                                        font-weight: 700;
+                                        border-top: 1px solid #e5e7eb;
+                                    "
+                                >
+                                    Overall AI Readiness:
+                                </td>
+
+                                <td
+                                    align="right"
+                                    style="
+                                        padding: 14px 18px;
+                                        font-size: 17px;
+                                        font-weight: 700;
+                                        color: #111111;
+                                        border-top: 1px solid #e5e7eb;
+                                    "
+                                >
+                                    {overall_ai_readiness}%
+                                </td>
+                            </tr>
+
+                        </table>
+
+                    </td>
+                </tr>
+
+                <tr>
+                    <td
+                        style="
+                            padding-top: 28px;
+                            font-size: 16px;
+                            line-height: 1.7;
+                            color: #222222;
+                        "
+                    >
+
+                        <p style="margin: 0 0 20px 0;">
+                            We also identified
+                            <strong>
+                                {opportunity_count} key opportunities
+                            </strong>
+                            that could improve how AI understands and
+                            recommends your product.
+                        </p>
+
+                        <p style="margin: 0 0 20px 0;">
+                            We've attached your
+                            <strong>
+                                ContentLynxe AI Visibility Snapshot
+                            </strong>
+                            with the key findings and recommended actions.
+                        </p>
+
+                        <p style="margin: 0 0 28px 0;">
+                            If you'd like, we can also walk you through the
+                            <strong>full report</strong>
+                            and show exactly where your product can improve.
+                        </p>
+
+                    </td>
+                </tr>
+
+                <tr>
+                    <td style="padding-bottom: 32px;">
+
+                        <a
+                            href="https://www.contentlynxe.com/"
+                            style="
+                                display: inline-block;
+                                background-color: #111111;
+                                color: #ffffff;
+                                text-decoration: none;
+                                font-size: 15px;
+                                font-weight: 700;
+                                padding: 13px 22px;
+                                border-radius: 6px;
+                            "
+                        >
+                            → View Your Full Report
+                        </a>
+
+                    </td>
+                </tr>
+
+                <tr>
+                    <td
+                        style="
+                            border-top: 1px solid #eeeeee;
+                            padding-top: 24px;
+                            font-size: 14px;
+                            line-height: 1.7;
+                            color: #555555;
+                        "
+                    >
+
+                        <p style="margin: 0 0 4px 0;">
+                            Best Regards,
+                        </p>
+
+                        <p style="margin: 0 0 18px 0;">
+                            <strong>
+                                Team
+                                <a
+                                    href="https://www.contentlynxe.com/"
+                                    style="
+                                        color: #222222;
+                                        text-decoration: none;
+                                    "
+                                >
+                                    ContentLynxe
+                                </a>
+                            </strong>
+                        </p>
+
+                        <p
+                            style="
+                                margin: 0 0 4px 0;
+                                font-style: italic;
+                            "
+                        >
+                            An
+                            <a
+                                href="https://uniqnex360.com/"
+                                style="
+                                    color: #555555;
+                                    text-decoration: none;
+                                "
+                            >
+                                UniqNex360
+                            </a>
+                            product
+                        </p>
+
+                        <p style="margin: 0;">
+                            <a
+                                href="mailto:growth@contentlynxe.com"
+                                style="
+                                    color: #555555;
+                                    text-decoration: none;
+                                "
+                            >
+                                growth@contentlynxe.com
+                            </a>
+                        </p>
+
+                    </td>
+                </tr>
+
+            </table>
+
+        </td>
+    </tr>
+</table>
+
+</body>
+</html>
+"""
+
+
+# ============================================================
+# PDF
+# ============================================================
+
+
+def generate_ai_visibility_pdf(
+    product_data: dict,
+) -> bytes:
+    """
+    Generate the PDF directly from the actual API JSON.
+
+    No temporary file is created.
+    """
+
+    product_name = clean_pdf_text(
+        product_data.get(
+            "name",
+            "Your Product",
+        )
+    )
+
+    # SAME get_scores() USED BY EMAIL
+    scores, overall = get_scores(product_data)
+
+    ai_visibility = scores["ai_visibility"]
+
+    product_readiness = scores["product_readiness"]
+
+    recommendation_readiness = scores["recommendation_readiness"]
+
+    pdf = FPDF(format="A4")
+
+    pdf.set_auto_page_break(
+        auto=True,
+        margin=15,
+    )
+
+    # ========================================================
+    # PAGE 1
+    # ========================================================
+
+    pdf.add_page()
+
+    # --------------------------------------------------------
+    # OPTIONAL IMAGE / LOGO
+    #
+    # Put your image URL here.
+    #
+    # Example:
+    # image_url = "https://your-domain.com/logo.png"
+    #
+    # Nothing is saved to disk.
+    # --------------------------------------------------------
+
+    image_url = (
+        "https://res.cloudinary.com/dh75n51on/image/upload/v1789735442/logo_xtodvn.png"
+    )
+
+    if image_url:
+
+        try:
+
+            response = requests.get(
+                image_url,
+                timeout=10,
+            )
+
+            response.raise_for_status()
+
+            image_bytes = BytesIO(response.content)
+
+            pdf.image(
+                image_bytes,
+                x=85,
+                y=10,
+                w=40,
+            )
+
+            pdf.ln(35)
+
+        except Exception:
+
+            # If image URL fails, continue generating
+            # the PDF without the image.
+
+            pdf.ln(5)
+
+    else:
+
+        pdf.ln(5)
+
+    # --------------------------------------------------------
+    # Header
+    # --------------------------------------------------------
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        24,
+    )
+
+    pdf.cell(
+        0,
+        12,
+        "ContentLynxe",
+        align="C",
+    )
+
+    pdf.ln(8)
+
+    pdf.set_font(
+        "Helvetica",
+        "",
+        9,
+    )
+
+    pdf.cell(
+        0,
+        6,
+        "OPTIMIZE. ENGAGE. GROW.",
+        align="C",
+    )
+
+    pdf.ln(10)
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        20,
+    )
+
+    pdf.cell(
+        0,
+        10,
+        "AI Visibility Snapshot",
+        align="C",
+    )
+
+    pdf.ln(8)
+
+    pdf.set_font(
+        "Helvetica",
+        "",
+        10,
+    )
+
+    pdf.multi_cell(
+        0,
+        6,
+        "How the product appears across AI-powered " "search and recommendations",
+        align="C",
+    )
+
+    pdf.ln(8)
+
+    # ========================================================
+    # EXECUTIVE SUMMARY
+    # ========================================================
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        14,
+    )
+
+    pdf.cell(
+        0,
+        8,
+        "01 Executive Summary",
+    )
+
+    pdf.ln(8)
+
+    pdf.set_font(
+        "Helvetica",
+        "",
+        10,
+    )
+
+    pdf.multi_cell(
+        0,
+        6,
+        f"We analyzed {product_name} to understand how well "
+        "its product information is positioned for "
+        "AI-powered search and recommendations.",
+    )
+
+    pdf.ln(6)
+
+    # ========================================================
+    # SUMMARY SCORE TABLE
+    # ========================================================
+
+    summary = [
+        (
+            "AI Visibility",
+            ai_visibility,
+        ),
+        (
+            "Product Readiness",
+            product_readiness,
+        ),
+        (
+            "Recommendation Readiness",
+            recommendation_readiness,
+        ),
+        (
+            "Overall AI Readiness",
+            overall,
+        ),
+    ]
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        8,
+    )
+
+    for label, score in summary:
+
+        pdf.cell(
+            47.5,
+            8,
+            label,
+            border=1,
+            align="C",
+        )
+
+    pdf.ln()
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        14,
+    )
+
+    for label, score in summary:
+
+        pdf.cell(
+            47.5,
+            11,
+            f"{score}%",
+            border=1,
+            align="C",
+        )
+
+    pdf.ln(15)
+
+    # ========================================================
+    # PRODUCT UNDERSTANDING
+    # ========================================================
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        14,
+    )
+
+    pdf.cell(
+        0,
+        8,
+        "02 Product Understanding Scores",
+    )
+
+    pdf.ln(8)
+
+    pdf.set_font(
+        "Helvetica",
+        "",
+        9,
+    )
+
+    pdf.multi_cell(
+        0,
+        6,
+        "Scores below are calculated directly from the "
+        "aggregate criterion scores returned by the "
+        "ContentLynxe recommendation engine.",
+    )
+
+    pdf.ln(5)
+
+    # --------------------------------------------------------
+    # TABLE HEADER
+    # --------------------------------------------------------
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        8,
+    )
+
+    pdf.cell(
+        40,
+        8,
+        "Criteria",
+        border=1,
+    )
+
+    pdf.cell(
+        20,
+        8,
+        "Score",
+        border=1,
+        align="C",
+    )
+
+    pdf.cell(
+        35,
+        8,
+        "Status",
+        border=1,
+        align="C",
+    )
+
+    pdf.cell(
+        95,
+        8,
+        "Key observation",
+        border=1,
+    )
+
+    pdf.ln()
+
+    # --------------------------------------------------------
+    # ONLY THE CRITERIA WE ACTUALLY HAVE
+    #
+    # Removed:
+    # Specifications
+    # FAQs
+    # Reviews
+    # Schema
+    # --------------------------------------------------------
+
+    criteria_rows = [
+        (
+            "Title",
+            scores["title"],
+            "Title clarity and product identity.",
+        ),
+        (
+            "Description",
+            scores["description"],
+            "Product description depth and relevance.",
+        ),
+        (
+            "Attributes",
+            scores["attributes"],
+            "Completeness of product attributes.",
+        ),
+        (
+            "Features",
+            scores["features"],
+            "Coverage of important product features.",
+        ),
+        (
+            "Images",
+            scores["assets"],
+            "Asset/image readiness.",
+        ),
+        (
+            "Pricing",
+            scores["pricing"],
+            "Pricing information readiness.",
+        ),
+    ]
+
+    # --------------------------------------------------------
+    # DRAW TABLE ROWS
+    #
+    # Calculate row height first so all borders stay aligned.
+    # --------------------------------------------------------
+
+    pdf.set_font(
+        "Helvetica",
+        "",
+        8,
+    )
+
+    for label, score, observation in criteria_rows:
+
+        # FIX: clean text BEFORE dry_run.
+        observation = clean_pdf_text(observation)
+
+        # Calculate required height for observation.
+        row_height = pdf.multi_cell(
+            95,
+            7,
+            observation,
+            dry_run=True,
+            output=MethodReturnValue.HEIGHT,
+        )
+
+        row_height = max(
+            7,
+            row_height,
+        )
+
+        x = pdf.get_x()
+        y = pdf.get_y()
+
+        # Criteria
+        pdf.cell(
+            40,
+            row_height,
+            label,
+            border=1,
+        )
+
+        # Score
+        pdf.cell(
+            20,
+            row_height,
+            f"{score}%",
+            border=1,
+            align="C",
+        )
+
+        # Status
+        pdf.cell(
+            35,
+            row_height,
+            get_status(score),
+            border=1,
+            align="C",
+        )
+
+        # Observation
+        pdf.multi_cell(
+            95,
+            7,
+            observation,
+            border=1,
+            new_x="LMARGIN",
+            new_y="NEXT",
+        )
+
+    pdf.ln(10)
+
+    # ========================================================
+    # AI SEARCH VISIBILITY
+    # ========================================================
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        14,
+    )
+
+    pdf.cell(
+        0,
+        8,
+        "03 AI Search Visibility",
+    )
+
+    pdf.ln(8)
+
+    pdf.set_font(
+        "Helvetica",
+        "",
+        9,
+    )
+
+    pdf.multi_cell(
+        0,
+        6,
+        f"Overall AI Visibility Score: {ai_visibility}%",
+    )
+
+    pdf.ln(5)
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        8,
+    )
+
+    # --------------------------------------------------------
+    # AI SEARCH TABLE
+    # --------------------------------------------------------
+
+    pdf.cell(
+        65,
+        8,
+        "Signal",
+        border=1,
+    )
+
+    pdf.cell(
+        30,
+        8,
+        "Score",
+        border=1,
+        align="C",
+    )
+
+    pdf.cell(
+        65,
+        8,
+        "Status",
+        border=1,
+    )
+
+    pdf.ln()
+
+    pdf.set_font(
+        "Helvetica",
+        "",
+        8,
+    )
+
+    # We now have enough metrics to calculate
+    # meaningful signal scores.
+
+    ai_rows = [
+        (
+            "Product discovery",
+            scores["title"],
+        ),
+        (
+            "Product understanding",
+            product_readiness,
+        ),
+        (
+            "Brand association",
+            scores["attributes"],
+        ),
+        (
+            "Content relevance",
+            scores["description"],
+        ),
+    ]
+
+    for signal, score in ai_rows:
+
+        pdf.cell(
+            65,
+            8,
+            signal,
+            border=1,
+        )
+
+        pdf.cell(
+            30,
+            8,
+            f"{score}%",
+            border=1,
+            align="C",
+        )
+
+        pdf.cell(
+            65,
+            8,
+            get_status(score),
+            border=1,
+        )
+
+        pdf.ln()
+
+    # ========================================================
+    # PAGE 2
+    # ========================================================
+
+    pdf.add_page()
+
+    # ========================================================
+    # OPPORTUNITIES
+    # ========================================================
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        14,
+    )
+
+    pdf.cell(
+        0,
+        8,
+        "04 Top Content & Visibility Opportunities",
+    )
+
+    pdf.ln(8)
+
+    pdf.set_font(
+        "Helvetica",
+        "",
+        9,
+    )
+
+    pdf.multi_cell(
+        0,
+        6,
+        "The opportunities below are taken directly from "
+        "the recommendations generated for each criterion.",
+    )
+
+    pdf.ln(5)
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        8,
+    )
+
+    pdf.cell(
+        40,
+        8,
+        "Criteria",
+        border=1,
+    )
+
+    pdf.cell(
+        20,
+        8,
+        "Score",
+        border=1,
+        align="C",
+    )
+
+    pdf.cell(
+        115,
+        8,
+        "Opportunity / finding",
+        border=1,
+    )
+
+    pdf.ln()
+
+    pdf.set_font(
+        "Helvetica",
+        "",
+        8,
+    )
+
+    opportunity_rows = [
+        (
+            "Title",
+            "title",
+            scores["title"],
+        ),
+        (
+            "Description",
+            "description",
+            scores["description"],
+        ),
+        (
+            "Attributes",
+            "attributes",
+            scores["attributes"],
+        ),
+        (
+            "Features",
+            "features",
+            scores["features"],
+        ),
+        (
+            "Images",
+            "assets",
+            scores["assets"],
+        ),
+        (
+            "Pricing",
+            "pricing",
+            scores["pricing"],
+        ),
+    ]
+
+    for label, criterion, score in opportunity_rows:
+
+        recommendation = get_best_recommendation(
+            product_data,
+            criterion,
+        )
+
+        if recommendation:
+
+            recommendation_name = recommendation.get(
+                "recommendation",
+                "",
+            )
+
+            action = recommendation.get(
+                "action",
+                "",
+            )
+
+            if recommendation_name and action:
+
+                opportunity = f"{recommendation_name}: " f"{action}"
+
+            elif action:
+
+                opportunity = action
+
+            elif recommendation_name:
+
+                opportunity = recommendation_name
+
+            else:
+
+                opportunity = recommendation.get(
+                    "why",
+                    "See recommendation details.",
+                )
+
+        else:
+
+            opportunity = "No recommendation available."
+
+        # FIX: clean AI-generated text BEFORE dry_run.
+        opportunity = clean_pdf_text(opportunity)
+
+        # Calculate row height first.
+        row_height = pdf.multi_cell(
+            115,
+            7,
+            opportunity,
+            dry_run=True,
+            output=MethodReturnValue.HEIGHT,
+        )
+
+        row_height = max(
+            7,
+            row_height,
+        )
+
+        # Draw the three cells at the same Y.
+        pdf.cell(
+            40,
+            row_height,
+            label,
+            border=1,
+        )
+
+        pdf.cell(
+            20,
+            row_height,
+            f"{score}%",
+            border=1,
+            align="C",
+        )
+
+        pdf.multi_cell(
+            115,
+            7,
+            opportunity,
+            border=1,
+            new_x="LMARGIN",
+            new_y="NEXT",
+        )
+
+    pdf.ln(8)
+
+    # ========================================================
+    # PRIORITY ACTION PLAN
+    # ========================================================
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        14,
+    )
+
+    pdf.cell(
+        0,
+        8,
+        "05 Priority Action Plan",
+    )
+
+    pdf.ln(8)
+
+    pdf.set_font(
+        "Helvetica",
+        "",
+        9,
+    )
+
+    pdf.multi_cell(
+        0,
+        6,
+        "Actions are taken from the highest-impact "
+        "recommendation available for each criterion.",
+    )
+
+    pdf.ln(5)
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        8,
+    )
+
+    pdf.cell(
+        40,
+        8,
+        "Criteria",
+        border=1,
+    )
+
+    pdf.cell(
+        30,
+        8,
+        "Priority",
+        border=1,
+        align="C",
+    )
+
+    pdf.cell(
+        105,
+        8,
+        "Recommended action",
+        border=1,
+    )
+
+    pdf.ln()
+
+    pdf.set_font(
+        "Helvetica",
+        "",
+        8,
+    )
+
+    priority_rows = [
+        (
+            "Title",
+            "title",
+            scores["title"],
+        ),
+        (
+            "Description",
+            "description",
+            scores["description"],
+        ),
+        (
+            "Attributes",
+            "attributes",
+            scores["attributes"],
+        ),
+        (
+            "Features",
+            "features",
+            scores["features"],
+        ),
+        (
+            "Images",
+            "assets",
+            scores["assets"],
+        ),
+        (
+            "Pricing",
+            "pricing",
+            scores["pricing"],
+        ),
+    ]
+
+    for label, criterion, score in priority_rows:
+
+        recommendation = get_best_recommendation(
+            product_data,
+            criterion,
+        )
+
+        if recommendation:
+
+            action = recommendation.get("action") or recommendation.get(
+                "recommendation",
+                "See recommendation.",
+            )
+
+        else:
+
+            action = "No recommendation available."
+
+        # FIX: clean AI-generated text BEFORE dry_run.
+        action = clean_pdf_text(action)
+
+        # Calculate row height first.
+        row_height = pdf.multi_cell(
+            105,
+            7,
+            action,
+            dry_run=True,
+            output=MethodReturnValue.HEIGHT,
+        )
+
+        row_height = max(
+            7,
+            row_height,
+        )
+
+        pdf.cell(
+            40,
+            row_height,
+            label,
+            border=1,
+        )
+
+        pdf.cell(
+            30,
+            row_height,
+            get_priority(score),
+            border=1,
+            align="C",
+        )
+
+        pdf.multi_cell(
+            105,
+            7,
+            action,
+            border=1,
+            new_x="LMARGIN",
+            new_y="NEXT",
+        )
+
+    pdf.ln(10)
+
+    # ========================================================
+    # FOOTER / CTA
+    # ========================================================
+
+    pdf.set_font(
+        "Helvetica",
+        "B",
+        10,
+    )
+
+    pdf.cell(
+        0,
+        7,
+        "Want to see the full picture?",
+        align="C",
+    )
+
+    pdf.ln(7)
+
+    pdf.set_font(
+        "Helvetica",
+        "",
+        9,
+    )
+
+    pdf.multi_cell(
+        0,
+        5,
+        "Ask us for the complete ContentLynxe AI Visibility "
+        "Report with detailed findings, gaps, and "
+        "prioritized recommendations.",
+        align="C",
+    )
+
+    pdf.ln(3)
+
+    pdf.cell(
+        0,
+        6,
+        "growth@contentlynxe.com | contentlynxe.com",
+        align="C",
+    )
+
+    # ========================================================
+    # RETURN BYTES
+    # ========================================================
+
+    return bytes(pdf.output())

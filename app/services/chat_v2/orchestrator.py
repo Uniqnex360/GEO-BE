@@ -138,21 +138,22 @@ async def run_geo_audit_stream(
         )
 
         search_keyword = f"{identifier} competitors buy online"
-
+        print("error")
         recommendations = await generate_product_recommendations(
             db=db,
             product=product_record,
             search_keyword=search_keyword,
             user_prompt=user_prompt,
         )
-
+        print("before")
         # The recommendation function returns the Pydantic object.
         # Save it explicitly to the requested Product field as JSON.
         product_record.recommandation_v2 = recommendations.model_dump(mode="json")
-
+        print("after")
         db.add(product_record)
         await db.commit()
         await db.refresh(product_record)
+        print("after 2")
 
         yield status_event(
             "GEO recommendations saved.",
