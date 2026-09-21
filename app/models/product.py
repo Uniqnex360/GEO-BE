@@ -141,6 +141,7 @@ class Product(BaseModel):
     extraction_token_usage: Mapped[dict] = mapped_column(
         JSONB, nullable=True, default=dict, server_default="{}"
     )
+    single_recommandation: Mapped[dict] = mapped_column(JSONB, nullable=True)
 
     # relationships
     tenant: Mapped["Tenant"] = relationship(back_populates="products")
