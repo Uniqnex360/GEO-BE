@@ -1153,7 +1153,10 @@ class ProductService:
         #     response_payload["tabData"] = {"actions": ui_actions[:8]}
 
         elif tab == "recommendations":
-            response_payload["tabData"] = {"actions": product.recommandation_v2 or []}
+            response_payload["tabData"] = {
+                "actions": product.recommandation_v2 or [],
+                "single_recommandation": product.single_recommandation or {},
+            }
 
         elif tab == "tips":
             chat_list = []
