@@ -1731,3 +1731,4 @@ def generate_ai_visibility_pdf(
     # ========================================================
 
     return bytes(pdf.output())
+
