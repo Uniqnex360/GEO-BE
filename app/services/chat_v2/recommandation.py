@@ -1,26 +1,11 @@
-"""
-geo_recommendations.py
-
-Runs the existing GEO audit for GPT/GEMINI/CLAUDE, gets recommendations for
-exactly 6 product-page criteria, validates them with Pydantic, and saves the
-result as JSON in product.recommendation.
-
-Assumption:
-    Your existing file is named `llm_audit.py` and contains:
-      - run_single_model_audit()
-      - build_chat_model_no_tools()
-
-Change that import if your filename is different.
-"""
-
 from __future__ import annotations
 
+import asyncio
 from enum import Enum
 from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from .llm_runner import build_chat_model, run_single_model_audit
 
@@ -50,7 +35,10 @@ class CriterionResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     score: int = Field(ge=0, le=100)
-    recommendations: list[Recommendation] = Field(min_length=1, max_length=3)
+    recommendations: list[Recommendation] = Field(
+        min_length=1,
+        max_length=3,
+    )
 
 
 class ModelRecommendations(BaseModel):
@@ -58,7 +46,6 @@ class ModelRecommendations(BaseModel):
 
     model: Literal["GPT", "GEMINI", "CLAUDE"]
 
-    # These six fields are intentionally explicit so they can never be omitted.
     title: CriterionResult
     description: CriterionResult
     features: CriterionResult
@@ -78,43 +65,56 @@ class CriterionSummary(BaseModel):
 class ProductRecommendations(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    models: list[ModelRecommendations] = Field(min_length=3, max_length=3)
+    models: list[ModelRecommendations] = Field(
+        min_length=3,
+        max_length=3,
+    )
 
-    # Always exactly these six keys.
     criteria: dict[Criterion, CriterionSummary]
 
 
 RECOMMENDATION_SYSTEM_PROMPT = """
-You are a GEO (Generative Engine Optimization) recommendation engine for
-e-commerce product pages.
+You are a GEO optimization expert.
 
-Your job is to analyze the supplied product data and GEO audit data and give
-concrete recommendations for AI search/recommendation engines.
+Analyze the provided product and GEO audit.
 
-You MUST return recommendations for exactly these 6 criteria:
-- title
-- description
-- features
-- attributes
-- assets
-- pricing
+Generate actionable recommendations for:
 
-Rules:
-- Never add another criterion.
-- Give 1-3 recommendations for every criterion.
-- impact is 1-10.
-- effort must be exactly: Low effort, Medium effort, or High effort.
-- score is 0-100 and represents the current GEO quality of that criterion.
-- recommendation = short recommendation title.
-- why = concise GEO reason.
-- action = exact practical change to make.
-- Do not invent product facts.
-- Base recommendations on the supplied audit data.
-- Keep everything concise and actionable.
+1. title
+2. description
+3. features
+4. attributes
+5. assets
+6. pricing
+
+For every criterion:
+
+- Give a score from 0 to 100.
+- Give 1 to 3 actionable recommendations.
+- Each recommendation must contain:
+  - impact: 1-10
+  - effort: Low effort / Medium effort / High effort
+  - recommendation
+  - why
+  - action
+
+Recommendations must be specific to the product and audit.
+
+Do not invent product facts.
+
+Return ONLY the requested structured output.
 """
 
 
 def _product_data(product: Any) -> dict[str, Any]:
+    """
+    Convert SQLAlchemy ORM object into a plain dict.
+
+    IMPORTANT:
+    This dict is created while the SQLAlchemy session is alive.
+    The LLM layer never receives the ORM object.
+    """
+
     return {
         "id": product.id,
         "name": product.name,
@@ -148,13 +148,13 @@ async def _get_model_recommendations(
     product_data: dict[str, Any],
     audit_data: Any,
 ) -> ModelRecommendations:
+
     llm = build_chat_model(model_name).with_structured_output(ModelRecommendations)
 
-    audit_json = (
-        audit_data.model_dump(mode="json")
-        if hasattr(audit_data, "model_dump")
-        else audit_data
-    )
+    if hasattr(audit_data, "model_dump"):
+        audit_json = audit_data.model_dump(mode="json")
+    else:
+        audit_json = audit_data
 
     prompt = f"""
 Model: {model_name}
@@ -177,24 +177,22 @@ Return the final recommendations now.
 
     result = ModelRecommendations.model_validate(result)
 
-    # Never trust the model to label itself correctly.
+    # Make absolutely sure model name is correct.
     result.model = model_name
+
     return result
 
 
 def _build_summary(
     model_results: list[ModelRecommendations],
 ) -> dict[Criterion, CriterionSummary]:
-    """
-    Build the top-level summary used by the UI.
 
-    Score is weighted by recommendation count, so models that produced more
-    recommendations contribute proportionally more to that criterion.
-    """
     summary: dict[Criterion, CriterionSummary] = {}
 
     for criterion in Criterion:
+
         results = [getattr(model, criterion.value) for model in model_results]
+
         all_recommendations = [
             recommendation
             for result in results
@@ -203,13 +201,17 @@ def _build_summary(
 
         count = len(all_recommendations)
 
+        if count == 0:
+            raise ValueError(f"No recommendations returned for {criterion.value}")
+
         weighted_score = round(
             sum(result.score * len(result.recommendations) for result in results)
             / count
         )
 
         avg_impact = round(
-            sum(r.impact for r in all_recommendations) / count,
+            sum(recommendation.impact for recommendation in all_recommendations)
+            / count,
             1,
         )
 
@@ -222,52 +224,80 @@ def _build_summary(
     return summary
 
 
+async def _run_one_model(
+    model_name: Literal["GPT", "GEMINI", "CLAUDE"],
+    product_data: dict[str, Any],
+    search_keyword: str,
+    user_prompt: str,
+) -> ModelRecommendations:
+
+    # First call: GEO audit
+    audit, _usage = await run_single_model_audit(
+        model_name=model_name,
+        user_prompt=user_prompt,
+        search_keyword=search_keyword,
+    )
+
+    # Second call: recommendations
+    recommendations = await _get_model_recommendations(
+        model_name=model_name,
+        product_data=product_data,
+        audit_data=audit,
+    )
+
+    return recommendations
+
+
 async def generate_product_recommendations(
-    db: AsyncSession,
-    product: Any,
+    product_data: dict[str, Any],
     *,
     search_keyword: str,
     user_prompt: str,
 ) -> ProductRecommendations:
     """
-    Run all 3 models and save the final JSON to product.recommendation.
+    Run GPT + GEMINI + CLAUDE concurrently.
 
-    Example:
+    NO DATABASE SESSION HERE.
 
-        result = await generate_product_recommendations(
-            db,
-            product,
-            search_keyword=product.title,
-            user_prompt="Audit this product page for GEO.",
-        )
+    This is intentional:
+    LLM calls can take a long time and should never hold
+    a Neon/Postgres connection open.
     """
-    product_data = _product_data(product)
+
+    results = await asyncio.gather(
+        *[
+            _run_one_model(
+                model_name=model_name,
+                product_data=product_data,
+                search_keyword=search_keyword,
+                user_prompt=user_prompt,
+            )
+            for model_name in MODEL_NAMES
+        ],
+        return_exceptions=True,
+    )
+
     model_results: list[ModelRecommendations] = []
+    errors: list[str] = []
 
-    for model_name in MODEL_NAMES:
-        # Existing audit/tool-calling code from your file.
-        audit, _usage = await run_single_model_audit(
-            model_name=model_name,
-            user_prompt=user_prompt,
-            search_keyword=search_keyword,
-        )
+    for model_name, result in zip(MODEL_NAMES, results):
 
-        recommendations = await _get_model_recommendations(
-            model_name=model_name,  # type: ignore[arg-type]
-            product_data=product_data,
-            audit_data=audit,
-        )
+        if isinstance(result, Exception):
+            errors.append(f"{model_name}: {type(result).__name__}: {result}")
+            continue
 
-        model_results.append(recommendations)
+        model_results.append(result)
 
-    final_result = ProductRecommendations(
+    if len(model_results) != len(MODEL_NAMES):
+
+        error_message = " | ".join(errors)
+
+        raise RuntimeError("GEO recommendation generation failed. " f"{error_message}")
+
+    # Keep deterministic model ordering.
+    model_results.sort(key=lambda item: MODEL_NAMES.index(item.model))
+
+    return ProductRecommendations(
         models=model_results,
         criteria=_build_summary(model_results),
     )
-
-    # Product.recommendation must be a SQLAlchemy JSON/JSONB column.
-    product.recommendation = final_result.model_dump(mode="json")
-
-    db.add(product)
-
-    return final_result
