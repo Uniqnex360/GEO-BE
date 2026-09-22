@@ -217,7 +217,7 @@ async def create_temp_user(
         for audit in geo_audits
     ]
 
-    html = build_geo_email({"product": product_data,  "first_name": data.name})
+    html = build_geo_email({"product": product_data, "first_name": data.name})
 
     pdf_bytes = generate_ai_visibility_pdf(product_data)
 
@@ -233,6 +233,89 @@ async def create_temp_user(
         "product": product_data,
     }
 
+    return {
+        "tenant_id": tenant_id,
+        "product": product_data,
+    }
+
+
+@router.get("/report/{product_id}/")
+async def get_product_data(
+    product_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    # ---------------------------------------------------------
+    # Get product + chats + search queries
+    # ---------------------------------------------------------
+    result = await db.execute(
+        select(Product)
+        .options(
+            selectinload(Product.chats).selectinload(Chat.search_queries),
+        )
+        .where(Product.id == product_id)
+    )
+
+    product = result.scalar_one_or_none()
+
+    if not product:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found.",
+        )
+
+    tenant_id = product.tenant_id
+
+    # ---------------------------------------------------------
+    # Product data
+    # ---------------------------------------------------------
+    product_data = {
+        column.name: getattr(product, column.name)
+        for column in Product.__table__.columns
+    }
+
+    # ---------------------------------------------------------
+    # Chat data
+    # ---------------------------------------------------------
+    product_data["chats"] = []
+
+    for chat in product.chats:
+        chat_data = {
+            column.name: getattr(chat, column.name) for column in Chat.__table__.columns
+        }
+
+        # Search query data
+        chat_data["search_queries"] = [
+            {
+                column.name: getattr(search_query, column.name)
+                for column in ChatSearchQuery.__table__.columns
+            }
+            for search_query in chat.search_queries
+        ]
+
+        product_data["chats"].append(chat_data)
+
+    # ---------------------------------------------------------
+    # GEO audit records
+    # ---------------------------------------------------------
+    result = await db.execute(
+        select(ChatGEOAuditRecord)
+        .where(ChatGEOAuditRecord.tenant_id == tenant_id)
+        .order_by(ChatGEOAuditRecord.id.desc())
+    )
+
+    geo_audits = result.scalars().all()
+
+    product_data["geo_audits"] = [
+        {
+            column.name: getattr(audit, column.name)
+            for column in ChatGEOAuditRecord.__table__.columns
+        }
+        for audit in geo_audits
+    ]
+
+    # ---------------------------------------------------------
+    # Return data only
+    # ---------------------------------------------------------
     return {
         "tenant_id": tenant_id,
         "product": product_data,
