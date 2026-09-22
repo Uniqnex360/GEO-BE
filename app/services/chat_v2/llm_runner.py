@@ -128,14 +128,48 @@ URLs. If no verified URL is available, leave 'product_url' as an empty string ""
     structured_llm = build_chat_model_no_tools(model_name).with_structured_output(
         UnifiedGEOResponse, include_raw=True
     )
-    messages.append(
-        HumanMessage(
-            content=(
-                "Based on everything above, produce the final UnifiedGEOResponse "
-                "JSON now. Use only URLs that appeared in tool results."
-            )
-        )
-    )
+    messages.append(HumanMessage(content=f"""
+Based on the complete tool-calling conversation above, produce the final
+UnifiedGEOResponse JSON.
+
+IMPORTANT — QUERY METRICS:
+
+The target product identifier is:
+
+"{search_keyword}"
+
+For every item in queries_executed:
+
+1. product_found MUST be true if the target product is actually present in
+   any search result returned for that query.
+
+2. product_found MUST NOT be false merely because the result is a competitor
+   search.
+
+3. If a returned search result contains the target product name, exact product
+   URL, MPN, SKU, or an unmistakable exact-product match, set product_found=true.
+
+4. total_websites_found must equal the number of unique verified URLs actually
+   returned by the search tool for that query.
+
+5. citing_sources must contain the actual verified URLs returned by the search
+   tool that support the query result.
+
+6. share_of_voice must be calculated from the discovered results, not guessed.
+
+7. citation_rank must be based on the position of the target product in the
+   returned search results. Use 0 when the product was not found.
+
+8. Never set product_found=false simply because the product is not the first
+   result.
+
+9. Never set total_websites_found=0 when the geo_web_search tool returned
+   actual organic results.
+
+10. Do not invent URLs or search results.
+
+Use only information actually present in the tool results above.
+"""))
 
     raw_result = await structured_llm.ainvoke(messages)
 

@@ -31,6 +31,7 @@ from app.models import (
     ChatSearchQuery,
     ChatGEOAuditRecord,
 )
+from app.models.base import LLMModels
 
 
 class DynamicRow:
@@ -546,6 +547,82 @@ class ProductService:
         }
 
     @staticmethod
+    def _get_llm_token_usage(chats: List[Chat]) -> Dict[str, Any]:
+        """
+        Aggregate input, output, and total token usage across chats.
+
+        Returns:
+            {
+                "inputTokens": int,
+                "outputTokens": int,
+                "totalTokens": int,
+                "byModel": {
+                    "GPT": {
+                        "inputTokens": int,
+                        "outputTokens": int,
+                        "totalTokens": int,
+                    },
+                    "GEMINI": {
+                        "inputTokens": int,
+                        "outputTokens": int,
+                        "totalTokens": int,
+                    },
+                    "CLAUDE": {
+                        "inputTokens": int,
+                        "outputTokens": int,
+                        "totalTokens": int,
+                    },
+                }
+            }
+        """
+
+        # Initialize global totals
+        usage = {
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "totalTokens": 0,
+            "byModel": {},
+        }
+
+        for chat in chats or []:
+            model = str(getattr(chat, "model_choice", None) or "UNKNOWN").upper()
+
+            input_tokens = int(getattr(chat, "input_tokens", 0) or 0)
+
+            output_tokens = int(getattr(chat, "output_tokens", 0) or 0)
+
+            # Use DB total_tokens when available.
+            # Otherwise calculate it from input + output.
+            total_tokens = int(
+                getattr(chat, "total_tokens", None) or (input_tokens + output_tokens)
+            )
+
+            # --------------------------------------------------------------
+            # Global totals
+            # --------------------------------------------------------------
+            usage["inputTokens"] += input_tokens
+            usage["outputTokens"] += output_tokens
+            usage["totalTokens"] += total_tokens
+
+            # --------------------------------------------------------------
+            # Model-wise totals
+            # --------------------------------------------------------------
+            if model not in usage["byModel"]:
+                usage["byModel"][model] = {
+                    "inputTokens": 0,
+                    "outputTokens": 0,
+                    "totalTokens": 0,
+                }
+
+            usage["byModel"][model]["inputTokens"] += input_tokens
+            usage["byModel"][model]["outputTokens"] += output_tokens
+            usage["byModel"][model]["totalTokens"] += total_tokens
+
+        return usage
+
+
+
+    @staticmethod
     async def product_detail_v2(
         db: AsyncSession,
         product_id: int,
@@ -585,7 +662,8 @@ class ProductService:
 
         if not product:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Product not found",
             )
 
         if not is_super_admin and product.tenant_id != tenant_id:
@@ -610,8 +688,9 @@ class ProductService:
         total_queries = len(all_queries)
 
         # ------------------------------------------------------------------
-        # 3. Dynamic Platform Breakdown Engine Analysis (SCALE 0 - 10)
-        #    Aligned with list_products logic
+        # FIX:
+        # Normalize SQLAlchemy LLMModels enum values before using them
+        # as dictionary keys.
         # ------------------------------------------------------------------
         ENGINE_LABEL_MAP = {
             "GPT": "chatgpt",
@@ -619,35 +698,90 @@ class ProductService:
             "CLAUDE": "claude",
         }
 
-        # Initialize tracking accumulators per engine
         engine_accum = {
             "chatgpt": {"total_queries": 0, "found_count": 0},
             "gemini": {"total_queries": 0, "found_count": 0},
             "claude": {"total_queries": 0, "found_count": 0},
         }
 
-        # Aggregate query statistics grouped by Chat.model_choice
         for q in all_queries:
             parent_chat = getattr(q, "_parent_chat", None)
             raw_model = parent_chat.model_choice if parent_chat else None
 
-            # Map raw model string to standardized key
-            engine_key = ENGINE_LABEL_MAP.get(
-                raw_model, str(raw_model).lower() if raw_model else None
-            )
+            if raw_model is None:
+                engine_key = None
+            else:
+                # Chat.model_choice is normally an LLMModels enum.
+                # Use .value instead of str(enum), because str(enum)
+                # can produce values such as "LLMModels.GPT".
+                model_name = (
+                    raw_model.value
+                    if isinstance(raw_model, LLMModels)
+                    else str(raw_model)
+                )
+
+                # Extra normalization makes this safe if the value is
+                # already "GPT", "LLMModels.GPT", etc.
+                model_name = model_name.split(".")[-1].upper()
+
+                engine_key = ENGINE_LABEL_MAP.get(model_name)
 
             if engine_key in engine_accum:
                 engine_accum[engine_key]["total_queries"] += 1
+
                 if q.product_found is True:
                     engine_accum[engine_key]["found_count"] += 1
 
+        # ------------------------------------------------------------------
+        # 3. Dynamic Platform Breakdown Engine Analysis (SCALE 0 - 10)
+        #    Aligned with list_products logic
+        # ------------------------------------------------------------------
+
+        for q in all_queries:
+            parent_chat = getattr(q, "_parent_chat", None)
+
+            raw_model = parent_chat.model_choice if parent_chat else None
+
+            if raw_model is None:
+                model_name = None
+            else:
+                model_name = (
+                    raw_model.value
+                    if isinstance(raw_model, LLMModels)
+                    else str(raw_model)
+                )
+
+            model_name = (
+                model_name.split(".")[-1].upper()
+                if model_name
+                else None
+            )
+
+            engine_key = ENGINE_LABEL_MAP.get(model_name)
+
+            print(
+                "ENGINE DEBUG:",
+                {
+                    "chat_id": parent_chat.id if parent_chat else None,
+                    "model": repr(raw_model),
+                    "model_name": model_name,
+                    "engine_key": engine_key,
+                    "product_found": q.product_found,
+                    "query": q.query_text,
+                }
+            )
+
         # Calculate Visibility Rate (0 - 10 scale) per engine
         engine_visibility_summary = {}
+
         for engine, bucket in engine_accum.items():
             tot_q = bucket["total_queries"]
             found_cnt = bucket["found_count"]
+
             engine_visibility_summary[engine] = (
-                round((found_cnt / tot_q) * 10, 1) if tot_q > 0 else 0.0
+                round((found_cnt / tot_q) * 10, 1)
+                if tot_q > 0
+                else 0.0
             )
 
         # Global AI Visibility Score: Mean of active engine visibility rates
@@ -656,6 +790,7 @@ class ProductService:
             for engine, rate in engine_visibility_summary.items()
             if engine_accum[engine]["total_queries"] > 0
         ]
+
         ai_visibility_score = (
             round(statistics.mean(active_engine_scores), 1)
             if active_engine_scores
@@ -663,15 +798,27 @@ class ProductService:
         )
 
         # Global Mention Rate across all queries (0 - 10 scale)
-        found_count = sum(1 for q in all_queries if q.product_found is True)
+        found_count = sum(
+            1 for q in all_queries if q.product_found is True
+        )
+
         mention_rate = (
-            round((found_count / total_queries) * 10, 1) if total_queries > 0 else 0.0
+            round((found_count / total_queries) * 10, 1)
+            if total_queries > 0
+            else 0.0
         )
 
         total_reviews = (
-            product.no_of_reviews if product.no_of_reviews is not None else 0
+            product.no_of_reviews
+            if product.no_of_reviews is not None
+            else 0
         )
-        total_faqs = product.no_of_faqs if product.no_of_faqs is not None else 0
+
+        total_faqs = (
+            product.no_of_faqs
+            if product.no_of_faqs is not None
+            else 0
+        )
 
         # ------------------------------------------------------------------
         # 4. Construct Shared Product Identity Header Schema Block
@@ -704,22 +851,31 @@ class ProductService:
                 "sku": product.sku or "N/A",
                 "mpn": product.mpn or "N/A",
                 "globalScores": {
-                    "visibilityScore": ai_visibility_score,  # 0 - 10
-                    "mentionRate": mention_rate,  # 0 - 10
+                    "visibilityScore": ai_visibility_score,
+                    "mentionRate": mention_rate,
                     "reviewsCount": total_reviews,
                 },
                 "engineBreakdown": [
                     {
                         "name": "ChatGPT",
-                        "score": engine_visibility_summary.get("chatgpt", 0.0),
+                        "score": engine_visibility_summary.get(
+                            "chatgpt",
+                            0.0,
+                        ),
                     },
                     {
                         "name": "Gemini",
-                        "score": engine_visibility_summary.get("gemini", 0.0),
+                        "score": engine_visibility_summary.get(
+                            "gemini",
+                            0.0,
+                        ),
                     },
                     {
                         "name": "Claude",
-                        "score": engine_visibility_summary.get("claude", 0.0),
+                        "score": engine_visibility_summary.get(
+                            "claude",
+                            0.0,
+                        ),
                     },
                 ],
             },
@@ -735,21 +891,31 @@ class ProductService:
                 if hasattr(product, "faqs") and product.faqs is not None
                 else total_faqs
             )
+
             response_payload["tabData"] = {
                 "chartData": [
                     {
                         "name": "ChatGPT",
-                        "score": engine_visibility_summary.get("chatgpt", 0.0),
+                        "score": engine_visibility_summary.get(
+                            "chatgpt",
+                            0.0,
+                        ),
                         "color": "#10b981",
                     },
                     {
                         "name": "Gemini",
-                        "score": engine_visibility_summary.get("gemini", 0.0),
+                        "score": engine_visibility_summary.get(
+                            "gemini",
+                            0.0,
+                        ),
                         "color": "#3b82f6",
                     },
                     {
                         "name": "Claude",
-                        "score": engine_visibility_summary.get("claude", 0.0),
+                        "score": engine_visibility_summary.get(
+                            "claude",
+                            0.0,
+                        ),
                         "color": "#f59e0b",
                     },
                 ],
@@ -774,7 +940,9 @@ class ProductService:
                         if isinstance(comp_entry, dict) and comp_entry.get(
                             "competitor_name"
                         ):
-                            competitors_set.add(comp_entry["competitor_name"])
+                            competitors_set.add(
+                                comp_entry["competitor_name"]
+                            )
 
             # Fallback: get competitor names from search queries
             if not competitors_set:
@@ -813,7 +981,9 @@ class ProductService:
                 # already be a list, or it may occasionally be a JSON string.
                 if isinstance(competitor_products, str):
                     try:
-                        competitor_products = json.loads(competitor_products)
+                        competitor_products = json.loads(
+                            competitor_products
+                        )
                     except (json.JSONDecodeError, TypeError):
                         competitor_products = []
 
@@ -828,7 +998,9 @@ class ProductService:
                         competitor_product.get("competitor_name") or ""
                     ).strip()
 
-                    product_url = (competitor_product.get("product_url") or "").strip()
+                    product_url = (
+                        competitor_product.get("product_url") or ""
+                    ).strip()
 
                     if not competitor_name or not product_url:
                         continue
@@ -936,7 +1108,9 @@ class ProductService:
                     # User's own product URL.
                     #
                     # This uses the actual Product.product_url from DB.
-                    "product_url": (getattr(product, "product_url", None) or ""),
+                    "product_url": (
+                        getattr(product, "product_url", None) or ""
+                    ),
                     "chatGPT": engine_visibility_summary.get(
                         "chatgpt",
                         0.0,
@@ -1049,7 +1223,9 @@ class ProductService:
                     f"{len(competitors_set)} "
                     f"competitor tracking profiles."
                 ),
-                "priorityCountText": (f"{len(schema_gaps)} Content Gaps Identified"),
+                "priorityCountText": (
+                    f"{len(schema_gaps)} Content Gaps Identified"
+                ),
                 "gaps": schema_gaps,
             }
 
@@ -1096,7 +1272,9 @@ class ProductService:
                     )
 
             # KEEP THE SAME RESPONSE STRUCTURE
-            response_payload["tabData"] = {"citations": ui_citations}
+            response_payload["tabData"] = {
+                "citations": ui_citations
+            }
 
         # elif tab == "recommendations":
         #     ui_actions = []
@@ -1104,7 +1282,7 @@ class ProductService:
         #         if q.query_optimization_tips and q.query_optimization_tips.strip():
         #             parent_chat = getattr(q, "_parent_chat", None)
         #             model_choice = parent_chat.model_choice if parent_chat else ""
-
+        #
         #             chat_competitors = []
         #             if (
         #                 parent_chat
@@ -1113,7 +1291,7 @@ class ProductService:
         #             ):
         #                 if isinstance(parent_chat.competitor_analytics, list):
         #                     chat_competitors = parent_chat.competitor_analytics
-
+        #
         #             ui_actions.append(
         #                 {
         #                     "type": (
@@ -1133,11 +1311,11 @@ class ProductService:
         #                     # "competitors": chat_competitors,
         #                     "impact": (
         #                         8.5 if q.product_found is False else 6.0
-        #                     ),  # Scale: 0.0 - 10.0
+        #                     ),
         #                     "competitor_products": q.competitor_products,
         #                 }
         #             )
-
+        #
         #     if not ui_actions:
         #         ui_actions.append(
         #             {
@@ -1146,10 +1324,10 @@ class ProductService:
         #                 "title": "Inject missing merchant schema markup and structural FAQs to expand engine crawl vectors.",
         #                 "model": "Unknown Model",
         #                 "competitors": [],
-        #                 "impact": 9.0,  # Scale: 0.0 - 10.0
+        #                 "impact": 9.0,
         #             }
         #         )
-
+        #
         #     response_payload["tabData"] = {"actions": ui_actions[:8]}
 
         elif tab == "recommendations":
@@ -1160,8 +1338,8 @@ class ProductService:
 
         elif tab == "tips":
             chat_list = []
-            for chat in all_chats:
 
+            for chat in all_chats:
                 chat_list.append(
                     {
                         "chat_id": chat.id,
@@ -1171,7 +1349,9 @@ class ProductService:
                         "created_at": chat.created_at,
                         "updated_at": getattr(chat, "updated_at", None),
                         "final_optimization_report": getattr(
-                            chat, "final_optimization_report", ""
+                            chat,
+                            "final_optimization_report",
+                            "",
                         ),
                     }
                 )
@@ -1182,8 +1362,12 @@ class ProductService:
             }
 
         elif tab == "actual_content":
-            response_payload["tabData"] = {"actual_content": product.actual_content}
-        return response_payload  # test
+            response_payload["tabData"] = {
+                "actual_content": product.actual_content
+            }
+
+        return response_payload
+
 
     @staticmethod
     async def list_products(
@@ -1206,6 +1390,7 @@ class ProductService:
         # 1. Base Core Tenant Filters
         # ------------------------------------------------------------------
         tenant_filters = [Product.is_deleted.is_(False)]
+
         if not is_super_admin:
             tenant_filters.append(Product.tenant_id == tenant_id)
         elif tenant_id:
@@ -1220,34 +1405,59 @@ class ProductService:
         ).where(*tenant_filters)
 
         prod_count_res = (await db.execute(prod_count_stmt)).first()
-        total_tenant_products = prod_count_res.unique_products if prod_count_res else 0
-        total_tenant_brands = prod_count_res.unique_brands if prod_count_res else 0
+        total_tenant_products = (
+            prod_count_res.unique_products if prod_count_res else 0
+        )
+        total_tenant_brands = (
+            prod_count_res.unique_brands if prod_count_res else 0
+        )
 
         global_stats_stmt = (
             select(
                 func.count(ChatSearchQuery.id).label("total_queries"),
-                func.sum(cast(ChatSearchQuery.share_of_voice, Float)).label(
-                    "total_sov"
-                ),
                 func.sum(
-                    case((ChatSearchQuery.product_found.is_(True), 1), else_=0)
+                    cast(ChatSearchQuery.share_of_voice, Float)
+                ).label("total_sov"),
+                func.sum(
+                    case(
+                        (
+                            ChatSearchQuery.product_found.is_(True),
+                            1,
+                        ),
+                        else_=0,
+                    )
                 ).label("total_found"),
             )
             .select_from(ChatSearchQuery)
-            .join(Chat, ChatSearchQuery.chat_id == Chat.id)
-            .join(Product, Chat.product_id == Product.id)
+            .join(
+                Chat,
+                ChatSearchQuery.chat_id == Chat.id,
+            )
+            .join(
+                Product,
+                Chat.product_id == Product.id,
+            )
             .where(*tenant_filters)
         )
 
         global_stats_result = await db.execute(global_stats_stmt)
         stats_row = global_stats_result.first()
 
-        tenant_total_queries = stats_row.total_queries if stats_row else 0
-        tenant_sov_accumulation = stats_row.total_sov if stats_row else 0.0
-        tenant_found_count = stats_row.total_found if stats_row else 0
+        tenant_total_queries = (
+            stats_row.total_queries if stats_row else 0
+        )
+        tenant_sov_accumulation = (
+            stats_row.total_sov if stats_row else 0.0
+        )
+        tenant_found_count = (
+            stats_row.total_found if stats_row else 0
+        )
 
         avg_mention_rate = (
-            round((tenant_found_count / tenant_total_queries) * 10, 1)
+            round(
+                (tenant_found_count / tenant_total_queries) * 10,
+                1,
+            )
             if tenant_total_queries and tenant_total_queries > 0
             else 0.0
         )
@@ -1265,16 +1475,29 @@ class ProductService:
         view_filters = list(tenant_filters)
 
         if brand:
-            brand_list = [b.strip() for b in brand.split(",") if b.strip()]
+            brand_list = [
+                b.strip()
+                for b in brand.split(",")
+                if b.strip()
+            ]
+
             if brand_list:
-                view_filters.append(Product.brand.has(Brand.name.in_(brand_list)))
+                view_filters.append(
+                    Product.brand.has(
+                        Brand.name.in_(brand_list)
+                    )
+                )
 
         if search:
-            view_filters.append(Product.name.ilike(f"%{search}%"))
+            view_filters.append(
+                Product.name.ilike(f"%{search}%")
+            )
 
         all_ids_stmt = select(Product.id).where(*view_filters)
         all_ids_result = await db.execute(all_ids_stmt)
-        all_product_ids = list(all_ids_result.scalars().all())
+        all_product_ids = list(
+            all_ids_result.scalars().all()
+        )
 
         if not all_product_ids:
             return [], 0, tenant_stats, []
@@ -1282,7 +1505,9 @@ class ProductService:
         # ------------------------------------------------------------------
         # 4. Sorting & Paginated ID Fetching
         # ------------------------------------------------------------------
-        total_count_col = func.count().over().label("total_count_val")
+        total_count_col = func.count().over().label(
+            "total_count_val"
+        )
 
         VISIBILITY_SORT_KEYS = {
             "visibility": None,
@@ -1293,16 +1518,34 @@ class ProductService:
 
         if sort_by in VISIBILITY_SORT_KEYS:
 
+            # FIX:
+            # Use the actual LLMModels enum members in SQL comparisons
+            # instead of plain strings. SQLAlchemy SQLEnum is backed by
+            # the Python enum used by Chat.model_choice.
             def _engine_rate_col(engine_code):
+                engine_enum = (
+                    engine_code
+                    if isinstance(engine_code, LLMModels)
+                    else LLMModels[engine_code]
+                )
+
                 matched_total = func.sum(
-                    case((Chat.model_choice == engine_code, 1), else_=0)
+                    case(
+                        (
+                            Chat.model_choice == engine_enum,
+                            1,
+                        ),
+                        else_=0,
+                    )
                 )
 
                 matched_found = func.sum(
                     case(
                         (
-                            (Chat.model_choice == engine_code)
-                            & (ChatSearchQuery.product_found.is_(True)),
+                            (Chat.model_choice == engine_enum)
+                            & (
+                                ChatSearchQuery.product_found.is_(True)
+                            ),
                             1,
                         ),
                         else_=0,
@@ -1312,7 +1555,15 @@ class ProductService:
                 return case(
                     (
                         matched_total > 0,
-                        cast(matched_found, Float) / cast(matched_total, Float) * 10.0,
+                        cast(
+                            matched_found,
+                            Float,
+                        )
+                        / cast(
+                            matched_total,
+                            Float,
+                        )
+                        * 10.0,
                     ),
                     else_=None,
                 )
@@ -1320,11 +1571,20 @@ class ProductService:
             vis_subquery = (
                 select(
                     Product.id.label("prod_id"),
-                    _engine_rate_col("GPT").label("gpt_rate"),
-                    _engine_rate_col("GEMINI").label("gemini_rate"),
-                    _engine_rate_col("CLAUDE").label("claude_rate"),
+                    _engine_rate_col("GPT").label(
+                        "gpt_rate"
+                    ),
+                    _engine_rate_col("GEMINI").label(
+                        "gemini_rate"
+                    ),
+                    _engine_rate_col("CLAUDE").label(
+                        "claude_rate"
+                    ),
                 )
-                .outerjoin(Chat, Chat.product_id == Product.id)
+                .outerjoin(
+                    Chat,
+                    Chat.product_id == Product.id,
+                )
                 .outerjoin(
                     ChatSearchQuery,
                     ChatSearchQuery.chat_id == Chat.id,
@@ -1342,15 +1602,28 @@ class ProductService:
 
             if VISIBILITY_SORT_KEYS[sort_by] is None:
                 sum_rates_expr = (
-                    func.coalesce(engine_rate_cols[0], 0.0)
-                    + func.coalesce(engine_rate_cols[1], 0.0)
-                    + func.coalesce(engine_rate_cols[2], 0.0)
+                    func.coalesce(
+                        engine_rate_cols[0],
+                        0.0,
+                    )
+                    + func.coalesce(
+                        engine_rate_cols[1],
+                        0.0,
+                    )
+                    + func.coalesce(
+                        engine_rate_cols[2],
+                        0.0,
+                    )
                 )
 
-                order_visibility_col = sum_rates_expr / 3.0
+                order_visibility_col = (
+                    sum_rates_expr / 3.0
+                )
 
             else:
-                target_engine = VISIBILITY_SORT_KEYS[sort_by]
+                target_engine = VISIBILITY_SORT_KEYS[
+                    sort_by
+                ]
 
                 col_map = {
                     "GPT": vis_subquery.c.gpt_rate,
@@ -1364,7 +1637,10 @@ class ProductService:
                 )
 
             paginated_id_stmt = (
-                select(Product.id, total_count_col)
+                select(
+                    Product.id,
+                    total_count_col,
+                )
                 .outerjoin(
                     vis_subquery,
                     Product.id == vis_subquery.c.prod_id,
@@ -1385,29 +1661,48 @@ class ProductService:
             ).where(*view_filters)
 
             if sort_by == "brand":
-                paginated_id_stmt = paginated_id_stmt.outerjoin(
-                    Brand,
-                    Product.brand_id == Brand.id,
+                paginated_id_stmt = (
+                    paginated_id_stmt.outerjoin(
+                        Brand,
+                        Product.brand_id == Brand.id,
+                    )
                 )
 
             order_clauses = []
 
             if sort_by == "name":
-                order_clauses.append(direction(func.lower(Product.name)))
+                order_clauses.append(
+                    direction(
+                        func.lower(Product.name)
+                    )
+                )
 
             elif sort_by == "sku":
-                order_clauses.append(direction(func.lower(Product.sku)))
+                order_clauses.append(
+                    direction(
+                        func.lower(Product.sku)
+                    )
+                )
 
             elif sort_by == "brand":
-                order_clauses.append(direction(func.lower(Brand.name)))
+                order_clauses.append(
+                    direction(
+                        func.lower(Brand.name)
+                    )
+                )
 
             else:
-                order_clauses.append(direction(Product.created_at))
+                order_clauses.append(
+                    direction(Product.created_at)
+                )
 
-            order_clauses.append(desc(Product.created_at))
+            order_clauses.append(
+                desc(Product.created_at)
+            )
 
             paginated_id_stmt = (
-                paginated_id_stmt.order_by(*order_clauses)
+                paginated_id_stmt
+                .order_by(*order_clauses)
                 .offset((page - 1) * limit)
                 .limit(limit)
             )
@@ -1415,9 +1710,15 @@ class ProductService:
         id_result = await db.execute(paginated_id_stmt)
         id_rows = id_result.all()
 
-        ordered_product_ids = [row[0] for row in id_rows]
+        ordered_product_ids = [
+            row[0] for row in id_rows
+        ]
 
-        total = id_rows[0].total_count_val if id_rows else len(all_product_ids)
+        total = (
+            id_rows[0].total_count_val
+            if id_rows
+            else len(all_product_ids)
+        )
 
         # ------------------------------------------------------------------
         # 5. Fetch Product Entities with single JOIN
@@ -1432,13 +1733,24 @@ class ProductService:
             )
         )
 
-        products_result = await db.execute(products_fetch_stmt)
-        fetched_products = products_result.unique().scalars().all()
+        products_result = await db.execute(
+            products_fetch_stmt
+        )
 
-        product_by_id = {p.id: p for p in fetched_products}
+        fetched_products = (
+            products_result.unique()
+            .scalars()
+            .all()
+        )
+
+        product_by_id = {
+            p.id: p for p in fetched_products
+        }
 
         ordered_products = [
-            product_by_id[pid] for pid in ordered_product_ids if pid in product_by_id
+            product_by_id[pid]
+            for pid in ordered_product_ids
+            if pid in product_by_id
         ]
 
         # ------------------------------------------------------------------
@@ -1448,8 +1760,12 @@ class ProductService:
             select(
                 Product.id.label("product_id"),
                 Chat.model_choice.label("model_choice"),
-                func.count(Chat.id.distinct()).label("total_chats"),
-                func.count(ChatSearchQuery.id).label("total_queries"),
+                func.count(
+                    Chat.id.distinct()
+                ).label("total_chats"),
+                func.count(
+                    ChatSearchQuery.id
+                ).label("total_queries"),
                 func.sum(
                     case(
                         (
@@ -1471,21 +1787,30 @@ class ProductService:
                         Float,
                     )
                 ).label("avg_rank"),
-                func.max(Chat.created_at).label("last_analysis"),
+                func.max(
+                    Chat.created_at
+                ).label("last_analysis"),
             )
-            .join(Chat, Chat.product_id == Product.id)
+            .join(
+                Chat,
+                Chat.product_id == Product.id,
+            )
             .join(
                 ChatSearchQuery,
                 ChatSearchQuery.chat_id == Chat.id,
             )
-            .where(Product.id.in_(ordered_product_ids))
+            .where(
+                Product.id.in_(ordered_product_ids)
+            )
             .group_by(
                 Product.id,
                 Chat.model_choice,
             )
         )
 
-        engine_metrics_res = await db.execute(engine_metrics_stmt)
+        engine_metrics_res = await db.execute(
+            engine_metrics_stmt
+        )
 
         metrics_rows = engine_metrics_res.all()
 
@@ -1508,11 +1833,17 @@ class ProductService:
                     0,
                 ).label("total_tokens"),
             )
-            .where(Chat.product_id.in_(ordered_product_ids))
+            .where(
+                Chat.product_id.in_(
+                    ordered_product_ids
+                )
+            )
             .group_by(Chat.product_id)
         )
 
-        product_tokens_res = await db.execute(product_tokens_stmt)
+        product_tokens_res = await db.execute(
+            product_tokens_stmt
+        )
 
         product_tokens_map = {
             row.product_id: {
@@ -1523,6 +1854,11 @@ class ProductService:
             for row in product_tokens_res.all()
         }
 
+        # ------------------------------------------------------------------
+        # FIX:
+        # Normalize model enum values before converting them to
+        # frontend engine labels.
+        # ------------------------------------------------------------------
         ENGINE_LABEL_MAP = {
             "GPT": "chatgpt",
             "GEMINI": "gemini",
@@ -1543,16 +1879,37 @@ class ProductService:
         )
 
         for row in metrics_rows:
-            engine_key = ENGINE_LABEL_MAP.get(
-                row.model_choice,
-                str(row.model_choice).lower(),
-            )
+            raw_model = row.model_choice
+
+            if raw_model is None:
+                engine_key = None
+            else:
+                model_name = (
+                    raw_model.value
+                    if isinstance(raw_model, LLMModels)
+                    else str(raw_model)
+                )
+
+                # Handles:
+                # GPT
+                # GEMINI
+                # CLAUDE
+                # LLMModels.GPT
+                # etc.
+                model_name = model_name.split(".")[-1].upper()
+
+                engine_key = ENGINE_LABEL_MAP.get(model_name)
+
+            # Do not create an invalid frontend engine key.
+            if engine_key is None:
+                continue
 
             tot_q = row.total_queries or 0
+            found_count = row.found_count or 0
 
             vis_rate = (
                 round(
-                    (row.found_count / tot_q) * 10,
+                    (found_count / tot_q) * 10,
                     2,
                 )
                 if tot_q > 0
@@ -1574,21 +1931,34 @@ class ProductService:
                 "last_analysis": row.last_analysis,
             }
 
-            p_tot = product_totals_map[row.product_id]
+            p_tot = product_totals_map[
+                row.product_id
+            ]
 
             p_tot["queries"] += tot_q
 
-            p_tot["sov_sum"] += (row.avg_sov or 0.0) * tot_q
+            p_tot["sov_sum"] += (
+                row.avg_sov or 0.0
+            ) * tot_q
 
             if row.avg_rank:
-                p_tot["rank_sum"] += (row.avg_rank or 0.0) * tot_q
+                p_tot["rank_sum"] += (
+                    row.avg_rank or 0.0
+                ) * tot_q
 
                 p_tot["rank_cnt"] += tot_q
 
-            if p_tot["last_analysis"] is None or (
-                row.last_analysis and row.last_analysis > p_tot["last_analysis"]
+            if (
+                p_tot["last_analysis"] is None
+                or (
+                    row.last_analysis
+                    and row.last_analysis
+                    > p_tot["last_analysis"]
+                )
             ):
-                p_tot["last_analysis"] = row.last_analysis
+                p_tot["last_analysis"] = (
+                    row.last_analysis
+                )
 
         # ------------------------------------------------------------------
         # 8. Build Product Payload
@@ -1602,7 +1972,9 @@ class ProductService:
                 {},
             )
 
-            totals = product_totals_map[product.id]
+            totals = product_totals_map[
+                product.id
+            ]
 
             token_data = product_tokens_map.get(
                 product.id,
@@ -1613,18 +1985,25 @@ class ProductService:
                 },
             )
 
-            rates = [eng["visibility_rate"] for eng in by_engine.values()]
+            rates = [
+                eng["visibility_rate"]
+                for eng in by_engine.values()
+            ]
 
             overall_vis = round(
                 sum(rates) / 3.0,
                 2,
             )
 
-            all_vis_scores.append(overall_vis)
+            all_vis_scores.append(
+                overall_vis
+            )
 
             tot_q = totals["queries"]
 
-            product.product_brand_id = product.brand_id
+            product.product_brand_id = (
+                product.brand_id
+            )
 
             product.analytics = {
                 "total_queries": tot_q,
@@ -1638,19 +2017,28 @@ class ProductService:
                 ),
                 "avg_citation_rank": (
                     round(
-                        totals["rank_sum"] / totals["rank_cnt"],
+                        totals["rank_sum"]
+                        / totals["rank_cnt"],
                         2,
                     )
                     if totals.get("rank_cnt", 0) > 0
                     else 0.0
                 ),
                 "visibility_rate": overall_vis,
-                "last_analysis": totals.get("last_analysis"),
+                "last_analysis": totals.get(
+                    "last_analysis"
+                ),
                 "by_engine": by_engine,
                 # Product-level token usage
-                "input_tokens": token_data["input_tokens"],
-                "output_tokens": token_data["output_tokens"],
-                "total_tokens": token_data["total_tokens"],
+                "input_tokens": token_data[
+                    "input_tokens"
+                ],
+                "output_tokens": token_data[
+                    "output_tokens"
+                ],
+                "total_tokens": token_data[
+                    "total_tokens"
+                ],
             }
 
             products_payload.append(product)
@@ -1660,7 +2048,8 @@ class ProductService:
         # ------------------------------------------------------------------
         if all_vis_scores:
             tenant_stats["avg_visibility_score"] = round(
-                sum(all_vis_scores) / len(all_vis_scores),
+                sum(all_vis_scores)
+                / len(all_vis_scores),
                 1,
             )
 
@@ -1676,76 +2065,3 @@ class ProductService:
             all_product_ids,
         )
 
-    @staticmethod
-    def _get_llm_token_usage(chats: List[Chat]) -> Dict[str, Any]:
-        """
-        Aggregate input, output, and total token usage across chats.
-
-        Returns:
-            {
-                "inputTokens": int,
-                "outputTokens": int,
-                "totalTokens": int,
-                "byModel": {
-                    "GPT": {
-                        "inputTokens": int,
-                        "outputTokens": int,
-                        "totalTokens": int,
-                    },
-                    "GEMINI": {
-                        "inputTokens": int,
-                        "outputTokens": int,
-                        "totalTokens": int,
-                    },
-                    "CLAUDE": {
-                        "inputTokens": int,
-                        "outputTokens": int,
-                        "totalTokens": int,
-                    },
-                }
-            }
-        """
-
-        # Initialize global totals
-        usage = {
-            "inputTokens": 0,
-            "outputTokens": 0,
-            "totalTokens": 0,
-            "byModel": {},
-        }
-
-        for chat in chats or []:
-            model = str(getattr(chat, "model_choice", None) or "UNKNOWN").upper()
-
-            input_tokens = int(getattr(chat, "input_tokens", 0) or 0)
-
-            output_tokens = int(getattr(chat, "output_tokens", 0) or 0)
-
-            # Use DB total_tokens when available.
-            # Otherwise calculate it from input + output.
-            total_tokens = int(
-                getattr(chat, "total_tokens", None) or (input_tokens + output_tokens)
-            )
-
-            # --------------------------------------------------------------
-            # Global totals
-            # --------------------------------------------------------------
-            usage["inputTokens"] += input_tokens
-            usage["outputTokens"] += output_tokens
-            usage["totalTokens"] += total_tokens
-
-            # --------------------------------------------------------------
-            # Model-wise totals
-            # --------------------------------------------------------------
-            if model not in usage["byModel"]:
-                usage["byModel"][model] = {
-                    "inputTokens": 0,
-                    "outputTokens": 0,
-                    "totalTokens": 0,
-                }
-
-            usage["byModel"][model]["inputTokens"] += input_tokens
-            usage["byModel"][model]["outputTokens"] += output_tokens
-            usage["byModel"][model]["totalTokens"] += total_tokens
-
-        return usage
