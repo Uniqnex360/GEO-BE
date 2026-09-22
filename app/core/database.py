@@ -5,11 +5,15 @@ from app.core.config import settings
 
 print("URL:", settings.DATABASE_URL)
 
-engine = create_async_engine(settings.DATABASE_URL)
-
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+)
 SessionLocal = async_sessionmaker(
     bind=engine, class_=AsyncSession, expire_on_commit=False
 )
+
 
 class Base(DeclarativeBase):
     pass
