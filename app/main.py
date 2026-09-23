@@ -12,7 +12,9 @@ app.add_middleware(
         "http://localhost:5174", 
         "https://geo-fe.onrender.com",
         "https://app.contentlynxe.com",
-        "https://www.contentlynxe.com"
+        "https://www.contentlynxe.com",
+        "https://geo-fe-ac6a.onrender.com",
+        "https://contentlynxe-website-0ky6.onrender.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],

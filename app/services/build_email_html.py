@@ -671,28 +671,6 @@ def build_geo_email(data: dict) -> str:
                 </tr>
 
                 <tr>
-                    <td style="padding-bottom: 32px;">
-
-                        <a
-                            href="https://www.contentlynxe.com/"
-                            style="
-                                display: inline-block;
-                                background-color: #111111;
-                                color: #ffffff;
-                                text-decoration: none;
-                                font-size: 15px;
-                                font-weight: 700;
-                                padding: 13px 22px;
-                                border-radius: 6px;
-                            "
-                        >
-                            → View Your Full Report
-                        </a>
-
-                    </td>
-                </tr>
-
-                <tr>
                     <td
                         style="
                             border-top: 1px solid #eeeeee;
@@ -1326,14 +1304,14 @@ def generate_ai_visibility_pdf(
 
         pdf.ln()
 
-    # ========================================================
+        # ========================================================
     # PAGE 2
     # ========================================================
 
     pdf.add_page()
 
     # ========================================================
-    # OPPORTUNITIES
+    # ACTION PLAN & PRIORITY
     # ========================================================
 
     pdf.set_font(
@@ -1345,7 +1323,7 @@ def generate_ai_visibility_pdf(
     pdf.cell(
         0,
         8,
-        "04 Top Content & Visibility Opportunities",
+        "04 Action Plan & Priority",
     )
 
     pdf.ln(8)
@@ -1359,8 +1337,9 @@ def generate_ai_visibility_pdf(
     pdf.multi_cell(
         0,
         6,
-        "The opportunities below are taken directly from "
-        "the recommendations generated for each criterion.",
+        "Recommended actions are consolidated below with "
+        "their corresponding priority so the same recommendation "
+        "is not repeated across separate sections.",
     )
 
     pdf.ln(5)
@@ -1371,8 +1350,12 @@ def generate_ai_visibility_pdf(
         8,
     )
 
+    # --------------------------------------------------------
+    # TABLE HEADER
+    # --------------------------------------------------------
+
     pdf.cell(
-        40,
+        30,
         8,
         "Criteria",
         border=1,
@@ -1387,186 +1370,6 @@ def generate_ai_visibility_pdf(
     )
 
     pdf.cell(
-        115,
-        8,
-        "Opportunity / finding",
-        border=1,
-    )
-
-    pdf.ln()
-
-    pdf.set_font(
-        "Helvetica",
-        "",
-        8,
-    )
-
-    opportunity_rows = [
-        (
-            "Title",
-            "title",
-            scores["title"],
-        ),
-        (
-            "Description",
-            "description",
-            scores["description"],
-        ),
-        (
-            "Attributes",
-            "attributes",
-            scores["attributes"],
-        ),
-        (
-            "Features",
-            "features",
-            scores["features"],
-        ),
-        (
-            "Images",
-            "assets",
-            scores["assets"],
-        ),
-        (
-            "Pricing",
-            "pricing",
-            scores["pricing"],
-        ),
-    ]
-
-    for label, criterion, score in opportunity_rows:
-
-        recommendation = get_best_recommendation(
-            product_data,
-            criterion,
-        )
-
-        if recommendation:
-
-            recommendation_name = recommendation.get(
-                "recommendation",
-                "",
-            )
-
-            action = recommendation.get(
-                "action",
-                "",
-            )
-
-            if recommendation_name and action:
-
-                opportunity = f"{recommendation_name}: " f"{action}"
-
-            elif action:
-
-                opportunity = action
-
-            elif recommendation_name:
-
-                opportunity = recommendation_name
-
-            else:
-
-                opportunity = recommendation.get(
-                    "why",
-                    "See recommendation details.",
-                )
-
-        else:
-
-            opportunity = "No recommendation available."
-
-        # FIX: clean AI-generated text BEFORE dry_run.
-        opportunity = clean_pdf_text(opportunity)
-
-        # Calculate row height first.
-        row_height = pdf.multi_cell(
-            115,
-            7,
-            opportunity,
-            dry_run=True,
-            output=MethodReturnValue.HEIGHT,
-        )
-
-        row_height = max(
-            7,
-            row_height,
-        )
-
-        # Draw the three cells at the same Y.
-        pdf.cell(
-            40,
-            row_height,
-            label,
-            border=1,
-        )
-
-        pdf.cell(
-            20,
-            row_height,
-            f"{score}%",
-            border=1,
-            align="C",
-        )
-
-        pdf.multi_cell(
-            115,
-            7,
-            opportunity,
-            border=1,
-            new_x="LMARGIN",
-            new_y="NEXT",
-        )
-
-    pdf.ln(8)
-
-    # ========================================================
-    # PRIORITY ACTION PLAN
-    # ========================================================
-
-    pdf.set_font(
-        "Helvetica",
-        "B",
-        14,
-    )
-
-    pdf.cell(
-        0,
-        8,
-        "05 Priority Action Plan",
-    )
-
-    pdf.ln(8)
-
-    pdf.set_font(
-        "Helvetica",
-        "",
-        9,
-    )
-
-    pdf.multi_cell(
-        0,
-        6,
-        "Actions are taken from the highest-impact "
-        "recommendation available for each criterion.",
-    )
-
-    pdf.ln(5)
-
-    pdf.set_font(
-        "Helvetica",
-        "B",
-        8,
-    )
-
-    pdf.cell(
-        40,
-        8,
-        "Criteria",
-        border=1,
-    )
-
-    pdf.cell(
         30,
         8,
         "Priority",
@@ -1575,9 +1378,9 @@ def generate_ai_visibility_pdf(
     )
 
     pdf.cell(
-        105,
+        95,
         8,
-        "Recommended action",
+        "Action / Finding",
         border=1,
     )
 
@@ -1588,6 +1391,10 @@ def generate_ai_visibility_pdf(
         "",
         8,
     )
+
+    # --------------------------------------------------------
+    # PRIORITY ROWS
+    # --------------------------------------------------------
 
     priority_rows = [
         (
@@ -1645,7 +1452,7 @@ def generate_ai_visibility_pdf(
 
         # Calculate row height first.
         row_height = pdf.multi_cell(
-            105,
+            95,
             7,
             action,
             dry_run=True,
@@ -1657,13 +1464,24 @@ def generate_ai_visibility_pdf(
             row_height,
         )
 
+        # Criteria
         pdf.cell(
-            40,
+            30,
             row_height,
             label,
             border=1,
         )
 
+        # Score
+        pdf.cell(
+            20,
+            row_height,
+            f"{score}%",
+            border=1,
+            align="C",
+        )
+
+        # Priority
         pdf.cell(
             30,
             row_height,
@@ -1672,8 +1490,9 @@ def generate_ai_visibility_pdf(
             align="C",
         )
 
+        # Action / Finding
         pdf.multi_cell(
-            105,
+            95,
             7,
             action,
             border=1,
@@ -1684,23 +1503,8 @@ def generate_ai_visibility_pdf(
     pdf.ln(10)
 
     # ========================================================
-    # FOOTER / CTA
+    # FOOTER
     # ========================================================
-
-    pdf.set_font(
-        "Helvetica",
-        "B",
-        10,
-    )
-
-    pdf.cell(
-        0,
-        7,
-        "Want to see the full picture?",
-        align="C",
-    )
-
-    pdf.ln(7)
 
     pdf.set_font(
         "Helvetica",
@@ -1708,21 +1512,10 @@ def generate_ai_visibility_pdf(
         9,
     )
 
-    pdf.multi_cell(
-        0,
-        5,
-        "Ask us for the complete ContentLynxe AI Visibility "
-        "Report with detailed findings, gaps, and "
-        "prioritized recommendations.",
-        align="C",
-    )
-
-    pdf.ln(3)
-
     pdf.cell(
         0,
         6,
-        "growth@contentlynxe.com | contentlynxe.com",
+        "The complete AI Visibility Report is attached for your reference.",
         align="C",
     )
 
@@ -1731,4 +1524,3 @@ def generate_ai_visibility_pdf(
     # ========================================================
 
     return bytes(pdf.output())
-
