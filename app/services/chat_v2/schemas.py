@@ -194,7 +194,7 @@ class ChatQueryBase(BaseModel):
     chat_context: str = Field(description="Scope tracking token context identifier.")
     brand: str = Field(description="Identified target brand.")
     query: str = Field(description="The generated search engine query executed.")
-    product_found: bool = Field(description="True if target product was discovered.")
+    product_found: bool = Field(description="True if target product/brand was discovered.")
     share_of_voice: float = Field(description="Calculated share of voice percentage.")
     total_websites_found: int = Field(
         description="Count of unique reference web sources found."
