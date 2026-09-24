@@ -13,6 +13,8 @@ from serpapi import GoogleSearch
 from langchain.tools import tool
 from langchain_community.tools import DuckDuckGoSearchRun
 
+logger = logging.getLogger(__name__)
+
 from .schemas import UnifiedGEOResponse
 
 logger = logging.getLogger(__name__)
@@ -43,120 +45,146 @@ def _format_search_results(results: list) -> str:
     return "\n".join(formatted_output)
 
 
-def _search_duckduckgo(query: str) -> str:
-    """Fallback search using LangChain Community DuckDuckGo."""
+# def _search_duckduckgo(query: str) -> str:
+#     """Fallback search using LangChain Community DuckDuckGo."""
 
-    try:
-        search = DuckDuckGoSearchRun()
+#     try:
+#         search = DuckDuckGoSearchRun()
 
-        raw_results = search.invoke(query)
+#         raw_results = search.invoke(query)
 
-        if not raw_results:
-            return f"No organic web results discovered for query: '{query}'."
+#         if not raw_results:
+#             return f"No organic web results discovered for query: '{query}'."
 
-        # DuckDuckGoSearchRun normally returns a text string rather than
-        # structured results. Keep the same output contract expected by
-        # the GEO model.
-        return (
-            "Result #1:\n"
-            "- Title: DuckDuckGo Search Result\n"
-            "- Verified URL: N/A\n"
-            "- Price: N/A\n"
-            f"- Summary: {raw_results}\n"
-        )
+#         # DuckDuckGoSearchRun normally returns a text string rather than
+#         # structured results. Keep the same output contract expected by
+#         # the GEO model.
+#         return (
+#             "Result #1:\n"
+#             "- Title: DuckDuckGo Search Result\n"
+#             "- Verified URL: N/A\n"
+#             "- Price: N/A\n"
+#             f"- Summary: {raw_results}\n"
+#         )
 
-    except Exception as err:
-        logger.exception(
-            "DuckDuckGo fallback failed for query=%r",
-            query,
-        )
-        return f"DuckDuckGo Search Failed: {str(err)}"
+#     except Exception as err:
+#         logger.exception(
+#             "DuckDuckGo fallback failed for query=%r",
+#             query,
+#         )
+#         return f"DuckDuckGo Search Failed: {str(err)}"
+
+
+# @tool
+# def geo_web_search(query: str) -> str:
+#     """
+#     Searches the web via SerpApi for live product metadata, verified
+#     competitor URLs, pricing, and organic search listings.
+
+#     If SerpApi reaches its limit or fails, DuckDuckGo is used as a fallback.
+#     """
+
+#     api_key = os.getenv("SERPAPI_KEY") or os.getenv("SERPAPI_API_KEY")
+
+#     if not api_key:
+#         logger.warning("SerpApi API key missing. Falling back to DuckDuckGo.")
+#         return _search_duckduckgo(query)
+
+#     try:
+#         search = GoogleSearch(
+#             {
+#                 "engine": "google",
+#                 "q": query,
+#                 "num": 5,
+#                 "hl": "en",
+#                 "gl": "us",
+#                 "api_key": api_key,
+#             }
+#         )
+
+#         results = search.get_dict()
+
+#         # SerpApi quota / account / API errors
+#         if "error" in results:
+#             logger.warning(
+#                 "geo_web_search: SerpApi returned error for query=%r: %s. "
+#                 "Falling back to DuckDuckGo.",
+#                 query,
+#                 results["error"],
+#             )
+
+#             return _search_duckduckgo(query)
+
+#         organic_results = results.get("organic_results", [])
+
+#         if not organic_results:
+#             logger.info(
+#                 "geo_web_search: no organic_results for query=%r. "
+#                 "Falling back to DuckDuckGo.",
+#                 query,
+#             )
+
+#             return _search_duckduckgo(query)
+
+#         formatted_output = []
+
+#         for index, item in enumerate(organic_results[:5], start=1):
+#             title = item.get("title", "")
+#             link = item.get("link", "")
+#             snippet = item.get("snippet", "")
+
+#             rich_extensions = (
+#                 item.get("rich_snippet", {})
+#                 .get("top", {})
+#                 .get("detected_extensions", {})
+#             )
+
+#             price = rich_extensions.get("price") or item.get("price") or "N/A"
+
+#             formatted_output.append(
+#                 f"Result #{index}:\n"
+#                 f"- Title: {title}\n"
+#                 f"- Verified URL: {link}\n"
+#                 f"- Price: {price}\n"
+#                 f"- Summary: {snippet}\n"
+#             )
+
+#         return "\n".join(formatted_output)
+
+#     except Exception as err:
+#         logger.exception(
+#             "geo_web_search: SerpApi call failed for query=%r. "
+#             "Falling back to DuckDuckGo.",
+#             query,
+#         )
+
+#         return _search_duckduckgo(query)
+
+
 
 
 @tool
 def geo_web_search(query: str) -> str:
     """
-    Searches the web via SerpApi for live product metadata, verified
-    competitor URLs, pricing, and organic search listings.
-
-    If SerpApi reaches its limit or fails, DuckDuckGo is used as a fallback.
+    Searches the web using DuckDuckGo.
     """
 
-    api_key = os.getenv("SERPAPI_KEY") or os.getenv("SERPAPI_API_KEY")
-
-    if not api_key:
-        logger.warning("SerpApi API key missing. Falling back to DuckDuckGo.")
-        return _search_duckduckgo(query)
-
     try:
-        search = GoogleSearch(
-            {
-                "engine": "google",
-                "q": query,
-                "num": 5,
-                "hl": "en",
-                "gl": "us",
-                "api_key": api_key,
-            }
-        )
+        search = DuckDuckGoSearchRun()
+        results = search.invoke(query)
 
-        results = search.get_dict()
+        if not results:
+            return f"No organic web results discovered for query: '{query}'."
 
-        # SerpApi quota / account / API errors
-        if "error" in results:
-            logger.warning(
-                "geo_web_search: SerpApi returned error for query=%r: %s. "
-                "Falling back to DuckDuckGo.",
-                query,
-                results["error"],
-            )
-
-            return _search_duckduckgo(query)
-
-        organic_results = results.get("organic_results", [])
-
-        if not organic_results:
-            logger.info(
-                "geo_web_search: no organic_results for query=%r. "
-                "Falling back to DuckDuckGo.",
-                query,
-            )
-
-            return _search_duckduckgo(query)
-
-        formatted_output = []
-
-        for index, item in enumerate(organic_results[:5], start=1):
-            title = item.get("title", "")
-            link = item.get("link", "")
-            snippet = item.get("snippet", "")
-
-            rich_extensions = (
-                item.get("rich_snippet", {})
-                .get("top", {})
-                .get("detected_extensions", {})
-            )
-
-            price = rich_extensions.get("price") or item.get("price") or "N/A"
-
-            formatted_output.append(
-                f"Result #{index}:\n"
-                f"- Title: {title}\n"
-                f"- Verified URL: {link}\n"
-                f"- Price: {price}\n"
-                f"- Summary: {snippet}\n"
-            )
-
-        return "\n".join(formatted_output)
+        return results
 
     except Exception as err:
         logger.exception(
-            "geo_web_search: SerpApi call failed for query=%r. "
-            "Falling back to DuckDuckGo.",
+            "geo_web_search: DuckDuckGo search failed for query=%r",
             query,
         )
 
-        return _search_duckduckgo(query)
+        return f"DuckDuckGo Search Failed: {str(err)}"
 
 
 @tool
